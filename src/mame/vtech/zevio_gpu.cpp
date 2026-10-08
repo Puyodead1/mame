@@ -827,7 +827,7 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 	// 2D positions: surface origin (clip top-left) + 0x85 offset + signed x/y
 	const int ox = (m_clip0 & 0xfff) + (m_w85 & 0xfff), oy = ((m_clip0 >> 12) & 0xfff) + ((m_w85 >> 12) & 0xfff);
 	const int x0 = ox + s16(xy & 0xffff), y0 = oy + s16(xy >> 16);
-	const int w = wh & 0xffff, h = wh >> 16;
+	const int w = std::min<int>(wh & 0xffff, 1024), h = std::min<int>(wh >> 16, 1024);
 	const float cr = (col & 0xff) / 255.0f, cg = ((col >> 8) & 0xff) / 255.0f, cb = ((col >> 16) & 0xff) / 255.0f;
 	for (int j = 0; j < h; j++)
 		for (int i = 0; i < w; i++)
@@ -944,7 +944,7 @@ void zevio_gpu_device::run_list(u32 addr)
 		{
 			const u32 pos = rd32(addr), size = rd32(addr + 4), src = rd32(addr + 12);
 			addr += 16;
-			const int x = pos & 0xffff, y = pos >> 16, w = size & 0xffff, h = size >> 16;
+			const int x = pos & 0xffff, y = pos >> 16, w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 8192);
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					vram_w(x + i, y + j, rd16(src + (j * w + i) * 2));
@@ -954,7 +954,7 @@ void zevio_gpu_device::run_list(u32 addr)
 		{
 			const u32 pos = rd32(addr), size = rd32(addr + 4);
 			addr += 8;
-			const int x = pos & 0xffff, y = pos >> 16, w = size & 0xffff, h = size >> 16;
+			const int x = pos & 0xffff, y = pos >> 16, w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 8192);
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					wr16(m_xfer + (j * w + i) * 2, vram_r(x + i, y + j));
@@ -969,7 +969,7 @@ void zevio_gpu_device::run_list(u32 addr)
 			const u32 pos = rd32(addr), size = rd32(addr + 4), col = rd32(addr + 8);
 			addr += 12;
 			m_stat_fills++;
-			const int x = pos & 0xffff, y = pos >> 16, w = size & 0xffff, h = size >> 16;
+			const int x = pos & 0xffff, y = pos >> 16, w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 8192);
 			const int ww = m_regs[0x94 / 4] & 0xffff, wh = m_regs[0x94 / 4] >> 16;
 			const bool windowed = (x + w <= ww) && (y + h <= wh);
 			const u32 base = windowed ? m_regs[0x98 / 4] : 0x0ffd0000;
@@ -988,7 +988,7 @@ void zevio_gpu_device::run_list(u32 addr)
 			const u32 dst = rd32(addr), size = rd32(addr + 4), src = rd32(addr + 8);
 			addr += 12;
 			const int dx = dst & 0xffff, dy = dst >> 16, sx = src & 0xffff, sy = src >> 16;
-			const int w = size & 0xffff, h = size >> 16;
+			const int w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 4096);
 			std::vector<u16> tmp(w * h);
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
