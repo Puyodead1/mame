@@ -335,6 +335,8 @@ bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b,
 	{
 		const u16 hw = vram_r(x0 + tu / 2, y0 + tv);
 		const u8 idx = BIT(tu, 0) ? (hw >> 8) : (hw & 0xff);
+		if (!idx)
+			return false; // palette index 0 is transparent
 		c = vram_r((m_clut[0] & 0xfff) + idx, (m_clut[0] >> 12) & 0xfff);
 		break;
 	}
@@ -342,6 +344,8 @@ bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b,
 	{
 		const u16 hw = vram_r(x0 + tu / 4, y0 + tv);
 		const u8 idx = (hw >> ((tu & 3) * 4)) & 0x0f;
+		if (!idx)
+			return false;
 		c = vram_r((m_clut[3] & 0xfff) + idx, (m_clut[3] >> 12) & 0xfff);
 		break;
 	}
@@ -354,8 +358,8 @@ bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b,
 		a = ((c >> 12) & 15) / 15.0f;
 		return a > 0.0f;
 	}
-	if (c == 0)
-		return false; // transparent texel
+	if (c == 0 || (c & 0x7fff) == 0x7c1f)
+		return false; // transparent texel (magenta colour key)
 	bgr555_to_f(c, r, g, b);
 	a = 1.0f;
 	return true;

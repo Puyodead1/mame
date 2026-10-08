@@ -2057,6 +2057,6 @@ ROM_END
 // Driver
 
 //    YEAR  NAME       PARENT    COMPAT  MACHINE   INPUT     CLASS           INIT        COMPANY  FULLNAME                 FLAGS
-COMP( 2007, vsmilpro,  0,        0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Smile Pro (Germany)", MACHINE_NO_SOUND | MACHINE_NOT_WORKING )
-COMP( 2007, vsmilprof, vsmilpro, 0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Smile Pro (France)",  MACHINE_NO_SOUND | MACHINE_NOT_WORKING )
-COMP( 2006, vflash,    vsmilpro, 0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Flash (USA)",         MACHINE_NO_SOUND | MACHINE_NOT_WORKING )
+COMP( 2007, vsmilpro,  0,        0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Smile Pro (Germany)", MACHINE_NO_SOUND | MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
+COMP( 2007, vsmilprof, vsmilpro, 0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Smile Pro (France)",  MACHINE_NO_SOUND | MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
+COMP( 2006, vflash,    vsmilpro, 0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Flash (USA)",         MACHINE_NO_SOUND | MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
