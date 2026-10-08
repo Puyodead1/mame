@@ -1092,6 +1092,7 @@ static inline rgb_t bgr555(u16 p)
 */
 u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
+	m_gpu->sync(); // finish drawing before reading VRAM
 	const u32 enable = m_disp_regs[0x100 / 4];
 	bitmap.fill(bgr555(m_disp_regs[0x10c / 4]), cliprect);
 
