@@ -33,7 +33,7 @@ constexpr uint32_t DRC_EXECUTE_RESET_CACHE   = 3;
 constexpr uint32_t DRC_EXECUTE_INTERP        = 100; // run one instruction in the interpreter (Thumb, unfetchable code)
 
 constexpr int DRC_MAX_INSNS = 64;
-constexpr size_t DRC_CACHE_SIZE = 64 * 1024 * 1024;
+constexpr size_t DRC_CACHE_SIZE = 256 * 1024 * 1024;
 
 } // anonymous namespace
 
