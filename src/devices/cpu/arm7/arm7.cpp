@@ -1200,6 +1200,7 @@ void arm7_cpu_device::fast_mem_update()
 
 void arm7_cpu_device::xlat_cache_flush()
 {
+	m_drc_dirty = true; // compiled blocks are keyed by virtual address
 	for (auto &e : m_dfetch)
 		e.tag = ~0U;
 	for (auto &t : m_xlat_cache)
@@ -1274,6 +1275,7 @@ bool arm7_cpu_device::memory_translate(int spacenum, int intention, offs_t &addr
 
 void arm7_cpu_device::postload()
 {
+	m_drc_dirty = true;
 	xlat_cache_flush();
 	update_reg_ptr();
 }
@@ -1348,6 +1350,7 @@ void arm7_cpu_device::device_start()
 	machine().save().register_postload(save_prepost_delegate(FUNC(arm7_cpu_device::postload), this));
 
 	set_icountptr(m_icount);
+	drc_start();
 
 	state_add( ARM7_PC,    "PC", m_pc).callexport().formatstr("%08X");
 	state_add(STATE_GENPC, "GENPC", m_pc).callexport().noshow();
@@ -1460,6 +1463,7 @@ void arm7_cpu_device::state_string_export(const device_state_entry &entry, std::
 
 void arm7_cpu_device::device_reset()
 {
+	m_drc_dirty = true;
 	xlat_cache_flush();
 	const uint32_t old_pc = m_r[eR15];
 	const uint32_t old_cpsr = m_r[eCPSR];
@@ -1691,9 +1695,224 @@ constexpr arm_cond_table s_cond = arm_cond_table();
 }
 #define s_cond_table s_cond.v
 
-void arm7_cpu_device::execute_run()
+// execute one ARM instruction (condition check, decode, execute); the caller
+// does the interrupt check and the base cycle count afterwards
+ATTR_FORCE_INLINE inline void arm7_cpu_device::exec_arm(uint32_t insn)
 {
 	auto const UNEXECUTED = [this] { m_r[eR15] += 4; m_icount += 2; }; // Any unexecuted instruction only takes 1 cycle (page 193)
+
+	int op_offset = 0;
+	/* process condition codes for this instruction */
+	if ((insn >> INSN_COND_SHIFT) != COND_AL)
+	{
+		const uint32_t cond = insn >> INSN_COND_SHIFT;
+		if (cond == COND_NV)
+		{
+			if (m_archRev < 5)
+				{ UNEXECUTED();  return; }
+			op_offset = 0x10;
+		}
+		else if (!BIT(s_cond_table[cond], GET_CPSR >> 28))
+			{ UNEXECUTED();  return; }
+	}
+	/*******************************************************************/
+	/* If we got here - condition satisfied, so decode the instruction */
+	/*******************************************************************/
+	if (!op_offset)
+	{
+		// the common classes, straight to their handlers: data processing
+		// (immediate, or register with an immediate shift, excluding the
+		// PSR transfer space that also holds the v5 DSP multiplies) and
+		// single data transfers without the media bit pattern
+		const uint32_t cls = insn & 0x0e000000;
+		if ((cls == 0x02000000 || (cls == 0 && !(insn & 0x10))) && (insn & 0x01900000) != 0x01000000)
+		{
+			// immediate operand, Rd and Rn not PC: HandleALU without the
+			// operand decode and R15 cases
+			// (also a plain register operand: Rm, LSL #0, Rm not PC)
+			const uint32_t rdn = (insn >> 12) & 15, rnn = (insn >> 16) & 15;
+			if (rdn != 15 && rnn != 15 && (cls == 0x02000000 || ((insn & 0xff0) == 0 && (insn & 15) != 15)))
+			{
+				uint32_t op2, sc;
+				if (cls == 0x02000000)
+				{
+					const uint32_t by = (insn >> 8) & 15;
+					op2 = std::rotr<uint32_t>(insn & 0xff, by << 1);
+					sc = by ? (op2 & SIGN_BIT) : (GET_CPSR & C_MASK);
+				}
+				else
+				{
+					op2 = GetRegister(insn & 15);
+					sc = GET_CPSR & C_MASK;
+				}
+				const uint32_t rn = GetRegister(rnn);
+				uint32_t rd;
+				switch ((insn >> 21) & 15)
+				{
+				case OPCODE_AND: case OPCODE_TST: rd = rn & op2; HandleALULogicalFlags(rd, sc); break;
+				case OPCODE_EOR: case OPCODE_TEQ: rd = rn ^ op2; HandleALULogicalFlags(rd, sc); break;
+				case OPCODE_SUB: case OPCODE_CMP: rd = rn - op2; HandleALUSubFlags(rd, rn, op2); break;
+				case OPCODE_RSB: rd = op2 - rn; HandleALUSubFlags(rd, op2, rn); break;
+				case OPCODE_ADD: case OPCODE_CMN: rd = rn + op2; HandleALUAddFlags(rd, rn, op2); break;
+				case OPCODE_ADC: rd = rn + op2 + ((GET_CPSR & C_MASK) >> C_BIT); HandleALUAddFlags(rd, rn, op2); break;
+				case OPCODE_SBC: rd = rn - op2 - (GET_CPSR & C_MASK ? 0 : 1); HandleALUSubFlags(rd, rn, op2); break;
+				case OPCODE_RSC: rd = op2 - rn - (GET_CPSR & C_MASK ? 0 : 1); HandleALUSubFlags(rd, op2, rn); break;
+				case OPCODE_ORR: rd = rn | op2; HandleALULogicalFlags(rd, sc); break;
+				case OPCODE_MOV: rd = op2; HandleALULogicalFlags(rd, sc); break;
+				case OPCODE_BIC: rd = rn & ~op2; HandleALULogicalFlags(rd, sc); break;
+				default: /* MVN */ rd = ~op2; HandleALULogicalFlags(rd, sc); break;
+				}
+				if ((insn & 0x01800000) != 0x01000000) // not TST/TEQ/CMP/CMN
+					SetRegister(rdn, rd);
+				ARM7_ICOUNT += 2;
+				return;
+			}
+			HandleALU(insn);
+			return;
+		}
+		// push / pop on fast RAM within one 1K page: STMDB Rb{!}, {list
+		// without PC} and LDMIA Rb{!}, {list} (S clear, Rb not PC and, for
+		// loads, not in the list); exactly as HandleMemBlock does them
+		if (cls == 0x08000000 && m_fast_mem && (insn & 0xffff) && !(insn & INSN_BDT_S) && ((insn >> 16) & 15) != 15)
+		{
+			const uint32_t rb = (insn >> 16) & 15, list = insn & 0xffff;
+			const uint32_t n = std::popcount(list);
+			if ((insn & 0x01900000) == 0x01000000 && !(list & 0x8000)) // STMDB
+			{
+				const uint32_t start = GetRegister(rb) - n * 4;
+				offs_t pa = start;
+				if (((start ^ (start + n * 4 - 1)) & ~0x3ffU) == 0 && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
+				{
+					if (uint8_t *p = fastram_ptr(pa & ~3))
+					{
+						if (m_drc)
+						{
+							drc_code_write(pa);
+							drc_code_write(pa + n * 4 - 1);
+						}
+						for (int i = 0; i < 16; i++)
+							if (BIT(list, i))
+							{
+								*reinterpret_cast<uint32_t *>(p) = GetRegister(i);
+								p += 4;
+							}
+						if (insn & INSN_BDT_W)
+							SetRegister(rb, GetRegister(rb) - n * 4);
+						ARM7_ICOUNT += 2 - int(n); // (n-1)S + 2N, then the -3 below
+						R15 += 4;
+						return;
+					}
+				}
+			}
+			else if ((insn & 0x01900000) == 0x00900000 && !BIT(list, rb)) // LDMIA
+			{
+				const uint32_t start = GetRegister(rb) & ~3;
+				offs_t pa = start;
+				if (((start ^ (start + n * 4 - 1)) & ~0x3ffU) == 0 && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
+				{
+					const uint8_t *p = fastram_ptr(pa);
+					// a loaded PC with bit 0 set switches to Thumb: leave that to the handler
+					if (p && !((list & 0x8000) && (reinterpret_cast<const uint32_t *>(p)[n - 1] & 1)))
+					{
+						for (int i = 0; i < 16; i++)
+							if (BIT(list, i))
+							{
+								SetRegister(i, *reinterpret_cast<const uint32_t *>(p));
+								p += 4;
+							}
+						if (insn & INSN_BDT_W)
+							SetRegister(rb, GetRegister(rb) + n * 4);
+						// LDM: nS + 1N + 1I, PC loads 2 more
+						ARM7_ICOUNT += 1 - int(n) - ((list & 0x8000) ? 2 : 0);
+						if (!(list & 0x8000))
+							R15 += 4;
+						return;
+					}
+				}
+			}
+		}
+		// B / BL
+		if (cls == 0x0a000000 && !(m_archFlags & ARCHFLAG_MODE26))
+		{
+			if (insn & INSN_BL)
+				SetRegister(14, R15 + 4);
+			R15 += util::sext((insn & INSN_BRANCH) << 2, 26) + 8;
+			return;
+		}
+		// LDR/STR(B) Rd, [Rn, #+-imm] (no write-back, Rd != PC) on fast RAM
+		if ((insn & 0x0f200000) == 0x05000000 && (insn & 0xf000) != 0xf000 && m_fast_mem)
+		{
+			const uint32_t rn = (insn >> 16) & 15;
+			const uint32_t base = (rn == 15) ? R15 + 8 : GetRegister(rn);
+			const uint32_t addr = (insn & INSN_SDT_U) ? base + (insn & 0xfff) : base - (insn & 0xfff);
+			offs_t pa = addr;
+			const bool load = insn & INSN_SDT_L, byte = insn & INSN_SDT_B;
+			if (xlat_hit(pa, load ? (ARM7_TLB_ABORT_D | ARM7_TLB_READ) : (ARM7_TLB_ABORT_D | ARM7_TLB_WRITE)))
+			{
+				if (uint8_t *const p = fastram_ptr(byte ? pa : (pa & ~3)))
+				{
+					const uint32_t rd = (insn >> 12) & 15;
+					if (load)
+						SetRegister(rd, byte ? *p : std::rotr(*reinterpret_cast<const uint32_t *>(p), 8 * (addr & 3)));
+					else
+					{
+						if (m_drc)
+							drc_code_write(pa);
+						if (byte)
+							*p = uint8_t(GetRegister(rd));
+						else
+							*reinterpret_cast<uint32_t *>(p) = GetRegister(rd);
+						ARM7_ICOUNT += 1; // stores take 2N
+					}
+					R15 += 4;
+					return;
+				}
+			}
+		}
+		if (cls == 0x04000000 || (cls == 0x06000000 && !(insn & 0x10)))
+		{
+			HandleMemSingle(insn);
+			R15 += 4;
+			return;
+		}
+		// halfword transfers and multiplies (not UMAAL, not swaps)
+		if (cls == 0 && (insn & 0x90) == 0x90 && m_archRev >= 3)
+		{
+			if (insn & 0x60)
+			{
+				HandleHalfWordDT(insn);
+				return;
+			}
+			if (!(insn & 0x01000000) && (insn & 0x0ff000f0) != 0x00400090)
+			{
+				if (insn & 0x800000)
+				{
+					if (insn & 0x00400000)
+						HandleSMulLong(insn);
+					else
+						HandleUMulLong(insn);
+				}
+				else
+					HandleMul(insn);
+				R15 += 4;
+				return;
+			}
+		}
+	}
+	(this->*ops_handler[((insn & 0xF000000) >> 24) + op_offset])(insn);
+}
+
+void arm7_cpu_device::execute_run()
+{
+	if (m_drc)
+		drc_execute_run();
+	else
+		execute_run_interp(false);
+}
+
+// the interpreter; single runs one instruction (used by the recompiler)
+void arm7_cpu_device::execute_run_interp(bool single)
+{
 
 	m_tlb_log = m_actual_log;
 	const bool debugging = machine().debug_flags & DEBUG_FLAG_ENABLED;
@@ -1944,198 +2163,7 @@ void arm7_cpu_device::execute_run()
 				goto skip_exec;
 			}
 
-			int op_offset = 0;
-			/* process condition codes for this instruction */
-			if ((insn >> INSN_COND_SHIFT) != COND_AL)
-			{
-				const uint32_t cond = insn >> INSN_COND_SHIFT;
-				if (cond == COND_NV)
-				{
-					if (m_archRev < 5)
-						{ UNEXECUTED();  goto skip_exec; }
-					op_offset = 0x10;
-				}
-				else if (!BIT(s_cond_table[cond], GET_CPSR >> 28))
-					{ UNEXECUTED();  goto skip_exec; }
-			}
-			/*******************************************************************/
-			/* If we got here - condition satisfied, so decode the instruction */
-			/*******************************************************************/
-			if (!op_offset)
-			{
-				// the common classes, straight to their handlers: data processing
-				// (immediate, or register with an immediate shift, excluding the
-				// PSR transfer space that also holds the v5 DSP multiplies) and
-				// single data transfers without the media bit pattern
-				const uint32_t cls = insn & 0x0e000000;
-				if ((cls == 0x02000000 || (cls == 0 && !(insn & 0x10))) && (insn & 0x01900000) != 0x01000000)
-				{
-					// immediate operand, Rd and Rn not PC: HandleALU without the
-					// operand decode and R15 cases
-					// (also a plain register operand: Rm, LSL #0, Rm not PC)
-					const uint32_t rdn = (insn >> 12) & 15, rnn = (insn >> 16) & 15;
-					if (rdn != 15 && rnn != 15 && (cls == 0x02000000 || ((insn & 0xff0) == 0 && (insn & 15) != 15)))
-					{
-						uint32_t op2, sc;
-						if (cls == 0x02000000)
-						{
-							const uint32_t by = (insn >> 8) & 15;
-							op2 = std::rotr<uint32_t>(insn & 0xff, by << 1);
-							sc = by ? (op2 & SIGN_BIT) : (GET_CPSR & C_MASK);
-						}
-						else
-						{
-							op2 = GetRegister(insn & 15);
-							sc = GET_CPSR & C_MASK;
-						}
-						const uint32_t rn = GetRegister(rnn);
-						uint32_t rd;
-						switch ((insn >> 21) & 15)
-						{
-						case OPCODE_AND: case OPCODE_TST: rd = rn & op2; HandleALULogicalFlags(rd, sc); break;
-						case OPCODE_EOR: case OPCODE_TEQ: rd = rn ^ op2; HandleALULogicalFlags(rd, sc); break;
-						case OPCODE_SUB: case OPCODE_CMP: rd = rn - op2; HandleALUSubFlags(rd, rn, op2); break;
-						case OPCODE_RSB: rd = op2 - rn; HandleALUSubFlags(rd, op2, rn); break;
-						case OPCODE_ADD: case OPCODE_CMN: rd = rn + op2; HandleALUAddFlags(rd, rn, op2); break;
-						case OPCODE_ADC: rd = rn + op2 + ((GET_CPSR & C_MASK) >> C_BIT); HandleALUAddFlags(rd, rn, op2); break;
-						case OPCODE_SBC: rd = rn - op2 - (GET_CPSR & C_MASK ? 0 : 1); HandleALUSubFlags(rd, rn, op2); break;
-						case OPCODE_RSC: rd = op2 - rn - (GET_CPSR & C_MASK ? 0 : 1); HandleALUSubFlags(rd, op2, rn); break;
-						case OPCODE_ORR: rd = rn | op2; HandleALULogicalFlags(rd, sc); break;
-						case OPCODE_MOV: rd = op2; HandleALULogicalFlags(rd, sc); break;
-						case OPCODE_BIC: rd = rn & ~op2; HandleALULogicalFlags(rd, sc); break;
-						default: /* MVN */ rd = ~op2; HandleALULogicalFlags(rd, sc); break;
-						}
-						if ((insn & 0x01800000) != 0x01000000) // not TST/TEQ/CMP/CMN
-							SetRegister(rdn, rd);
-						ARM7_ICOUNT += 2;
-						goto skip_exec;
-					}
-					HandleALU(insn);
-					goto skip_exec;
-				}
-				// push / pop on fast RAM within one 1K page: STMDB Rb{!}, {list
-				// without PC} and LDMIA Rb{!}, {list} (S clear, Rb not PC and, for
-				// loads, not in the list); exactly as HandleMemBlock does them
-				if (cls == 0x08000000 && m_fast_mem && (insn & 0xffff) && !(insn & INSN_BDT_S) && ((insn >> 16) & 15) != 15)
-				{
-					const uint32_t rb = (insn >> 16) & 15, list = insn & 0xffff;
-					const uint32_t n = std::popcount(list);
-					if ((insn & 0x01900000) == 0x01000000 && !(list & 0x8000)) // STMDB
-					{
-						const uint32_t start = GetRegister(rb) - n * 4;
-						offs_t pa = start;
-						if (((start ^ (start + n * 4 - 1)) & ~0x3ffU) == 0 && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
-						{
-							if (uint8_t *p = fastram_ptr(pa & ~3))
-							{
-								for (int i = 0; i < 16; i++)
-									if (BIT(list, i))
-									{
-										*reinterpret_cast<uint32_t *>(p) = GetRegister(i);
-										p += 4;
-									}
-								if (insn & INSN_BDT_W)
-									SetRegister(rb, GetRegister(rb) - n * 4);
-								ARM7_ICOUNT += 2 - int(n); // (n-1)S + 2N, then the -3 below
-								R15 += 4;
-								goto skip_exec;
-							}
-						}
-					}
-					else if ((insn & 0x01900000) == 0x00900000 && !BIT(list, rb)) // LDMIA
-					{
-						const uint32_t start = GetRegister(rb) & ~3;
-						offs_t pa = start;
-						if (((start ^ (start + n * 4 - 1)) & ~0x3ffU) == 0 && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
-						{
-							const uint8_t *p = fastram_ptr(pa);
-							// a loaded PC with bit 0 set switches to Thumb: leave that to the handler
-							if (p && !((list & 0x8000) && (reinterpret_cast<const uint32_t *>(p)[n - 1] & 1)))
-							{
-								for (int i = 0; i < 16; i++)
-									if (BIT(list, i))
-									{
-										SetRegister(i, *reinterpret_cast<const uint32_t *>(p));
-										p += 4;
-									}
-								if (insn & INSN_BDT_W)
-									SetRegister(rb, GetRegister(rb) + n * 4);
-								// LDM: nS + 1N + 1I, PC loads 2 more
-								ARM7_ICOUNT += 1 - int(n) - ((list & 0x8000) ? 2 : 0);
-								if (!(list & 0x8000))
-									R15 += 4;
-								goto skip_exec;
-							}
-						}
-					}
-				}
-				// B / BL
-				if (cls == 0x0a000000 && !(m_archFlags & ARCHFLAG_MODE26))
-				{
-					if (insn & INSN_BL)
-						SetRegister(14, R15 + 4);
-					R15 += util::sext((insn & INSN_BRANCH) << 2, 26) + 8;
-					goto skip_exec;
-				}
-				// LDR/STR(B) Rd, [Rn, #+-imm] (no write-back, Rd != PC) on fast RAM
-				if ((insn & 0x0f200000) == 0x05000000 && (insn & 0xf000) != 0xf000 && m_fast_mem)
-				{
-					const uint32_t rn = (insn >> 16) & 15;
-					const uint32_t base = (rn == 15) ? R15 + 8 : GetRegister(rn);
-					const uint32_t addr = (insn & INSN_SDT_U) ? base + (insn & 0xfff) : base - (insn & 0xfff);
-					offs_t pa = addr;
-					const bool load = insn & INSN_SDT_L, byte = insn & INSN_SDT_B;
-					if (xlat_hit(pa, load ? (ARM7_TLB_ABORT_D | ARM7_TLB_READ) : (ARM7_TLB_ABORT_D | ARM7_TLB_WRITE)))
-					{
-						if (uint8_t *const p = fastram_ptr(byte ? pa : (pa & ~3)))
-						{
-							const uint32_t rd = (insn >> 12) & 15;
-							if (load)
-								SetRegister(rd, byte ? *p : std::rotr(*reinterpret_cast<const uint32_t *>(p), 8 * (addr & 3)));
-							else
-							{
-								if (byte)
-									*p = uint8_t(GetRegister(rd));
-								else
-									*reinterpret_cast<uint32_t *>(p) = GetRegister(rd);
-								ARM7_ICOUNT += 1; // stores take 2N
-							}
-							R15 += 4;
-							goto skip_exec;
-						}
-					}
-				}
-				if (cls == 0x04000000 || (cls == 0x06000000 && !(insn & 0x10)))
-				{
-					HandleMemSingle(insn);
-					R15 += 4;
-					goto skip_exec;
-				}
-				// halfword transfers and multiplies (not UMAAL, not swaps)
-				if (cls == 0 && (insn & 0x90) == 0x90 && m_archRev >= 3)
-				{
-					if (insn & 0x60)
-					{
-						HandleHalfWordDT(insn);
-						goto skip_exec;
-					}
-					if (!(insn & 0x01000000) && (insn & 0x0ff000f0) != 0x00400090)
-					{
-						if (insn & 0x800000)
-						{
-							if (insn & 0x00400000)
-								HandleSMulLong(insn);
-							else
-								HandleUMulLong(insn);
-						}
-						else
-							HandleMul(insn);
-						R15 += 4;
-						goto skip_exec;
-					}
-				}
-			}
-			(this->*ops_handler[((insn & 0xF000000) >> 24) + op_offset])(insn);
+			exec_arm(insn);
 		}
 
 skip_exec:
@@ -2145,7 +2173,7 @@ skip_exec:
 
 		/* All instructions remove 3 cycles.. Others taking less / more will have adjusted this # prior to here */
 		m_icount -= 3;
-	} while (m_icount > 0);
+	} while (m_icount > 0 && !single);
 
 	m_tlb_log = 0;
 }
@@ -3040,7 +3068,7 @@ void arm7_cpu_device::arm7_cpu_write32(offs_t addr, uint32_t data)
 	}
 
 	addr &= ~3;
-	if (uint8_t *const p = fastram_ptr(addr)) { *reinterpret_cast<uint32_t *>(p) = data; return; }
+	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); *reinterpret_cast<uint32_t *>(p) = data; return; }
 	m_program->write_dword(addr, data);
 }
 
@@ -3061,7 +3089,7 @@ void arm7_cpu_device::arm7_cpu_write16(offs_t addr, uint16_t data)
 	}
 
 	addr &= ~1;
-	if (uint8_t *const p = fastram_ptr(addr)) { *reinterpret_cast<uint16_t *>(p) = data; return; }
+	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); *reinterpret_cast<uint16_t *>(p) = data; return; }
 	m_program->write_word(addr, data);
 }
 
@@ -3080,7 +3108,7 @@ void arm7_cpu_device::arm7_cpu_write8(offs_t addr, uint8_t data)
 		}
 	}
 
-	if (uint8_t *const p = fastram_ptr(addr)) { *p = data; return; }
+	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); *p = data; return; }
 	m_program->write_byte(addr, data);
 }
 
@@ -3165,3 +3193,5 @@ uint8_t arm7_cpu_device::arm7_cpu_read8(offs_t addr)
 		return *p;
 	return m_program->read_byte(addr);
 }
+
+#include "arm7drc.hxx"

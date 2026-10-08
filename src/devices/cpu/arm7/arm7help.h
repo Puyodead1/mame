@@ -217,6 +217,8 @@ inline void arm7_cpu_device::fast_write32(offs_t addr, uint32_t data)
 	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
 		if (uint8_t *const p = fastram_ptr(pa & ~3))
 		{
+			if (m_drc)
+				drc_code_write(pa);
 			*reinterpret_cast<uint32_t *>(p) = data;
 			return;
 		}
@@ -229,6 +231,8 @@ inline void arm7_cpu_device::fast_write16(offs_t addr, uint16_t data)
 	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
 		if (uint8_t *const p = fastram_ptr(pa & ~1))
 		{
+			if (m_drc)
+				drc_code_write(pa);
 			*reinterpret_cast<uint16_t *>(p) = data;
 			return;
 		}
@@ -241,6 +245,8 @@ inline void arm7_cpu_device::fast_write8(offs_t addr, uint8_t data)
 	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
 		if (uint8_t *const p = fastram_ptr(pa))
 		{
+			if (m_drc)
+				drc_code_write(pa);
 			*p = data;
 			return;
 		}

@@ -1891,9 +1891,6 @@ void vsmilpro_state::machine_start()
 	// Speedup: the boot ROM's idle task (0x1001098C) is an endless counting
 	// loop whose counter lives at 0x101E05E4; sleep until the next interrupt
 	// TODO: equivalent for FA's idle task
-	// the ARM926 has caches, so the ARM7 prefetch buffer model is not needed
-	m_maincpu->set_direct_fetch(true);
-
 	// direct SDRAM access for the CPU core, except the boot ROM idle counter
 	// (watched by the tap below); off with the debugger so watchpoints work
 	if (!(machine().debug_flags & DEBUG_FLAG_ENABLED))
@@ -2087,6 +2084,9 @@ INPUT_PORTS_END
 void vsmilpro_state::vsmilpro(machine_config &config)
 {
 	ARM9(config, m_maincpu, 150'000'000); // ARM926EJ-S
+	// the ARM926 has caches, so the ARM7 prefetch buffer model is not needed
+	m_maincpu->set_direct_fetch(true);
+	m_maincpu->set_drc(!getenv("VFLASH_NO_DRC"));
 	m_maincpu->set_addrmap(AS_PROGRAM, &vsmilpro_state::vsmilpro_map);
 
 	NVRAM(config, m_nvram, nvram_device::DEFAULT_NONE);

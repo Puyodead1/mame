@@ -24,6 +24,10 @@
  *  PUBLIC FUNCTIONS
  ***************************************************************************************************/
 
+class drc_cache;
+class drcuml_state;
+namespace uml { class code_handle; }
+
 class arm7_cpu_device : public cpu_device, public arm7_disassembler::config
 {
 public:
@@ -53,6 +57,9 @@ public:
 	// fetch instructions directly instead of emulating the ARM7 prefetch
 	// buffer (for cached cores where software flushes caches after writing code)
 	void set_direct_fetch(bool enable) { m_direct_fetch = enable; }
+	// dynamic recompiler for ARM state (arm7drc.hxx); needs direct fetch and
+	// is not used with the debugger
+	void set_drc(bool enable) { m_drc_requested = enable; }
 
 	// fast RAM: physical ranges of plain little-endian RAM accessed through a
 	// host pointer instead of the address space (no taps or watchpoints there)
@@ -270,6 +277,37 @@ protected:
 	struct dfetch_entry { uint32_t tag = ~0U; uint32_t pbase = 0; uint8_t *host = nullptr; };
 	dfetch_entry m_dfetch[DFETCH_SIZE];
 	bool direct_fetch(offs_t vaddr, bool thumb, uint32_t &insn);
+	void exec_arm(uint32_t insn);
+	void execute_run_interp(bool single);
+
+	// dynamic recompiler
+	bool m_drc_requested = false;
+	bool m_drc = false;
+	bool m_drc_dirty = true;
+	std::unique_ptr<drc_cache> m_drc_cache;
+	std::unique_ptr<drcuml_state> m_drcuml;
+	uml::code_handle *m_drc_entry = nullptr;
+	uml::code_handle *m_drc_nocode = nullptr;
+	uml::code_handle *m_drc_out_of_cycles = nullptr;
+	uint32_t m_drc_insn = 0;
+	uint32_t m_drc_flush_count = 0;
+	offs_t m_drc_pages_base = 0;          // physical range with code page flags
+	uint32_t m_drc_pages_count = 0;
+	std::unique_ptr<uint8_t[]> m_drc_page_flags; // 1 = compiled code here (identity mapped), 2 = remapped code
+	void drc_start();
+	void drc_execute_run();
+	void drc_flush();
+	void drc_static_generate();
+	void drc_compile(uint32_t mode, offs_t pc);
+	void drc_code_write(offs_t pa)
+	{
+		const offs_t page = (pa - m_drc_pages_base) >> 10;
+		if (page < m_drc_pages_count && m_drc_page_flags[page])
+			drc_code_written(page);
+	}
+	void drc_code_written(offs_t page);
+	static void drc_interp_one(void *param);
+	static void drc_check_irq(void *param);
 	// inline cache check before the virtual translate (cache entries only
 	// come from arm7_cpu_device::translate_vaddr_to_paddr)
 	bool translate_fast(offs_t &vaddr, const int flags);
