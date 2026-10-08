@@ -64,8 +64,12 @@ void arm7_cpu_device::drc_check_irq(void *param)
 	reinterpret_cast<arm7_cpu_device *>(param)->arm7_check_irq_state();
 }
 
+static uint64_t s_drc_compiles, s_drc_invalidates, s_drc_dirty_flushes, s_drc_compile_insns;
+static struct drc_stats_dump { ~drc_stats_dump() { if (getenv("ARM_DRC_STATS")) printf("DRC compiles %llu (%llu insns) invalidated pages %llu flushes %llu\n", (unsigned long long)s_drc_compiles, (unsigned long long)s_drc_compile_insns, (unsigned long long)s_drc_invalidates, (unsigned long long)s_drc_dirty_flushes); } } s_drc_stats_dump;
+
 void arm7_cpu_device::drc_code_written(offs_t page)
 {
+	s_drc_invalidates++;
 	const uint8_t flags = m_drc_page_flags[page];
 	m_drc_page_flags[page] = 0;
 	if (flags & 2)
@@ -83,6 +87,7 @@ void arm7_cpu_device::drc_flush()
 	m_drcuml->reset();
 	m_drc_dirty = false;
 	m_drc_flush_count++;
+	s_drc_dirty_flushes++;
 
 	// page flags cover the fast RAM (set up by the driver after device_start)
 	if (!m_drc_page_flags && m_fastram_count)
@@ -304,11 +309,13 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 		};
 
 		UML_HASH(block, mode, startpc);
+		s_drc_compiles++;
 
 		offs_t pc = startpc;
 		bool ended = false;
 		for (int n = 0; n < DRC_MAX_INSNS && !ended; n++, pc += 4)
 		{
+			s_drc_compile_insns++;
 			// fetch the way the interpreter does
 			offs_t phys = pc;
 			if ((m_control & COPRO_CTRL_MMU_EN) && !translate_fast(phys, ARM7_TLB_ABORT_P | ARM7_TLB_READ))
