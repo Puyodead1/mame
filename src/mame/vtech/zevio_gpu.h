@@ -69,6 +69,7 @@ private:
 
 	// pixels
 	bool texel(float u, float v, bool normalized, float &r, float &g, float &b, float &a) const;
+	bool texel_point(int tu, int tv, float &r, float &g, float &b, float &a) const;
 	void plot(int x, int y, float z, float r, float g, float b, float a, bool depth);
 	bool in_clip(int x, int y) const;
 

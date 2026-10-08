@@ -1125,7 +1125,11 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		if (!in_sdram(map) || !in_sdram(tiles))
 			continue;
 		const u32 scroll = m_disp_regs[(0x110 / 4) + layer];
-		const int mapw = 16 << ((m_disp_regs[0x104 / 4] >> (layer * 8)) & 3);
+		// +0x104 byte n: bits 0-1 map width (16/32/64/128 tiles), bits 2-3 tile
+		// format (0 = 8bpp, 2 = 4bpp as in FA's text overlay)
+		const u8 mode = m_disp_regs[0x104 / 4] >> (layer * 8);
+		const int mapw = 16 << (mode & 3);
+		const bool bpp4 = ((mode >> 2) & 3) == 2;
 		const int sx = scroll & 0xfff, sy = (scroll >> 16) & 0xfff;
 		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 		{
@@ -1136,9 +1140,17 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 					continue;
 				const int lx = (x + sx) & (mapw * 8 - 1), ly = (y + sy) & (mapw * 8 - 1);
 				const u16 entry = ram_r16(map + ((ly >> 3) * mapw + (lx >> 3)) * 2);
-				const u8 index = ram_r8(tiles + (entry & 0xfff) * 64 + (ly & 7) * 8 + (lx & 7));
+				u8 index;
+				if (bpp4)
+				{
+					// TODO: palette select from the entry's upper bits
+					const u8 b = ram_r8(tiles + (entry & 0xfff) * 32 + (ly & 7) * 4 + ((lx & 7) >> 1));
+					index = BIT(lx, 0) ? (b >> 4) : (b & 0x0f);
+				}
+				else
+					index = ram_r8(tiles + (entry & 0xfff) * 64 + (ly & 7) * 8 + (lx & 7));
 				const u16 color = m_disp_regs[(0x800 / 4) + (index >> 1)] >> (BIT(index, 0) * 16);
-				if (color == 0x83e0) // UI transparency key
+				if (color == 0x83e0 || color == 0x0000) // UI transparency key, or empty colour
 					continue;
 				dst[x] = bgr555(color);
 			}
