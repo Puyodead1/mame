@@ -42,6 +42,7 @@
 
 #include "emu.h"
 
+#include "zevio_dsp.h"
 #include "zevio_gpu.h"
 #include "zevio_spu.h"
 
@@ -66,7 +67,7 @@
 #define LOG_SYS     (1U << 10)
 #define LOG_DEBUGTX (1U << 11)
 
-#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX)
+#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_CD)
 #include "logmacro.h"
 
 #include <deque>
@@ -85,6 +86,7 @@ public:
 		m_nvram(*this, "spiflash"),
 		m_spu(*this, "spu"),
 		m_gpu(*this, "gpu"),
+		m_dsp(*this, "dsp"),
 		m_sdram(*this, "sdram"),
 		m_spi_region(*this, "spi"),
 		m_io_keys(*this, "KEYS"),
@@ -137,6 +139,7 @@ private:
 	required_device<nvram_device> m_nvram;
 	required_device<zevio_spu_device> m_spu;
 	required_device<zevio_gpu_device> m_gpu;
+	required_device<zevio_dsp_hle_device> m_dsp;
 	required_shared_ptr<u32> m_sdram;
 	optional_memory_region m_spi_region;
 	required_ioport m_io_keys;
@@ -181,7 +184,9 @@ private:
 
 	// interrupt controller
 	u32 m_int_raw;      // level of each source
-	u32 m_int_pending;  // currently the same as m_int_raw
+	u32 m_int_pending;
+	u32 m_int_latched;  // edge sources
+	static constexpr u32 EDGE_SOURCES = (1U << 17) | (1U << 18);
 	u32 m_int_enable[2];
 	u32 m_int_regs[0x400 / 4];
 	void set_irq(int source, int state);
@@ -203,7 +208,6 @@ private:
 	void rtc_w(offs_t offset, u32 data, u32 mem_mask);
 	template <int Bank> u32 gpio_r(offs_t offset);
 	template <int Bank> void gpio_w(offs_t offset, u32 data, u32 mem_mask);
-	void update_mbox_irqs();
 
 	// timers
 	u32 m_timer_regs[0x40 / 4];
@@ -287,6 +291,8 @@ private:
 	s32 m_cd_dir;       // direction of the last sled command
 	s32 m_cd_jump_n;    // 2N track jump count from the last $7x command
 	bool m_cd_sled_armed;
+	u8 m_cd_cal;         // last $3AA8xx calibration value
+	u32 m_cd_rx;        // servo read result
 	u32 m_cd_ptr;       // decoder write pointer
 	s32 m_cd_len;
 	bool m_cd_running;
@@ -314,13 +320,18 @@ private:
 
 void vsmilpro_state::set_irq(int source, int state)
 {
-	// sources are level sensitive: the ROM's tick handler only acknowledges the
-	// timer block, never the controller
+	// Most sources are level sensitive: the ROM's tick handler only
+	// acknowledges the timer block, never the controller. The DSP mailbox
+	// sources latch on a rising edge until written to +0x04 (software sets
+	// 0xDC000204 bits 17/18 for them; FA counts each IRQ 17 as one message).
+	const u32 bit = 1U << source;
+	if (state && !(m_int_raw & bit) && (EDGE_SOURCES & bit))
+		m_int_latched |= bit;
 	if (state)
-		m_int_raw |= 1U << source;
+		m_int_raw |= bit;
 	else
-		m_int_raw &= ~(1U << source);
-	m_int_pending = m_int_raw;
+		m_int_raw &= ~bit;
+	m_int_pending = (m_int_raw & ~EDGE_SOURCES) | m_int_latched;
 	update_cpu_irqs();
 }
 
@@ -359,7 +370,8 @@ void vsmilpro_state::intc_w(offs_t offset, u32 data, u32 mem_mask)
 	{
 	case 0x004 / 4: case 0x104 / 4:
 		// write 1 to clear; level sources stay pending while asserted
-		m_int_pending = m_int_raw;
+		m_int_latched &= ~data;
+		m_int_pending = (m_int_raw & ~EDGE_SOURCES) | m_int_latched;
 		break;
 	case 0x008 / 4: m_int_enable[0] |= data; break;
 	case 0x00c / 4: m_int_enable[0] &= ~data; break;
@@ -377,12 +389,6 @@ void vsmilpro_state::intc_w(offs_t offset, u32 data, u32 mem_mask)
     System control (0x900A0000), PLL, RTC, GPIO
 ***************************************************************************/
 
-void vsmilpro_state::update_mbox_irqs()
-{
-	set_irq(IRQ_MBOX0, m_sysctl[0x104 / 4] != 0);
-	set_irq(IRQ_MBOX1, m_sysctl[0x110 / 4] != 0);
-}
-
 u32 vsmilpro_state::sysctl_r(offs_t offset)
 {
 	switch (offset)
@@ -398,8 +404,6 @@ u32 vsmilpro_state::sysctl_r(offs_t offset)
 	case 0x01c / 4: return 0;
 	case 0x030 / 4: return m_sysctl[offset];
 	default:
-		if (offset >= 0x100 / 4 && offset < 0x120 / 4)
-			LOGMASKED(LOG_SYS, "%08x: mailbox read %03x = %08x\n", m_maincpu->pc(), offset * 4, m_sysctl[offset]);
 		return m_sysctl[offset];
 	}
 }
@@ -442,11 +446,10 @@ void vsmilpro_state::sysctl_w(offs_t offset, u32 data, u32 mem_mask)
 		break;
 	}
 	COMBINE_DATA(&m_sysctl[offset]);
-	if (offset >= 0x100 / 4 && offset < 0x120 / 4)
-	{
-		LOGMASKED(LOG_SYS, "%08x: mailbox write %03x = %08x\n", m_maincpu->pc(), offset * 4, data);
-		update_mbox_irqs();
-	}
+	if (offset == 0x020 / 4)
+		m_dsp->run_w(m_sysctl[offset]);
+	else if (offset == 0x024 / 4)
+		m_dsp->windows_w(m_sysctl[offset]);
 }
 
 u32 vsmilpro_state::pll_r(offs_t offset)
@@ -1083,6 +1086,33 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		}
 	}
 
+	// layer 5: planar YCbCr 4:2:0 at +0x164/+0x168/+0x16C, window +0x138/+0x13C,
+	// stride = window width (DSP movie and photo output)
+	if (BIT(enable, 5))
+	{
+		const u32 a = m_disp_regs[0x138 / 4], b = m_disp_regs[0x13c / 4];
+		const int x0 = a & 0x7ff, y0 = (a >> 16) & 0x7ff, x1 = b & 0x7ff, y1 = (b >> 16) & 0x7ff;
+		const int w = x1 - x0 + 1;
+		const u32 yb = m_disp_regs[0x164 / 4], ub = m_disp_regs[0x168 / 4], vb = m_disp_regs[0x16c / 4];
+		if (w > 2 && in_sdram(yb) && in_sdram(ub) && in_sdram(vb))
+			for (int y = std::max(y0, cliprect.top()); y <= std::min(y1, cliprect.bottom()); y++)
+			{
+				u32 *dst = &bitmap.pix(y);
+				const int ly = y - y0;
+				for (int x = std::max(x0, cliprect.left()); x <= std::min(x1, cliprect.right()); x++)
+				{
+					const int lx = x - x0;
+					const float yy = ram_r8(yb + ly * w + lx);
+					const float cb = ram_r8(ub + (ly / 2) * (w / 2) + lx / 2) - 128.0f;
+					const float cr = ram_r8(vb + (ly / 2) * (w / 2) + lx / 2) - 128.0f;
+					const int r = std::clamp(int(yy + 1.402f * cr), 0, 255);
+					const int g = std::clamp(int(yy - 0.344136f * cb - 0.714136f * cr), 0, 255);
+					const int bl = std::clamp(int(yy + 1.772f * cb), 0, 255);
+					dst[x] = rgb_t(r, g, bl);
+				}
+			}
+	}
+
 	static const int window_regs[4] = { 0x170, 0x120, 0x128, 0x178 };
 	for (int layer = 0; layer < 4; layer++)
 	{
@@ -1207,6 +1237,8 @@ void vsmilpro_state::dcdma_w(offs_t offset, u32 data, u32 mem_mask)
 				const u32 next = ram_r32(desc + 16), count = ram_r32(desc + 20);
 				const s32 sstride = ram_r32(desc + 24), dstride = ram_r32(desc + 28);
 				LOGMASKED(LOG_DMA, "dcdma ch%d desc %08x: %08x -> %08x count %d (%08x %08x)\n", ch, desc, src, dst, count, ram_r32(desc), ram_r32(desc + 4));
+				if (dst == 0xdc020000)
+					m_dsp->program_loaded(count); // DSP program memory segment
 				for (u32 i = 0; i < count; i++)
 				{
 					const u32 d = dst + i * dstride;
@@ -1277,9 +1309,11 @@ void vsmilpro_state::cd_update_irq()
 
 bool vsmilpro_state::cd_sens(u8 select)
 {
+	if (select == 0x30)
+		return m_cd_head <= CD_HOME;         // sled inner limit switch
 	switch (select & 0xf0)
 	{
-	case 0x30: return m_cd_head <= CD_HOME;  // sled inner limit switch
+	case 0x30: return false;                 // other $3x selects: calibration comparators (FA loops on $38 until 0)
 	case 0x40: return true;                  // XBUSY: sequence finished
 	case 0x50: return m_cdrom->exists();     // FOK
 	case 0xa0: return m_cdrom->exists();     // GFS
@@ -1329,16 +1363,28 @@ void vsmilpro_state::cd_servo_write(int nbits, u64 value, bool sens)
 	case 24:
 		if ((cmd & 0xf0) == 0x70)
 			m_cd_jump_n = (value >> 4) & 0xffff;
+		else if (cmd == 0x3a && ((value >> 8) & 0xff) == 0xa8)
+			m_cd_cal = value & 0xff; // swept by FA's balance calibration (sub_109E5610)
 		break;
 	case 32:
-		// traverse count for a long sled move; only meaningful right after a
-		// $22/$23 sled command (the init sequence also writes $B0 values)
-		if ((cmd & 0xf0) == 0xb0 && m_cd_sled_armed)
+		// traverse count for a long sled move (count in bits 27-12). The init
+		// sequence also writes $B0 values, so only act while the disc spins.
+		// The direction comes from a preceding $22/$23 when there is one;
+		// FA's seek sends none, so fall back to the decoder's target MSF.
+		// TODO: find the direction bit
+		if ((cmd & 0xf0) == 0xb0 && (m_cd_sled_armed || (m_cd_regs[0x40 / 4] & 1)))
 		{
+			s32 dir = m_cd_dir;
+			if (!m_cd_sled_armed)
+			{
+				const u32 t = m_cd_regs[0x1c / 4];
+				const s32 target = (from_bcd(t >> 16) * 60 + from_bcd(t >> 8)) * 75 + from_bcd(t);
+				dir = (target >= m_cd_head) ? 1 : -1;
+			}
 			m_cd_sled_armed = false;
-			const s32 c = (value >> 8) & 0xfffff;
+			const s32 c = (value >> 12) & 0xffff;
 			const s32 tracks = (c <= 2399) ? c * 100 / 60 : c * 100 / 90;
-			cd_jump_tracks(m_cd_dir * tracks);
+			cd_jump_tracks(dir * tracks);
 		}
 		break;
 	}
@@ -1516,7 +1562,7 @@ u32 vsmilpro_state::cd_r(offs_t offset)
 {
 	switch (offset)
 	{
-	case 0x10 / 4: return 0; // servo RX data: calibration monitor reads accept anything
+	case 0x10 / 4: return m_cd_rx; // servo RX data
 	case 0x24 / 4: return m_cd_ptr;
 	default:
 		return m_cd_regs[offset];
@@ -1541,6 +1587,14 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 			LOGMASKED(LOG_CD, "%08x: cd servo %s %d bits tx %09x\n", m_maincpu->pc(), read ? "read" : "write", nbits, value);
 			if (!read)
 				cd_servo_write(nbits, value, BIT(m_cd_regs[0x14 / 4], 3));
+			else
+			{
+				// monitor reads ($39 aa 00): calibration loops accept any value
+				// except FA's sweep of $3AA8xx, which waits for monitor $1F to
+				// enter a window; let it follow the swept value
+				const u8 cmd = u8(value >> (nbits - 8)), addr = u8(value >> (nbits - 16));
+				m_cd_rx = (cmd == 0x39 && addr == 0x1f) ? u8(m_cd_cal - 0x40) : 0;
+			}
 			m_cd_regs[0x14 / 4] &= ~3; // start and read bits clear when the transfer completes
 			m_cd_regs[0x64 / 4] |= read ? 2 : 1;
 			cd_update_irq();
@@ -1634,6 +1688,7 @@ void vsmilpro_state::vsmilpro_map(address_map &map)
 	map(0x90080000, 0x9008003f).noprw(); // write-once key
 	map(0x90090000, 0x900900ff).rw(FUNC(vsmilpro_state::rtc_r), FUNC(vsmilpro_state::rtc_w));
 	map(0x900a0000, 0x900a0fff).rw(FUNC(vsmilpro_state::sysctl_r), FUNC(vsmilpro_state::sysctl_w));
+	map(0x900a0100, 0x900a011f).rw(m_dsp, FUNC(zevio_dsp_hle_device::mbox_r), FUNC(zevio_dsp_hle_device::mbox_w));
 	map(0x900b0000, 0x900b003f).rw(FUNC(vsmilpro_state::pll_r), FUNC(vsmilpro_state::pll_w));
 	map(0x900c0000, 0x900c003f).rw(FUNC(vsmilpro_state::timer_r), FUNC(vsmilpro_state::timer_w));
 	map(0x900d0000, 0x900d00ff).rw(FUNC(vsmilpro_state::gpio_r<1>), FUNC(vsmilpro_state::gpio_w<1>));
@@ -1670,6 +1725,7 @@ void vsmilpro_state::machine_start()
 	m_dsp_mem = std::make_unique<u16[]>(0x80000);
 	m_spu->set_ram(m_sdram.target(), SDRAM_BASE, SDRAM_SIZE);
 	m_gpu->set_ram(m_sdram.target(), SDRAM_BASE, SDRAM_SIZE);
+	m_dsp->set_ram(m_sdram.target(), SDRAM_BASE, SDRAM_SIZE);
 
 	m_tick_timer = timer_alloc(FUNC(vsmilpro_state::tick_cb), this);
 	for (auto &t : m_bcdma_timer)
@@ -1693,6 +1749,7 @@ void vsmilpro_state::machine_start()
 
 	save_item(NAME(m_int_raw));
 	save_item(NAME(m_int_pending));
+	save_item(NAME(m_int_latched));
 	save_item(NAME(m_int_enable));
 	save_item(NAME(m_int_regs));
 	save_item(NAME(m_sysctl));
@@ -1720,7 +1777,7 @@ void vsmilpro_state::machine_start()
 
 void vsmilpro_state::machine_reset()
 {
-	m_int_raw = m_int_pending = 0;
+	m_int_raw = m_int_pending = m_int_latched = 0;
 	m_int_enable[0] = m_int_enable[1] = 0;
 	std::fill(std::begin(m_int_regs), std::end(m_int_regs), 0);
 	std::fill(std::begin(m_sysctl), std::end(m_sysctl), 0);
@@ -1771,6 +1828,8 @@ void vsmilpro_state::machine_reset()
 	m_cd_dir = 1;
 	m_cd_jump_n = 0;
 	m_cd_sled_armed = false;
+	m_cd_cal = 0;
+	m_cd_rx = 0;
 	m_cd_ptr = 0;
 	m_cd_len = 0;
 	m_cd_running = false;
@@ -1861,6 +1920,10 @@ void vsmilpro_state::vsmilpro(machine_config &config)
 	m_screen->set_screen_update(FUNC(vsmilpro_state::screen_update));
 
 	SPEAKER(config, "speaker", 2).front();
+
+	ZEVIO_DSP_HLE(config, m_dsp);
+	m_dsp->msg_irq_cb().set([this] (int state) { set_irq(IRQ_MBOX0, state); });
+	m_dsp->reply_irq_cb().set([this] (int state) { set_irq(IRQ_MBOX1, state); });
 
 	ZEVIO_GPU(config, m_gpu);
 	m_gpu->irq_cb().set([this] (int state) { set_irq(IRQ_GPU, state); });
