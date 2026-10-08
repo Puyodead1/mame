@@ -357,6 +357,7 @@ void zevio_gpu_device::plot(int x, int y, float z, float r, float g, float b, fl
 		b = b * kb + db * (1.0f - kb);
 	}
 	m_stat_pixels++;
+	m_total_pixels++;
 	vram_w(x, y, f_to_bgr555(r, g, b));
 }
 
@@ -380,6 +381,7 @@ zevio_gpu_device::vertex_t zevio_gpu_device::fetch_vertex(u32 addr, u8 fmt) cons
 	int i = 2;
 	if (BIT(fmt, 5))
 	{
+		v.lit = true;
 		const u32 w2 = rd32(addr + 8);
 		v.nx = f16_to_float(w1 >> 16);
 		v.ny = f16_to_float(w2 & 0xffff);
@@ -414,14 +416,37 @@ void zevio_gpu_device::transform(vertex_t &v) const
 	const float z = reg_f(0x46) * sx + reg_f(0x47) * sy + reg_f(0x48) * sz + reg_f(0x4e);
 	v.x = x;
 	v.y = y;
-	v.z = -z; // eye space looks down -Z; keep positive depth from here on
+	v.z = z; // positive eye Z is in front (particles at z=+0.03 project on-screen)
 
-	// ambient light (0x70); directional lights are TODO
-	float ar, ag, ab;
-	bgr555_to_f(m_r[0x70], ar, ag, ab);
-	v.r *= ar;
-	v.g *= ag;
-	v.b *= ab;
+	// lighting only for vertices with normals: ambient (0x70) plus three
+	// directional lights (directions 0x60/0x64/0x68, colours 0x6C-0x6E)
+	if (!v.lit)
+		return;
+	float nx = reg_f(0x40) * v.nx + reg_f(0x41) * v.ny + reg_f(0x42) * v.nz;
+	float ny = reg_f(0x43) * v.nx + reg_f(0x44) * v.ny + reg_f(0x45) * v.nz;
+	float nz = reg_f(0x46) * v.nx + reg_f(0x47) * v.ny + reg_f(0x48) * v.nz;
+	const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+	if (len > 0.0f)
+	{
+		nx /= len; ny /= len; nz /= len;
+	}
+	float lr, lg, lb;
+	bgr555_to_f(m_r[0x70], lr, lg, lb);
+	for (int i = 0; i < 3; i++)
+	{
+		const int d = 0x60 + i * 4;
+		const float dot = -(nx * reg_f(d) + ny * reg_f(d + 1) + nz * reg_f(d + 2));
+		if (dot <= 0.0f)
+			continue;
+		float cr, cg, cb;
+		bgr555_to_f(m_r[0x6c + i], cr, cg, cb);
+		lr += cr * dot;
+		lg += cg * dot;
+		lb += cb * dot;
+	}
+	v.r *= std::min(lr, 1.0f);
+	v.g *= std::min(lg, 1.0f);
+	v.b *= std::min(lb, 1.0f);
 }
 
 // perspective projection to screen; returns false if behind the near plane
@@ -443,6 +468,7 @@ void zevio_gpu_device::draw_triangle(const vertex_t &a, const vertex_t &b, const
 	// screen-space edge functions over the bounding box, perspective-correct UVs
 	const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
 	m_stat_tris++;
+	m_total_tris++;
 	if (std::fabs(area) < 1e-6f)
 		return;
 	const int cx0 = std::max<int>(m_clip0 & 0xfff, 0), cy0 = std::max<int>((m_clip0 >> 12) & 0xfff, 0);
@@ -493,6 +519,17 @@ void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 {
 	if (m_no3d) return;
 	const bool textured = BIT(m_w1c, 6);
+	// Bratz draws particles at eye z > 0 and full-screen quads at z < 0, so
+	// the divide seems sign-blind: mirror triangles entirely at negative z
+	// (same x/z, y/z) so depth and clipping work on positive z.
+	// TODO: confirm on hardware
+	if (a.z < 0 && b.z < 0 && c.z < 0)
+		for (vertex_t *p : { &a, &b, &c })
+		{
+			p->x = -p->x;
+			p->y = -p->y;
+			p->z = -p->z;
+		}
 	// clip against the near plane in eye space, then project
 	const float near_z = 1.0f / 4096.0f;
 	vertex_t in[3] = { a, b, c };
@@ -515,6 +552,8 @@ void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 			out[n++] = m;
 		}
 	}
+	if ((VERBOSE & LOG_LIST) && (m_stat_dbg2++ % 20000) == 0)
+		LOGMASKED(LOG_LIST, "tri3d n=%d z %f %f %f total tris %d pixels %d xy %f,%f clip %06x-%06x\n", n, a.z, b.z, c.z, m_total_tris, m_total_pixels, a.x, a.y, m_clip0, m_clip1);
 	if (n < 3)
 		return;
 	for (int i = 0; i < n; i++)
@@ -562,10 +601,15 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 	}
 	for (auto &v : verts)
 		transform(v);
-	if ((VERBOSE & LOG_LIST) && n && m_stat_dbg < 40)
+	if ((VERBOSE & LOG_LIST) && n && (m_stat_dbg++ % 5000) == 0)
 	{
 		m_stat_dbg++;
-		LOGMASKED(LOG_LIST, "prim %08x v0 eye (%f %f %f) uv %f %f col %f %f %f\n", header, verts[0].x, verts[0].y, verts[0].z, verts[0].u, verts[0].v, verts[0].r, verts[0].g, verts[0].b);
+		vertex_t raw = fetch_vertex(BIT(fmt, 6) ? m_vtxbase + rd16(addr - ((n + 1) / 2) * 4) * 4 : addr - n * wpv * 4, fmt & 0x3f);
+		LOGMASKED(LOG_LIST, "prim %08x v0 raw (%f %f %f) eye (%f %f %f) S %f %f %f R %f %f %f / %f %f %f / %f %f %f T %f %f %f f %f %f c81 %06x\n", header,
+				raw.x, raw.y, raw.z, verts[0].x, verts[0].y, verts[0].z,
+				reg_f(0x3c), reg_f(0x3d), reg_f(0x3e),
+				reg_f(0x40), reg_f(0x41), reg_f(0x42), reg_f(0x43), reg_f(0x44), reg_f(0x45), reg_f(0x46), reg_f(0x47), reg_f(0x48),
+				reg_f(0x4c), reg_f(0x4d), reg_f(0x4e), reg_f(0x78), reg_f(0x79), m_w81);
 	}
 
 	switch (kind)
@@ -795,7 +839,7 @@ void zevio_gpu_device::run_list(u32 addr)
 		case 0x0c: m_xfer = rd32(addr); addr += 4; break;
 		case 0x0e: addr += 4; break;
 		case 0x10: m_regs[0x5c / 4] = rd32(addr); addr += 4; break;
-		case 0x12: case 0x89: case 0x95: case 0x96: case 0x8e: break;
+		case 0x00: case 0x12: case 0x89: case 0x95: case 0x96: case 0x8e: break; // 00: padding after sub-list calls
 		case 0x14:
 			m_regs[0x14 / 4] = (cmd & 0xff00) | 0x08;
 			update_irq();

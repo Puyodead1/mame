@@ -36,6 +36,7 @@ private:
 		float r, g, b;       // 0-1
 		float w;             // 1/z for perspective correction
 		u16 hi;
+		bool lit;            // has a normal: apply lighting
 	};
 
 	// memory
@@ -90,7 +91,7 @@ private:
 
 	std::unique_ptr<float[]> m_zbuf; // 1024 x 1024, GPU coordinates
 	bool m_no3d = false;
-	int m_stat_tris = 0, m_stat_pixels = 0, m_stat_fills = 0, m_stat_dbg = 0;
+	int m_stat_tris = 0, m_stat_pixels = 0, m_stat_fills = 0, m_stat_dbg = 0, m_stat_dbg2 = 0, m_total_tris = 0, m_total_pixels = 0;
 };
 
 DECLARE_DEVICE_TYPE(ZEVIO_GPU, zevio_gpu_device)
