@@ -212,14 +212,14 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 			UML_HASHJMP(block, I0, I1, *m_drc_nocode);
 		};
 
-		// after a natively compiled instruction: interrupt check, then cycles
-		// (the interpreter's order). Execution continues after the tail.
+		// after a natively compiled instruction: cycles. The interpreter checks
+		// for interrupts first, but the instructions compiled here neither
+		// access memory nor change the mode or the I/F bits, so nothing can
+		// become pending or unmasked: that check would always do nothing.
+		// Execution continues after the tail.
 		auto tail = [&] (int cost, offs_t nextpc)
 		{
 			const code_label irq = nextlabel++, ooc = nextlabel++, resume = nextlabel++;
-			UML_LOAD(block, I0, &m_pending_interrupt, 0, SIZE_BYTE, SCALE_x1);
-			UML_TEST(block, I0, 0xff);
-			UML_JMPc(block, uml::COND_NZ, irq);
 			load(I0, &m_icount);
 			UML_SUB(block, I0, I0, cost);
 			store(&m_icount, I0);
@@ -518,6 +518,105 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				continue;
 			}
 
+			// LDR/STR(B) Rd, [Rn, #+-imm] (no write-back, Rd != PC): fast RAM
+			// inline, anything else (other memory, translation miss, unaligned
+			// word, store to a code page) through the interpreter
+			if ((insn & 0x0f200000) == 0x05000000 && rdn != 15 && cond != 15 && m_fast_mem && m_fastram_count)
+			{
+				const code_label skip = (cond != 14) ? condition(cond) : code_label(0);
+				const code_label slow = nextlabel++, resume = nextlabel++;
+				const bool isload = insn & INSN_SDT_L, isbyte = insn & INSN_SDT_B;
+				const uint32_t off = insn & 0xfff;
+
+				// I0 = virtual address
+				if (rnn == 15)
+					UML_MOV(block, I0, (insn & INSN_SDT_U) ? pc + 8 + off : pc + 8 - off);
+				else
+				{
+					load(I0, reg(rnn));
+					if (off)
+					{
+						if (insn & INSN_SDT_U)
+							UML_ADD(block, I0, I0, off);
+						else
+							UML_SUB(block, I0, I0, off);
+					}
+				}
+				if (!isbyte)
+				{
+					UML_TEST(block, I0, 3);
+					UML_JMPc(block, uml::COND_NZ, slow);
+				}
+				// I1 = physical address through the translation cache
+				if (m_control & COPRO_CTRL_MMU_EN)
+				{
+					const int flags = ARM7_TLB_ABORT_D | (isload ? ARM7_TLB_READ : ARM7_TLB_WRITE);
+					UML_SHR(block, I2, I0, 10);
+					UML_AND(block, I3, I2, XLAT_CACHE_SIZE - 1);
+					if (mode & 0xf)
+						UML_OR(block, I2, I2, 0x80000000);
+					UML_LOAD(block, I4, &m_xlat_cache[flags & 0xf][0].tag, I3, SIZE_DWORD, SCALE_x8);
+					UML_CMP(block, I4, I2);
+					UML_JMPc(block, uml::COND_NE, slow);
+					UML_LOAD(block, I1, &m_xlat_cache[flags & 0xf][0].ppage, I3, SIZE_DWORD, SCALE_x8);
+					UML_AND(block, I2, I0, 0x3ff);
+					UML_OR(block, I1, I1, I2);
+				}
+				else
+					UML_MOV(block, I1, I0);
+
+				// fast RAM range (I2 = offset into it); code page check for stores
+				const code_label found = nextlabel++;
+				for (unsigned r = 0; r < m_fastram_count; r++)
+				{
+					const code_label next = nextlabel++;
+					UML_SUB(block, I2, I1, m_fastram[r].start);
+					UML_CMP(block, I2, m_fastram[r].span - (isbyte ? 0 : 3));
+					UML_JMPc(block, uml::COND_A, next);
+					if (!isload && m_drc_page_flags)
+					{
+						UML_SUB(block, I3, I1, m_drc_pages_base);
+						UML_SHR(block, I3, I3, 10);
+						UML_LOAD(block, I4, &m_drc_page_flags[0], I3, SIZE_BYTE, SCALE_x1);
+						UML_TEST(block, I4, 0xff);
+						UML_JMPc(block, uml::COND_NZ, slow);
+					}
+					if (isload)
+					{
+						UML_LOAD(block, I3, m_fastram[r].base, I2, isbyte ? SIZE_BYTE : SIZE_DWORD, SCALE_x1);
+						store(reg(rdn), I3);
+					}
+					else
+					{
+						load(I3, reg(rdn));
+						UML_STORE(block, m_fastram[r].base, I2, I3, isbyte ? SIZE_BYTE : SIZE_DWORD, SCALE_x1);
+					}
+					UML_JMP(block, found);
+					UML_LABEL(block, next);
+				}
+				UML_JMP(block, slow);
+				UML_LABEL(block, found);
+				tail(isload ? 3 : 2, pc + 4); // loads 3, stores 2 (HandleMemSingle)
+				UML_LABEL(block, resume);
+
+				stubs.emplace_back([&, slow, resume, pc, insn] ()
+				{
+					UML_LABEL(block, slow);
+					fallback(pc, insn);
+					UML_JMP(block, resume);
+				});
+
+				if (cond != 14)
+				{
+					const code_label done = nextlabel++;
+					UML_JMP(block, done);
+					UML_LABEL(block, skip);
+					tail(1, pc + 4);
+					UML_LABEL(block, done);
+				}
+				continue;
+			}
+
 			// B / BL
 			if (cls == 0x0a000000 && cond != 15)
 			{
@@ -571,8 +670,11 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 			UML_HASHJMP(block, mode, pc, *m_drc_nocode);
 		}
 
-		for (auto &stub : stubs)
+		for (size_t i = 0; i < stubs.size(); i++)
+		{
+			auto stub = std::move(stubs[i]); // stubs may add stubs
 			stub();
+		}
 
 		block.end();
 	}
