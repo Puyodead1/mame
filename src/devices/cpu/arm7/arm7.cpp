@@ -1990,12 +1990,22 @@ void arm7_cpu_device::execute_run()
 				{
 					// immediate operand, Rd and Rn not PC: HandleALU without the
 					// operand decode and R15 cases
+					// (also a plain register operand: Rm, LSL #0, Rm not PC)
 					const uint32_t rdn = (insn >> 12) & 15, rnn = (insn >> 16) & 15;
-					if (cls == 0x02000000 && rdn != 15 && rnn != 15)
+					if (rdn != 15 && rnn != 15 && (cls == 0x02000000 || ((insn & 0xff0) == 0 && (insn & 15) != 15)))
 					{
-						const uint32_t by = (insn >> 8) & 15;
-						const uint32_t op2 = std::rotr<uint32_t>(insn & 0xff, by << 1);
-						const uint32_t sc = by ? (op2 & SIGN_BIT) : (GET_CPSR & C_MASK);
+						uint32_t op2, sc;
+						if (cls == 0x02000000)
+						{
+							const uint32_t by = (insn >> 8) & 15;
+							op2 = std::rotr<uint32_t>(insn & 0xff, by << 1);
+							sc = by ? (op2 & SIGN_BIT) : (GET_CPSR & C_MASK);
+						}
+						else
+						{
+							op2 = GetRegister(insn & 15);
+							sc = GET_CPSR & C_MASK;
+						}
 						const uint32_t rn = GetRegister(rnn);
 						uint32_t rd;
 						switch ((insn >> 21) & 15)
@@ -2019,6 +2029,14 @@ void arm7_cpu_device::execute_run()
 						goto skip_exec;
 					}
 					HandleALU(insn);
+					goto skip_exec;
+				}
+				// B / BL
+				if (cls == 0x0a000000 && !(m_archFlags & ARCHFLAG_MODE26))
+				{
+					if (insn & INSN_BL)
+						SetRegister(14, R15 + 4);
+					R15 += util::sext((insn & INSN_BRANCH) << 2, 26) + 8;
 					goto skip_exec;
 				}
 				// LDR/STR(B) Rd, [Rn, #+-imm] (no write-back, Rd != PC) on fast RAM
