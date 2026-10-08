@@ -42,6 +42,7 @@
 
 #include "emu.h"
 
+#include "zevio_gpu.h"
 #include "zevio_spu.h"
 
 #include "cpu/arm7/arm7.h"
@@ -83,6 +84,7 @@ public:
 		m_cdrom(*this, "cdrom"),
 		m_nvram(*this, "spiflash"),
 		m_spu(*this, "spu"),
+		m_gpu(*this, "gpu"),
 		m_sdram(*this, "sdram"),
 		m_spi_region(*this, "spi"),
 		m_io_keys(*this, "KEYS"),
@@ -134,6 +136,7 @@ private:
 	required_device<cdrom_image_device> m_cdrom;
 	required_device<nvram_device> m_nvram;
 	required_device<zevio_spu_device> m_spu;
+	required_device<zevio_gpu_device> m_gpu;
 	required_shared_ptr<u32> m_sdram;
 	optional_memory_region m_spi_region;
 	required_ioport m_io_keys;
@@ -249,25 +252,6 @@ private:
 	u8 sflash_xfer(int index, u8 data, std::vector<u8> &cmd);
 	u8 dataflash_xfer(int index, u8 data, std::vector<u8> &cmd);
 
-	// GPU
-	u32 m_gpu_regs[0x400 / 4];
-	u32 m_gpu_clip[2];
-	u32 m_gpu_offset;
-	u32 m_gpu_texmode, m_gpu_texpos, m_gpu_clutpos;
-	u32 m_gpu_xfer_addr;
-	u32 m_gpu_state[0x100];
-	u32 gpu_r(offs_t offset);
-	void gpu_w(offs_t offset, u32 data, u32 mem_mask);
-	void gpu_run_list(u32 addr);
-	void gpu_update_irq();
-	u16 gpu_vram_r16(u32 x, u32 y) { return ram_r16(tiled_addr(m_gpu_regs[0x98 / 4], x * 2, y)); }
-	void gpu_vram_w16(u32 x, u32 y, u16 data) { ram_w16(tiled_addr(m_gpu_regs[0x98 / 4], x * 2, y), data); }
-	void gpu_plot(int x, int y, u16 color);
-	u16 gpu_texel(u32 u, u32 v, bool &transparent);
-	void gpu_sprite(u32 flags, const u32 *args, int nargs);
-	u32 m_gpu_cvt[0x40 / 4];
-	u32 gpucvt_r(offs_t offset);
-	void gpucvt_w(offs_t offset, u32 data, u32 mem_mask);
 
 	// display
 	u32 m_disp_regs[0x3000 / 4];
@@ -974,314 +958,6 @@ u8 vsmilpro_state::dataflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 
 
 /***************************************************************************
-    GPU ("Hanabi") command processor at 0xA8000000
-    Display lists are executed instantly when kicked.
-***************************************************************************/
-
-void vsmilpro_state::gpu_update_irq()
-{
-	// +0x10 is an enable mask (FA writes 0x1F and waits for the list-end IRQ)
-	const u32 enable = m_gpu_regs[0x10 / 4];
-	set_irq(IRQ_GPU, (m_gpu_regs[0x14 / 4] & enable & 0x3f) != 0);
-}
-
-u32 vsmilpro_state::gpu_r(offs_t offset)
-{
-	switch (offset)
-	{
-	case 0x00 / 4: return m_gpu_regs[0] & 0xffff; // engine idle
-	default: return m_gpu_regs[offset];
-	}
-}
-
-void vsmilpro_state::gpu_w(offs_t offset, u32 data, u32 mem_mask)
-{
-	switch (offset)
-	{
-	case 0x00 / 4:
-		LOGMASKED(LOG_GPU, "%08x: gpu cmd %x list %08x\n", m_maincpu->pc(), data, m_gpu_regs[0x28 / 4]);
-		if (data == 1)
-			gpu_run_list(m_gpu_regs[0x28 / 4]);
-		else if (data == 3)
-		{
-			m_gpu_regs[0x14 / 4] = 0;
-			gpu_update_irq();
-		}
-		return;
-	case 0x14 / 4:
-		// acknowledge: writing the source bits clears them along with the tag
-		if (data & 0x3f)
-			m_gpu_regs[0x14 / 4] &= ~(data & 0x3f);
-		if (!(m_gpu_regs[0x14 / 4] & 0x3f))
-			m_gpu_regs[0x14 / 4] = 0;
-		gpu_update_irq();
-		return;
-	case 0x10 / 4:
-		COMBINE_DATA(&m_gpu_regs[offset]);
-		gpu_update_irq();
-		return;
-	default:
-		COMBINE_DATA(&m_gpu_regs[offset]);
-		return;
-	}
-}
-
-void vsmilpro_state::gpu_plot(int x, int y, u16 color)
-{
-	const int cx0 = m_gpu_clip[0] & 0xfff, cy0 = (m_gpu_clip[0] >> 12) & 0xfff;
-	const int cx1 = m_gpu_clip[1] & 0xfff, cy1 = (m_gpu_clip[1] >> 12) & 0xfff;
-	if (x < cx0 || x > cx1 || y < cy0 || y > cy1 || x < 0 || y < 0 || x > 1023)
-		return;
-	gpu_vram_w16(x, y, color);
-}
-
-// texture mode (0x86): bits 0-2 log2(width/8), bits 3-5 log2(height/8),
-// bit 8 + bits 9-10 colour format (from the engine's use; partly guessed)
-u16 vsmilpro_state::gpu_texel(u32 u, u32 v, bool &transparent)
-{
-	const u32 w = 8 << (m_gpu_texmode & 7);
-	const u32 h = 8 << ((m_gpu_texmode >> 3) & 7);
-	u &= w - 1;
-	v &= h - 1;
-	const u32 tx = m_gpu_texpos & 0xfff, ty = (m_gpu_texpos >> 12) & 0xfff;
-	const u32 bppsel = (m_gpu_texmode >> 9) & 3;
-	const u32 base = m_gpu_regs[0x98 / 4];
-	u16 color;
-	if (bppsel == 0)
-		color = ram_r16(tiled_addr(base, tx * 2 + u * 2, ty + v));
-	else
-	{
-		u32 index;
-		if (bppsel == 1)
-			index = ram_r8(tiled_addr(base, tx * 2 + u, ty + v));
-		else
-		{
-			const u8 b = ram_r8(tiled_addr(base, tx * 2 + (u >> 1), ty + v));
-			index = BIT(u, 0) ? (b >> 4) : (b & 0x0f);
-		}
-		const u32 cx = m_gpu_clutpos & 0xfff, cy = (m_gpu_clutpos >> 12) & 0xfff;
-		color = ram_r16(tiled_addr(base, cx * 2 + index * 2, cy));
-	}
-	transparent = (color == 0);
-	return color;
-}
-
-void vsmilpro_state::gpu_sprite(u32 flags, const u32 *args, int nargs)
-{
-	// args: colour/z, y<<16|x, h<<16|w, [v<<16|u]
-	if (nargs < 3)
-		return;
-	const int ox = m_gpu_offset & 0xfff, oy = (m_gpu_offset >> 12) & 0xfff;
-	const int x = s16(args[1] & 0xffff) + ox, y = s16(args[1] >> 16) + oy;
-	const int w = args[2] & 0xffff, h = args[2] >> 16;
-	const bool textured = BIT(flags, 0) && nargs >= 4;
-	const u32 u0 = textured ? args[3] & 0xffff : 0, v0 = textured ? args[3] >> 16 : 0;
-	for (int j = 0; j < h; j++)
-		for (int i = 0; i < w; i++)
-		{
-			if (textured)
-			{
-				bool transparent;
-				const u16 c = gpu_texel(u0 + i, v0 + j, transparent);
-				if (!transparent)
-					gpu_plot(x + i, y + j, c);
-			}
-			else
-				gpu_plot(x + i, y + j, args[0] & 0xffff);
-		}
-}
-
-void vsmilpro_state::gpu_run_list(u32 addr)
-{
-	if (VERBOSE & LOG_GPU)
-	{
-		std::string words;
-		for (int i = 0; i < 48; i++)
-			words += util::string_format(" %08x", ram_r32(addr + i * 4));
-		LOGMASKED(LOG_GPU, "gpu list %08x:%s\n", addr, words);
-	}
-	std::vector<u32> callstack;
-	int guard = 0;
-	while (guard++ < 0x200000)
-	{
-		const u32 cmd = ram_r32(addr);
-		addr += 4;
-		const u8 op = cmd >> 24;
-		switch (op)
-		{
-		case 0x04: // end of a called sub-list
-			if (!callstack.empty())
-			{
-				addr = callstack.back();
-				callstack.pop_back();
-			}
-			break;
-		case 0x95: case 0x96: // flush/terminate primitive
-			break;
-		case 0x08: // jump
-			addr = ram_r32(addr);
-			break;
-		case 0x09: // call
-			callstack.push_back(addr + 4);
-			addr = ram_r32(addr);
-			break;
-		case 0x0a: // jump over inline data
-			addr = ram_r32(addr);
-			break;
-		case 0x0c: // address for the next transfer
-			m_gpu_xfer_addr = ram_r32(addr);
-			addr += 4;
-			break;
-		case 0x0e: // fetch words: handled by the image commands
-			addr += 4;
-			break;
-		case 0x10: // fence
-			m_gpu_regs[0x5c / 4] = cmd & 0xffffff;
-			break;
-		case 0x14: // end of list, interrupt with tag in bits 8-15
-			addr += 4;
-			m_gpu_regs[0x14 / 4] = (cmd & 0xff00) | 0x08;
-			gpu_update_irq();
-			return;
-		case 0x1c: case 0x1e:
-			m_gpu_state[op] = cmd & 0xffffff;
-			break;
-		case 0x20: // register block write: n 16-bit values, padded to a word
-		{
-			const u32 reg = (cmd >> 16) & 0xff, n = cmd & 0xffff;
-			for (u32 i = 0; i < n; i++)
-				m_gpu_state[(reg + i) & 0xff] = ram_r16(addr + i * 2);
-			addr += (n * 2 + 3) & ~3;
-			break;
-		}
-		case 0x81: m_gpu_state[op] = cmd & 0xffffff; break;
-		case 0x82: m_gpu_clip[0] = cmd & 0xffffff; break;
-		case 0x83: m_gpu_clip[1] = cmd & 0xffffff; break;
-		case 0x85: m_gpu_offset = cmd & 0xffffff; break;
-		case 0x86: m_gpu_texmode = cmd & 0xffffff; break;
-		case 0x87: m_gpu_texpos = cmd & 0xffffff; break;
-		case 0x8f: m_gpu_clutpos = cmd & 0xffffff; break;
-		case 0x84: case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8c: case 0x8d: case 0x8e:
-		case 0x90: case 0x91: case 0x92: case 0x93: case 0x94:
-			m_gpu_state[op] = cmd & 0xffffff;
-			break;
-		case 0xd0: case 0xd4: // load image into VRAM: pos, size, then 0x0E fetch of n words from src
-		{
-			const u32 pos = ram_r32(addr), size = ram_r32(addr + 4);
-			u32 fetch = ram_r32(addr + 8), src = ram_r32(addr + 12);
-			addr += 16;
-			const u32 x = pos & 0xffff, y = pos >> 16, w = size & 0xffff, h = size >> 16;
-			LOGMASKED(LOG_GPU, "gpu load image (%d,%d) %dx%d from %08x (%08x)\n", x, y, w, h, src, fetch);
-			if ((fetch >> 24) != 0x0e)
-				LOGMASKED(LOG_UNKNOWN, "gpu load image: unexpected %08x\n", fetch);
-			for (u32 j = 0; j < h; j++)
-				for (u32 i = 0; i < w; i++)
-					gpu_vram_w16((x + i) & 1023, y + j, ram_r16(src + (j * w + i) * 2));
-			break;
-		}
-		case 0xd1: // store image from VRAM to the 0x0C address
-		{
-			const u32 pos = ram_r32(addr), size = ram_r32(addr + 4);
-			addr += 8;
-			const u32 x = pos & 0xffff, y = pos >> 16, w = size & 0xffff, h = size >> 16;
-			for (u32 j = 0; j < h; j++)
-				for (u32 i = 0; i < w; i++)
-					ram_w16(m_gpu_xfer_addr + (j * w + i) * 2, gpu_vram_r16((x + i) & 1023, y + j));
-			break;
-		}
-		case 0xd3: // fill rectangle
-		{
-			const u32 pos = ram_r32(addr), size = ram_r32(addr + 4), col = ram_r32(addr + 8);
-			addr += 12;
-			const u32 x = pos & 0xffff, y = pos >> 16, w = size & 0xffff, h = size >> 16;
-			LOGMASKED(LOG_GPU, "gpu fill (%d,%d) %dx%d %04x\n", x, y, w, h, col & 0xffff);
-			for (u32 j = 0; j < h; j++)
-				for (u32 i = 0; i < w; i++)
-					gpu_vram_w16((x + i) & 1023, y + j, col);
-			break;
-		}
-		case 0xc8: // sprite
-		{
-			const int n = cmd & 0xff;
-			u32 args[8] = { };
-			for (int i = 0; i < n && i < 8; i++)
-				args[i] = ram_r32(addr + i * 4);
-			addr += n * 4;
-			gpu_sprite((cmd >> 16) & 0xff, args, n);
-			break;
-		}
-		default:
-			if (op >= 0xc0 && op <= 0xdf)
-			{
-				// other primitives: skip their arguments
-				// TODO: polygons, lines, points, 3D primitive kinds
-				const int n = cmd & 0xff;
-				LOGMASKED(LOG_UNKNOWN, "gpu unhandled primitive %08x (%d words)\n", cmd, n);
-				addr += n * 4;
-				if (op == 0xc0 || op == 0xc2)
-				{
-					// strips end with 0xFF000000
-					while (ram_r32(addr) != 0xff000000 && guard++ < 0x200000)
-						addr += 4;
-					addr += 4;
-				}
-			}
-			else
-			{
-				std::string ctx;
-				for (int i = -12; i < 8; i++)
-					ctx += util::string_format(i == -1 ? " [%08x]" : " %08x", ram_r32(addr + i * 4));
-				LOGMASKED(LOG_UNKNOWN, "gpu unknown command %08x at %08x, stopping list:%s\n", cmd, addr - 4, ctx);
-				m_gpu_regs[0x14 / 4] = 0xfd08;
-				gpu_update_irq();
-				return;
-			}
-			break;
-		}
-	}
-	LOGMASKED(LOG_UNKNOWN, "gpu list runaway\n");
-}
-
-// number converters (0xA4000000)
-u32 vsmilpro_state::gpucvt_r(offs_t offset)
-{
-	const u32 v = m_gpu_cvt[offset];
-	switch (offset)
-	{
-	case 0x0c / 4: case 0x1c / 4: // f16 (1.6.9, bias 31) -> 4.12 fixed
-	{
-		if (!(v & 0x7fff))
-			return 0;
-		const int e = ((v >> 9) & 0x3f) - 31;
-		double f = ldexp(1.0 + (v & 0x1ff) / 512.0, e);
-		if (v & 0x8000)
-			f = -f;
-		return u32(s32(f * 4096.0));
-	}
-	case 0x08 / 4: // fixed (x.12) -> f16
-	{
-		const s32 s = util::sext(v, 27);
-		if (!s)
-			return 0;
-		double f = std::abs(s) / 4096.0;
-		int e;
-		const double m = frexp(f, &e); // f = m * 2^e, m in [0.5,1)
-		const int exp = std::clamp(e - 1 + 31, 0, 63);
-		const u32 mant = u32((m * 2.0 - 1.0) * 512.0) & 0x1ff;
-		return (s < 0 ? 0x8000 : 0) | (exp << 9) | mant;
-	}
-	default:
-		return v;
-	}
-}
-
-void vsmilpro_state::gpucvt_w(offs_t offset, u32 data, u32 mem_mask)
-{
-	COMBINE_DATA(&m_gpu_cvt[offset]);
-}
-
-
-/***************************************************************************
     Display controller (0xB8000000)
 ***************************************************************************/
 
@@ -1414,6 +1090,10 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 			continue;
 		const u32 map = m_disp_regs[(0x140 / 4) + layer];
 		const u32 tiles = m_disp_regs[(0x150 / 4) + layer];
+		// FA leaves layer 3 enabled with null pointers; show nothing for it
+		// TODO: check what the hardware fetches in that case
+		if (!in_sdram(map) || !in_sdram(tiles))
+			continue;
 		const u32 scroll = m_disp_regs[(0x110 / 4) + layer];
 		const int mapw = 16 << ((m_disp_regs[0x104 / 4] >> (layer * 8)) & 3);
 		const int sx = scroll & 0xfff, sy = (scroll >> 16) & 0xfff;
@@ -1960,8 +1640,8 @@ void vsmilpro_state::vsmilpro_map(address_map &map)
 
 	map(0xa0000000, 0xa00fffff).lr32(NAME([] () { return 0; })); // nothing on the factory bus
 	map(0xa1000000, 0xa100003f).rw(FUNC(vsmilpro_state::spi_r), FUNC(vsmilpro_state::spi_w));
-	map(0xa4000000, 0xa400003f).rw(FUNC(vsmilpro_state::gpucvt_r), FUNC(vsmilpro_state::gpucvt_w));
-	map(0xa8000000, 0xa80003ff).rw(FUNC(vsmilpro_state::gpu_r), FUNC(vsmilpro_state::gpu_w));
+	map(0xa4000000, 0xa400003f).rw(m_gpu, FUNC(zevio_gpu_device::cvt_r), FUNC(zevio_gpu_device::cvt_w));
+	map(0xa8000000, 0xa80003ff).rw(m_gpu, FUNC(zevio_gpu_device::regs_r), FUNC(zevio_gpu_device::regs_w));
 	map(0xb0000000, 0xb0001fff).rw(m_spu, FUNC(zevio_spu_device::read), FUNC(zevio_spu_device::write));
 	map(0xb8000000, 0xb8002fff).rw(FUNC(vsmilpro_state::disp_r), FUNC(vsmilpro_state::disp_w)); // +0x800-0xFFF on-chip SRAM / palettes
 	map(0xbc000000, 0xbc0001ff).rw(FUNC(vsmilpro_state::bcdma_r), FUNC(vsmilpro_state::bcdma_w));
@@ -1989,6 +1669,7 @@ void vsmilpro_state::machine_start()
 
 	m_dsp_mem = std::make_unique<u16[]>(0x80000);
 	m_spu->set_ram(m_sdram.target(), SDRAM_BASE, SDRAM_SIZE);
+	m_gpu->set_ram(m_sdram.target(), SDRAM_BASE, SDRAM_SIZE);
 
 	m_tick_timer = timer_alloc(FUNC(vsmilpro_state::tick_cb), this);
 	for (auto &t : m_bcdma_timer)
@@ -2023,7 +1704,6 @@ void vsmilpro_state::machine_start()
 	save_item(NAME(m_gpio_out));
 	save_item(NAME(m_timer_regs));
 	save_item(NAME(m_spi_regs));
-	save_item(NAME(m_gpu_regs));
 	save_item(NAME(m_disp_regs));
 	save_item(NAME(m_disp_status));
 	save_item(NAME(m_bcdma_regs));
@@ -2057,9 +1737,6 @@ void vsmilpro_state::machine_reset()
 			m_gpio_dir[b][l] = m_gpio_out[b][l] = 0;
 	std::fill(std::begin(m_timer_regs), std::end(m_timer_regs), 0);
 	std::fill(std::begin(m_spi_regs), std::end(m_spi_regs), 0);
-	std::fill(std::begin(m_gpu_regs), std::end(m_gpu_regs), 0);
-	std::fill(std::begin(m_gpu_state), std::end(m_gpu_state), 0);
-	std::fill(std::begin(m_gpu_cvt), std::end(m_gpu_cvt), 0);
 	std::fill(std::begin(m_disp_regs), std::end(m_disp_regs), 0);
 	std::fill(std::begin(m_bcdma_regs), std::end(m_bcdma_regs), 0);
 	m_bcdma_busy = 0;
@@ -2067,9 +1744,6 @@ void vsmilpro_state::machine_reset()
 		t->adjust(attotime::never);
 	std::fill(std::begin(m_dcdma_regs), std::end(m_dcdma_regs), 0);
 	std::fill(std::begin(m_cd_regs), std::end(m_cd_regs), 0);
-	m_gpu_clip[0] = 0;
-	m_gpu_clip[1] = 0xffffff;
-	m_gpu_offset = m_gpu_texmode = m_gpu_texpos = m_gpu_clutpos = m_gpu_xfer_addr = 0;
 	m_disp_status = 0;
 	m_sflash_status = 0;
 	m_sflash_aai_addr = 0;
@@ -2187,6 +1861,9 @@ void vsmilpro_state::vsmilpro(machine_config &config)
 	m_screen->set_screen_update(FUNC(vsmilpro_state::screen_update));
 
 	SPEAKER(config, "speaker", 2).front();
+
+	ZEVIO_GPU(config, m_gpu);
+	m_gpu->irq_cb().set([this] (int state) { set_irq(IRQ_GPU, state); });
 
 	ZEVIO_SPU(config, m_spu);
 	m_spu->irq_cb().set([this] (int state) { set_irq(IRQ_SOUND, state); });
