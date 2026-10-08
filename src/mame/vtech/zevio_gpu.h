@@ -5,6 +5,12 @@
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+
 class zevio_gpu_device : public device_t
 {
 public:
@@ -27,6 +33,7 @@ protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
 	virtual void device_stop() override ATTR_COLD;
+	virtual void device_pre_save() override;
 
 private:
 	struct vertex_t
@@ -75,24 +82,79 @@ private:
 	bool project(vertex_t &v) const;
 	void prim3d(u32 header, u32 &addr);
 	void transform_to_memory(u32 header, u32 &addr);
-	void draw_triangle(const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured, int band_y0 = 0, int band_y1 = 1 << 20);
-	void draw_line(const vertex_t &a, const vertex_t &b);
 	void draw_3d_tri(vertex_t a, vertex_t b, vertex_t c);
 
 	// 2D
 	void prim2d(u32 header, u32 &addr);
 	void sprite(u32 header, u32 &addr);
-	void log_texture() const;
-
-	// pixels
-	bool texel(float u, float v, bool normalized, float &r, float &g, float &b, float &a) const;
-	bool texel_point(int tu, int tv, float &r, float &g, float &b, float &a) const;
-	int texel_raw(int tu, int tv) const;
-	void load_palette(int which, int n) const;
-	void plot(int x, int y, float z, float r, float g, float b, float a, bool depth);
-	bool in_clip(int x, int y) const;
+	void log_texture();
 
 	float reg_f(int r) const { return f16_to_float(m_r[r & 0xff]); }
+
+	/*
+	    Rendering. List parsing, transforms and FA's queue bookkeeping run on
+	    the emulation thread; drawing is recorded as commands with a snapshot
+	    of the render state and executed in order on a render thread, split
+	    into horizontal bands on worker threads (bands touch disjoint rows of
+	    VRAM and the depth buffer, so the result does not depend on timing).
+	    sync() waits for it: before VRAM is read or copied, on screen update
+	    and on save.
+	*/
+public:
+	void sync();
+private:
+	struct rstate
+	{
+		u32 w84, w86, w87, w88, w8d, clip0, clip1, clut0, clut3;
+	};
+	struct rcache // per band
+	{
+		u16 pal[256];
+		u32 key = ~0U;
+	};
+	enum : u8 { CMD_TRI3D, CMD_TRI2D, CMD_LINE, CMD_POINT, CMD_SPRITE, CMD_FILL };
+	struct rcmd
+	{
+		u8 type;
+		bool textured;
+		rstate st;
+		int ymin, ymax;        // rows touched (for band culling)
+		vertex_t v[3];
+		u32 a0, a1, a2, a3;    // sprite: x0/y0, w/h, uv, col | fill: base, size, col
+		u8 flags;
+	};
+	rstate cur_state() const;
+	void add_cmd(rcmd &&c);
+	void submit();
+	void exec_batch(const std::vector<rcmd> &cmds);
+	void exec_band(const std::vector<rcmd> &cmds, int y0, int y1);
+	void render_thread();
+
+	bool in_clip(const rstate &s, int x, int y) const;
+	bool texel(const rstate &s, rcache &pc, float u, float v, bool normalized, float &r, float &g, float &b, float &a) const;
+	bool texel_point(const rstate &s, rcache &pc, int tu, int tv, float &r, float &g, float &b, float &a) const;
+	int texel_raw(const rstate &s, rcache &pc, int tu, int tv) const;
+	void plot(const rstate &s, int x, int y, float z, float r, float g, float b, float a, bool depth);
+	void draw_triangle(const rstate &s, rcache &pc, const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured, int y0, int y1);
+	void draw_tri2d(const rstate &s, rcache &pc, const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured, int y0, int y1);
+	void draw_line(const rstate &s, const vertex_t &a, const vertex_t &b, int y0, int y1);
+	void draw_sprite(const rstate &s, rcache &pc, const rcmd &c, int y0, int y1);
+	void draw_fill(const rcmd &c, int y0, int y1);
+
+	static constexpr int MAX_BANDS = 16;
+	struct band_job { zevio_gpu_device *gpu; const std::vector<rcmd> *cmds; int y0, y1; };
+	static void *band_cb(void *param, int threadid);
+	std::vector<rcmd> m_cmds;              // being recorded
+	osd_work_queue *m_queue = nullptr;
+	int m_bands = 1;
+	bool m_count_stats = false;
+	bool m_async = true;
+	std::thread m_thread;
+	std::mutex m_mutex;
+	std::condition_variable m_cv;
+	std::deque<std::vector<rcmd>> m_jobs;
+	bool m_busy = false, m_quit = false;
+	std::atomic<u32> m_pal_gen{ 0 };       // bumped when a palette may have changed
 
 	devcb_write_line m_irq_cb;
 	u32 *m_ram;
@@ -107,23 +169,10 @@ private:
 	u32 m_w1c, m_w1e, m_w84, m_w88, m_w81, m_w85, m_w86, m_w87, m_w8d;
 	u32 m_clip0, m_clip1;
 	u32 m_clut[6];         // 0x8F-0x94
-	mutable u16 m_pal[256];      // CLUT entries for the current texture
-	mutable int m_pal_valid = -1; // which CLUT m_pal holds (0 or 3), -1 none
 	u32 m_vtxbase, m_xfer;
 
 	std::unique_ptr<float[]> m_zbuf; // 1024 x 1024, GPU coordinates
 	bool m_no3d = false;
-
-	// parallel triangle rendering
-	static constexpr int MAX_BANDS = 16;
-	struct tri_t { vertex_t a, b, c; };
-	struct band_job { zevio_gpu_device *gpu; int y0, y1; bool textured; };
-	std::vector<tri_t> m_batch;
-	osd_work_queue *m_queue = nullptr;
-	int m_bands = 1;
-	bool m_count_stats = false;
-	static void *band_cb(void *param, int threadid);
-	void flush_batch();
 
 	// FA display list queue HLE (see fa_queue_hle)
 	bool m_defer_irq = false;
