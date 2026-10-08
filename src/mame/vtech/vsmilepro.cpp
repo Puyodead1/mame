@@ -313,7 +313,7 @@ private:
 		u64 total = 0;
 		for (auto &e : m_prof) { v.emplace_back(e.second, e.first); total += e.second; }
 		std::sort(v.rbegin(), v.rend());
-		for (int i = 0; i < std::min<int>(v.size(), 30); i++)
+		for (int i = 0; i < std::min<int>(v.size(), getenv("ZPROF_N") ? atoi(getenv("ZPROF_N")) : 30); i++)
 			printf("PROF %08x %5.1f%%\n", v[i].second, 100.0 * v[i].first / std::max<u64>(total, 1));
 		const double secs = std::max(machine().time().as_double() - m_prof_start, 0.001);
 		for (int i = 0; i < 32; i++)

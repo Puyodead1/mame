@@ -1193,9 +1193,15 @@ bool arm7_cpu_device::translate_vaddr_to_paddr(offs_t &vaddr, const int flags)
 	}
 }
 
+void arm7_cpu_device::fast_mem_update()
+{
+	m_fast_mem = m_fastram_count && !(m_archFlags & ARCHFLAG_MODE26);
+}
+
 void arm7_cpu_device::xlat_cache_flush()
 {
-	m_dfetch_vbase = ~0U;
+	for (auto &e : m_dfetch)
+		e.tag = ~0U;
 	for (auto &t : m_xlat_cache)
 		for (auto &e : t)
 			e.tag = ~0U;
@@ -1537,30 +1543,30 @@ inline bool arm7_cpu_device::translate_fast(offs_t &vaddr, const int flags)
 // direct instruction fetch (no prefetch buffer) through a one-entry cache of
 // the current 1K code page; cores with caches (ARM9) do not depend on the
 // ARM7 prefetch behaviour
-bool arm7_cpu_device::direct_fetch(offs_t vaddr, bool thumb, uint32_t &insn)
+inline bool arm7_cpu_device::direct_fetch(offs_t vaddr, bool thumb, uint32_t &insn)
 {
-	const uint32_t priv = (GET_CPSR & 0xf) ? 1 : 0;
-	if (((vaddr ^ m_dfetch_vbase) & ~0x3ffU) || priv != m_dfetch_priv)
+	const uint32_t tag = (vaddr & ~0x3ffU) | ((GET_CPSR & 0xf) ? 1 : 0);
+	dfetch_entry &e = m_dfetch[(vaddr >> 10) & (DFETCH_SIZE - 1)];
+	if (e.tag != tag)
 	{
 		offs_t phys = vaddr & ~0x3ffU;
 		if ((m_control & COPRO_CTRL_MMU_EN) && !translate_fast(phys, ARM7_TLB_ABORT_P | ARM7_TLB_READ))
 		{
-			m_dfetch_vbase = ~0U;
+			e.tag = ~0U;
 			return false;
 		}
-		m_dfetch_vbase = vaddr & ~0x3ffU;
-		m_dfetch_pbase = phys;
-		m_dfetch_priv = priv;
+		e.tag = tag;
+		e.pbase = phys;
 		uint8_t *const first = fastram_ptr(phys), *const last = fastram_ptr(phys + 0x3ff);
-		m_dfetch_host = (first && last == first + 0x3ff) ? first : nullptr;
+		e.host = (first && last == first + 0x3ff) ? first : nullptr;
 	}
 	const uint32_t off = vaddr & 0x3ff;
-	if (m_dfetch_host)
+	if (e.host)
 	{
-		insn = thumb ? *reinterpret_cast<const uint16_t *>(m_dfetch_host + (off & ~1U)) : *reinterpret_cast<const uint32_t *>(m_dfetch_host + (off & ~3U));
+		insn = thumb ? *reinterpret_cast<const uint16_t *>(e.host + (off & ~1U)) : *reinterpret_cast<const uint32_t *>(e.host + (off & ~3U));
 		return true;
 	}
-	const uint32_t w = insn_fetch_word(m_dfetch_pbase | (off & ~3U));
+	const uint32_t w = insn_fetch_word(e.pbase | (off & ~3U));
 	insn = thumb ? uint16_t(w >> ((off & 2) ? m_prefetch_word1_shift : m_prefetch_word0_shift)) : w;
 	return true;
 }
@@ -2299,9 +2305,12 @@ uint32_t arm7_cpu_device::arm7_rt_r_callback(offs_t offset)
 
 void arm7_cpu_device::arm7_rt_w_callback(offs_t offset, uint32_t data)
 {
-	xlat_cache_flush(); // any CP15 write may change translation or permissions
 	uint32_t opcode = offset;
 	uint8_t cReg = ( opcode & INSN_COPRO_CREG ) >> INSN_COPRO_CREG_SHIFT;
+	// CP15 registers that change translation or permissions: control, TTB,
+	// domains, TLB operations and lockdown, PID (not the frequent cache ops)
+	if (cReg == 1 || cReg == 2 || cReg == 3 || cReg == 8 || cReg == 10 || cReg == 13)
+		xlat_cache_flush();
 	uint8_t op2 =  ( opcode & INSN_COPRO_OP2 )  >> INSN_COPRO_OP2_SHIFT;
 	uint8_t op3 =    opcode & INSN_COPRO_OP3;
 	uint8_t cpnum = (opcode & INSN_COPRO_CPNUM) >> INSN_COPRO_CPNUM_SHIFT;

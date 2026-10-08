@@ -60,6 +60,7 @@ public:
 	{
 		assert(m_fastram_count < std::size(m_fastram));
 		m_fastram[m_fastram_count++] = { start, end - start, reinterpret_cast<uint8_t *>(base) };
+		fast_mem_update();
 	}
 
 	// 26-bit data space (CP15 DATA32 clear on the parts with the 26-bit modes): a data address with bits 31:26 set takes
@@ -258,19 +259,29 @@ protected:
 
 	// small direct-mapped cache of successful 1K-page translations, indexed by
 	// the TLB access flags; flushed on CP15 writes, reset and state load
-	static constexpr unsigned XLAT_CACHE_SIZE = 64;
+	static constexpr unsigned XLAT_CACHE_SIZE = 256;
 	struct xlat_cache_entry { uint32_t tag = ~0U; uint32_t ppage = 0; };
 	xlat_cache_entry m_xlat_cache[16][XLAT_CACHE_SIZE];
 	void xlat_cache_flush();
 
 	// direct instruction fetch (see set_direct_fetch)
 	bool m_direct_fetch = false;
-	uint32_t m_dfetch_vbase = ~0U, m_dfetch_pbase = 0, m_dfetch_priv = 0;
-	uint8_t *m_dfetch_host = nullptr;
+	static constexpr unsigned DFETCH_SIZE = 32;
+	struct dfetch_entry { uint32_t tag = ~0U; uint32_t pbase = 0; uint8_t *host = nullptr; };
+	dfetch_entry m_dfetch[DFETCH_SIZE];
 	bool direct_fetch(offs_t vaddr, bool thumb, uint32_t &insn);
 	// inline cache check before the virtual translate (cache entries only
 	// come from arm7_cpu_device::translate_vaddr_to_paddr)
 	bool translate_fast(offs_t &vaddr, const int flags);
+	bool m_fast_mem = false;
+	void fast_mem_update();
+	bool xlat_hit(offs_t &addr, const int flags) const;
+	uint32_t fast_read32(offs_t addr);
+	uint32_t fast_read16(offs_t addr);
+	uint8_t fast_read8(offs_t addr);
+	void fast_write32(offs_t addr, uint32_t data);
+	void fast_write16(offs_t addr, uint16_t data);
+	void fast_write8(offs_t addr, uint8_t data);
 	bool page_table_finish_translation(offs_t &vaddr, const uint8_t type, const uint32_t lvl1, const uint32_t lvl2, const int flags, const uint32_t lvl1a, const uint32_t lvl2a);
 	bool page_table_translate(offs_t &vaddr, const int flags);
 	tlb_entry *tlb_map_entry(const offs_t vaddr, const int flags);

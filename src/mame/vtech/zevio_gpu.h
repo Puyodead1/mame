@@ -26,6 +26,7 @@ public:
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void device_stop() override ATTR_COLD;
 
 private:
 	struct vertex_t
@@ -74,7 +75,7 @@ private:
 	bool project(vertex_t &v) const;
 	void prim3d(u32 header, u32 &addr);
 	void transform_to_memory(u32 header, u32 &addr);
-	void draw_triangle(const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured);
+	void draw_triangle(const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured, int band_y0 = 0, int band_y1 = 1 << 20);
 	void draw_line(const vertex_t &a, const vertex_t &b);
 	void draw_3d_tri(vertex_t a, vertex_t b, vertex_t c);
 
@@ -112,6 +113,24 @@ private:
 
 	std::unique_ptr<float[]> m_zbuf; // 1024 x 1024, GPU coordinates
 	bool m_no3d = false;
+
+	// parallel triangle rendering
+	static constexpr int MAX_BANDS = 16;
+	struct tri_t { vertex_t a, b, c; };
+	struct band_job { zevio_gpu_device *gpu; int y0, y1; bool textured; };
+	std::vector<tri_t> m_batch;
+	osd_work_queue *m_queue = nullptr;
+	int m_bands = 1;
+	bool m_count_stats = false;
+	static void *band_cb(void *param, int threadid);
+	void flush_batch();
+
+	// FA display list queue HLE (see fa_queue_hle)
+	bool m_defer_irq = false;
+	u32 m_fa_handler = 0;
+	double m_fa_next_scan = 0;
+	u32 fa_find_irq_handler();
+	bool fa_queue_hle();
 	int m_stat_tris = 0, m_stat_pixels = 0, m_stat_fills = 0, m_stat_dbg = 0, m_stat_dbg2 = 0, m_total_tris = 0, m_total_pixels = 0;
 };
 

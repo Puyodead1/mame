@@ -23,14 +23,14 @@
 /* Set NZCV flags for ADDS / SUBS */
 #define HandleALUAddFlags(rd, rn, op2)                                                \
 	if (insn & INSN_S)                                                                  \
-	set_cpsr(((GET_CPSR & ~(N_MASK | Z_MASK | V_MASK | C_MASK))                       \
+	set_cpsr_nzcv(((GET_CPSR & ~(N_MASK | Z_MASK | V_MASK | C_MASK))                       \
 				| (((!SIGN_BITS_DIFFER(rn, op2)) && SIGN_BITS_DIFFER(rn, rd)) << V_BIT) \
 				| (((IsNeg(rn) & IsNeg(op2)) | (IsNeg(rn) & IsPos(rd)) | (IsNeg(op2) & IsPos(rd))) ? C_MASK : 0) \
 				| HandleALUNZFlags(rd)));                                               \
 	R15 += 4;
 
 #define HandleThumbALUAddFlags(rd, rn, op2)                                                       \
-	set_cpsr(((GET_CPSR & ~(N_MASK | Z_MASK | V_MASK | C_MASK))                                   \
+	set_cpsr_nzcv(((GET_CPSR & ~(N_MASK | Z_MASK | V_MASK | C_MASK))                                   \
 				| (((!THUMB_SIGN_BITS_DIFFER(rn, op2)) && THUMB_SIGN_BITS_DIFFER(rn, rd)) << V_BIT) \
 				| (((IsNeg(rn) & IsNeg(op2)) | (IsNeg(rn) & IsPos(rd)) | (IsNeg(op2) & IsPos(rd))) ? C_MASK : 0) \
 				| HandleALUNZFlags(rd)));                                                           \
@@ -56,14 +56,14 @@
 
 #define HandleALUSubFlags(rd, rn, op2)                                                                         \
 	if (insn & INSN_S)                                                                                           \
-	set_cpsr(((GET_CPSR & ~(N_MASK | Z_MASK | V_MASK | C_MASK))                                                \
+	set_cpsr_nzcv(((GET_CPSR & ~(N_MASK | Z_MASK | V_MASK | C_MASK))                                                \
 				| ((SIGN_BITS_DIFFER(rn, op2) && SIGN_BITS_DIFFER(rn, rd)) << V_BIT)                             \
 				| (((IsNeg(rn) & IsPos(op2)) | (IsNeg(rn) & IsPos(rd)) | (IsPos(op2) & IsPos(rd))) ? C_MASK : 0) \
 				| HandleALUNZFlags(rd)));                                                                        \
 	R15 += 4;
 
 #define HandleThumbALUSubFlags(rd, rn, op2)                                                                    \
-	set_cpsr(((GET_CPSR & ~(N_MASK | Z_MASK | V_MASK | C_MASK))                                                \
+	set_cpsr_nzcv(((GET_CPSR & ~(N_MASK | Z_MASK | V_MASK | C_MASK))                                                \
 				| ((THUMB_SIGN_BITS_DIFFER(rn, op2) && THUMB_SIGN_BITS_DIFFER(rn, rd)) << V_BIT)                 \
 				| (((IsNeg(rn) & IsPos(op2)) | (IsNeg(rn) & IsPos(rd)) | (IsPos(op2) & IsPos(rd))) ? C_MASK : 0) \
 				| HandleALUNZFlags(rd)));                                                                        \
@@ -116,7 +116,7 @@
 
 #define HandleALULogicalFlags(rd, sc)                  \
 	if (insn & INSN_S)                                   \
-	set_cpsr(((GET_CPSR & ~(N_MASK | Z_MASK | C_MASK)) \
+	set_cpsr_nzcv(((GET_CPSR & ~(N_MASK | Z_MASK | C_MASK)) \
 				| HandleALUNZFlags(rd)                   \
 				| (((sc) != 0) << C_BIT)));              \
 	R15 += 4;
@@ -152,11 +152,99 @@
 /* Macros that can be re-defined for custom cpu implementations - The core expects these to be defined */
 /* In this case, we are using the default arm7 handlers (supplied by the core)
    - but simply changes these and define your own if needed for cpu implementation specific needs */
-#define READ8(addr)         arm7_cpu_read8(addr)
-#define WRITE8(addr,data)   arm7_cpu_write8(addr,data)
-#define READ16(addr)        arm7_cpu_read16(addr)
-#define WRITE16(addr,data)  arm7_cpu_write16(addr,data)
-#define READ32(addr)        arm7_cpu_read32(addr)
-#define WRITE32(addr,data)  arm7_cpu_write32(addr,data)
+// condition flag updates keep the mode and T bits, so on 32-bit-only cores
+// they do not need set_cpsr's mode switching
+#define set_cpsr_nzcv(val) do { const uint32_t v_ = (val); if (!(m_archFlags & ARCHFLAG_MODE26)) m_r[eCPSR] = v_; else set_cpsr(v_); } while (0)
+
+#define READ8(addr)         fast_read8(addr)
+#define WRITE8(addr,data)   fast_write8(addr,data)
+#define READ16(addr)        fast_read16(addr)
+#define WRITE16(addr,data)  fast_write16(addr,data)
+#define READ32(addr)        fast_read32(addr)
+#define WRITE32(addr,data)  fast_write32(addr,data)
+
+// inline fast path for fast RAM (see add_fastram): a cached translation and
+// a host pointer, else the normal (virtual) access functions
+inline bool arm7_cpu_device::xlat_hit(offs_t &addr, const int flags) const
+{
+	if (!(m_control & COPRO_CTRL_MMU_EN))
+		return true;
+	if (addr < 0x2000000)
+		return false;
+	const uint32_t xtag = (addr >> 10) | ((m_r[eCPSR] & 0xf) ? 0x80000000U : 0);
+	const xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][(addr >> 10) & (XLAT_CACHE_SIZE - 1)];
+	if (xe.tag != xtag)
+		return false;
+	addr = xe.ppage | (addr & 0x3ff);
+	return true;
+}
+
+inline uint32_t arm7_cpu_device::fast_read32(offs_t addr)
+{
+	offs_t pa = addr;
+	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
+		if (const uint8_t *const p = fastram_ptr(pa & ~3))
+			return std::rotr(*reinterpret_cast<const uint32_t *>(p), 8 * (addr & 3));
+	return arm7_cpu_read32(addr);
+}
+
+inline uint32_t arm7_cpu_device::fast_read16(offs_t addr)
+{
+	offs_t pa = addr;
+	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
+		if (const uint8_t *const p = fastram_ptr(pa & ~1))
+		{
+			uint32_t result = *reinterpret_cast<const uint16_t *>(p);
+			if (addr & 1)
+				result = ((result >> 8) & 0xff) | ((result & 0xff) << 24);
+			return result;
+		}
+	return arm7_cpu_read16(addr);
+}
+
+inline uint8_t arm7_cpu_device::fast_read8(offs_t addr)
+{
+	offs_t pa = addr;
+	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
+		if (const uint8_t *const p = fastram_ptr(pa))
+			return *p;
+	return arm7_cpu_read8(addr);
+}
+
+inline void arm7_cpu_device::fast_write32(offs_t addr, uint32_t data)
+{
+	offs_t pa = addr;
+	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
+		if (uint8_t *const p = fastram_ptr(pa & ~3))
+		{
+			*reinterpret_cast<uint32_t *>(p) = data;
+			return;
+		}
+	arm7_cpu_write32(addr, data);
+}
+
+inline void arm7_cpu_device::fast_write16(offs_t addr, uint16_t data)
+{
+	offs_t pa = addr;
+	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
+		if (uint8_t *const p = fastram_ptr(pa & ~1))
+		{
+			*reinterpret_cast<uint16_t *>(p) = data;
+			return;
+		}
+	arm7_cpu_write16(addr, data);
+}
+
+inline void arm7_cpu_device::fast_write8(offs_t addr, uint8_t data)
+{
+	offs_t pa = addr;
+	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
+		if (uint8_t *const p = fastram_ptr(pa))
+		{
+			*p = data;
+			return;
+		}
+	arm7_cpu_write8(addr, data);
+}
 #define PTR_READ32          &arm7_cpu_read32
 #define PTR_WRITE32         &arm7_cpu_write32
