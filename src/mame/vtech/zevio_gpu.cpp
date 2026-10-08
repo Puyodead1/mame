@@ -60,9 +60,10 @@ constexpr int ZW = 1024, ZH = 2048; // depth buffer in absolute GPU coordinates
 
 inline void bgr555_to_f(u16 c, float &r, float &g, float &b)
 {
-	r = (c & 0x1f) / 31.0f;
-	g = ((c >> 5) & 0x1f) / 31.0f;
-	b = ((c >> 10) & 0x1f) / 31.0f;
+	constexpr float k = 1.0f / 31.0f;
+	r = (c & 0x1f) * k;
+	g = ((c >> 5) & 0x1f) * k;
+	b = ((c >> 10) & 0x1f) * k;
 }
 
 inline u16 f_to_bgr555(float r, float g, float b)
@@ -421,6 +422,29 @@ bool zevio_gpu_device::texel(const rstate &s, rcache &pc, float u, float v, bool
 	const float fu = u * w - 0.5f, fv = v * h - 0.5f;
 	const int iu = int(std::floor(fu)), iv = int(std::floor(fv));
 	const float du = fu - iu, dv = fv - iv;
+	if (!BIT(mode, 8))
+	{
+		// BGR555 texels: 8-bit fixed point weights, transparent texels drop out
+		const int wu = int(du * 256.0f), wv = int(dv * 256.0f);
+		const int wt[4] = { (256 - wu) * (256 - wv), wu * (256 - wv), (256 - wu) * wv, wu * wv };
+		int sr = 0, sg = 0, sb = 0, wsum = 0;
+		for (int k = 0; k < 4; k++)
+		{
+			const int t = texel_raw(s, pc, iu + (k & 1), iv + (k >> 1));
+			if (t >= 0)
+			{
+				sr += (t & 0x1f) * wt[k];
+				sg += ((t >> 5) & 0x1f) * wt[k];
+				sb += ((t >> 10) & 0x1f) * wt[k];
+				wsum += wt[k];
+			}
+		}
+		if (wsum < 32768)
+			return false; // mostly transparent here
+		const float k = 1.0f / (float(wsum) * 31.0f);
+		r = sr * k; g = sg * k; b = sb * k; a = 1.0f;
+		return true;
+	}
 	float sr = 0, sg = 0, sb = 0, sa = 0, wsum = 0;
 	for (int k = 0; k < 4; k++)
 	{
@@ -665,17 +689,27 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 	if (minx > maxx || miny > maxy)
 		return;
 	const float inv_area = 1.0f / area;
+	// barycentrics step linearly along a row
+	const float d0 = (b.y - c.y) * inv_area, d1 = (c.y - a.y) * inv_area;
 	for (int y = miny; y <= maxy; y++)
 	{
 		const float py = y + 0.5f;
+		const float px0 = minx + 0.5f;
+		float w0 = ((b.x - px0) * (c.y - py) - (b.y - py) * (c.x - px0)) * inv_area - d0;
+		float w1 = ((c.x - px0) * (a.y - py) - (c.y - py) * (a.x - px0)) * inv_area - d1;
+		bool inside = false;
 		for (int x = minx; x <= maxx; x++)
 		{
-			const float px = x + 0.5f;
-			float w0 = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) * inv_area;
-			float w1 = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) * inv_area;
-			float w2 = 1.0f - w0 - w1;
+			w0 += d0;
+			w1 += d1;
+			const float w2 = 1.0f - w0 - w1;
 			if (w0 < 0 || w1 < 0 || w2 < 0)
+			{
+				if (inside)
+					break; // left the (convex) triangle on this row
 				continue;
+			}
+			inside = true;
 			const float iw = w0 * a.w + w1 * b.w + w2 * c.w;
 			const float z = 1.0f / iw;
 			float r = w0 * a.r + w1 * b.r + w2 * c.r;
