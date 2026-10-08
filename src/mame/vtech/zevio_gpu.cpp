@@ -358,8 +358,10 @@ bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b,
 		a = ((c >> 12) & 15) / 15.0f;
 		return a > 0.0f;
 	}
-	if (c == 0 || (c & 0x7fff) == 0x7c1f)
-		return false; // transparent texel (magenta colour key)
+	// 0x0000 and bit 15 set are transparent (Bratz: 0x0000 panel backgrounds;
+	// Cars: 0x8000 billboards, 0xFC1F menu text boxes, 0xFFFF icon backgrounds)
+	if (c == 0 || BIT(c, 15))
+		return false;
 	bgr555_to_f(c, r, g, b);
 	a = 1.0f;
 	return true;
@@ -372,10 +374,12 @@ void zevio_gpu_device::plot(int x, int y, float z, float r, float g, float b, fl
 	const int zx = x - int(m_clip0 & 0xfff), zy = y - int((m_clip0 >> 12) & 0xfff);
 	if (depth && zx >= 0 && zy >= 0 && zx < ZW && zy < ZH)
 	{
+		// 0x84 bit 0 = depth test, bit 1 = depth write (Cars draws its sky and
+		// ground with both clear, models with both set)
 		float &zb = m_zbuf[zy * ZW + zx];
-		if (z > zb)
+		if (BIT(m_w84, 0) && z > zb)
 			return;
-		if (!BIT(m_w88, 1)) // translucent pass tests but does not write
+		if (BIT(m_w84, 1) && !BIT(m_w88, 1)) // translucent pass tests but does not write
 			zb = z;
 	}
 	if (BIT(m_w88, 1) || a < 1.0f)
@@ -513,7 +517,7 @@ void zevio_gpu_device::draw_triangle(const vertex_t &a, const vertex_t &b, const
 	const int maxy = std::min(cy1, int(std::ceil(std::max({ a.y, b.y, c.y }))));
 	if (minx > maxx || miny > maxy)
 		return;
-	const bool depth = BIT(m_w84, 0) || true; // TODO: confirm the depth-test bit
+	const bool depth = true;
 	const float inv_area = 1.0f / area;
 	for (int y = miny; y <= maxy; y++)
 	{
@@ -599,7 +603,8 @@ void zevio_gpu_device::draw_line(const vertex_t &a, const vertex_t &b)
 
 void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 {
-	m_no3d = getenv("ZGPU_NO_3D") != nullptr;
+	static const bool no3d = getenv("ZGPU_NO_3D") != nullptr;
+	m_no3d = no3d;
 	// debug: ZGPU_ONLY=<hex upper half> draws only primitives with that header
 	static const char *only = getenv("ZGPU_ONLY");
 	if (only && (header >> 16) != strtoul(only, nullptr, 16))
@@ -628,7 +633,8 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 	}
 	for (auto &v : verts)
 		transform(v);
-	if (getenv("ZGPU_ZLOG") && n)
+	static const bool zlog = getenv("ZGPU_ZLOG") != nullptr;
+	if (zlog && n)
 	{
 		static std::map<u32, std::pair<float, float>> zr;
 		static int cnt = 0;
@@ -652,6 +658,12 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 				reg_f(0x40), reg_f(0x41), reg_f(0x42), reg_f(0x43), reg_f(0x44), reg_f(0x45), reg_f(0x46), reg_f(0x47), reg_f(0x48),
 				reg_f(0x4c), reg_f(0x4d), reg_f(0x4e), reg_f(0x78), reg_f(0x79), m_w81);
 	}
+
+	// debug: ZGPU_PRIMLOG=<time> logs every 3D primitive drawn in the 0.05 s after it
+	static double primlog_at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
+	const double now = machine().time().as_double();
+	const bool primlog = primlog_at >= 0 && now >= primlog_at && now < primlog_at + 0.05;
+	const int pix0 = m_stat_pixels, tri0 = m_stat_tris;
 
 	switch (kind)
 	{
@@ -680,12 +692,59 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 		LOGMASKED(LOG_UNKNOWN, "unknown 3D primitive %08x\n", header);
 		break;
 	}
+	if (primlog && n)
+	{
+		float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+		for (auto v : verts)
+		{
+			z0 = std::min(z0, v.z); z1 = std::max(z1, v.z);
+			if (project(v))
+			{
+				x0 = std::min(x0, v.x); x1 = std::max(x1, v.x);
+				y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
+			}
+		}
+		logerror("PRIM %08x tris %d pix %d x %.0f..%.0f y %.0f..%.0f z %.3f..%.3f 1c %06x 1e %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x clip %06x-%06x\n",
+				header, m_stat_tris - tri0, m_stat_pixels - pix0, x0, x1, y0, y1, z0, z1, m_w1c, m_w1e, m_w84, m_w88, m_w86, m_w87, m_w8d, m_clip0, m_clip1);
+		if (BIT(m_w1c, 6))
+			log_texture();
+	}
+}
+
+// debug: histogram of the current texture's 16-bit colours
+void zevio_gpu_device::log_texture() const
+{
+	// texture colour histogram (raw 16-bit values after the CLUT)
+	std::map<u16, int> hist;
+	const int w = 8 << (m_w86 & 7), h = 8 << ((m_w86 >> 3) & 7);
+	const int tx = m_w87 & 0xfff, ty = (m_w87 >> 12) & 0xfff;
+	for (int v = 0; v < h; v++)
+		for (int u = 0; u < w; u++)
+		{
+			u16 c;
+			switch ((m_w86 >> 9) & 3)
+			{
+			case 0: c = vram_r(tx + u, ty + v); break;
+			case 1: { const u16 hw = vram_r(tx + u / 2, ty + v); c = vram_r((m_clut[0] & 0xfff) + (BIT(u, 0) ? (hw >> 8) : (hw & 0xff)), (m_clut[0] >> 12) & 0xfff); break; }
+			default: { const u16 hw = vram_r(tx + u / 4, ty + v); c = vram_r((m_clut[3] & 0xfff) + ((hw >> ((u & 3) * 4)) & 15), (m_clut[3] >> 12) & 0xfff); break; }
+			}
+			hist[c]++;
+		}
+	std::vector<std::pair<int, u16>> top;
+	for (auto &e : hist)
+		top.emplace_back(e.second, e.first);
+	std::sort(top.rbegin(), top.rend());
+	std::string s;
+	for (int i = 0; i < std::min<int>(6, top.size()); i++)
+		s += util::string_format(" %04x:%d", top[i].second, top[i].first);
+	logerror("  TEX %dx%d clut %06x %06x:%s\n", w, h, m_clut[0], m_clut[3], s);
 }
 
 // 0x6F8: transform n inline vertices into RAM at the 0x0C address, same layout
 void zevio_gpu_device::transform_to_memory(u32 header, u32 &addr)
 {
-	if (getenv("ZGPU_NO_XFORM")) { addr += (header & 0xffff) * vertex_words((header >> 16) & 0x3f) * 4; return; }
+	static const bool no_xform = getenv("ZGPU_NO_XFORM") != nullptr;
+	if (no_xform) { addr += (header & 0xffff) * vertex_words((header >> 16) & 0x3f) * 4; return; }
 	const u8 fmt = (header >> 16) & 0x3f;
 	const int n = header & 0xffff;
 	const int wpv = vertex_words(fmt);
@@ -833,6 +892,15 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 	const int x0 = ox + s16(xy & 0xffff), y0 = oy + s16(xy >> 16);
 	const int w = std::min<int>(wh & 0xffff, 1024), h = std::min<int>(wh >> 16, 1024);
 	const float cr = (col & 0xff) / 255.0f, cg = ((col >> 8) & 0xff) / 255.0f, cb = ((col >> 16) & 0xff) / 255.0f;
+	static double primlog_at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
+	const double now = machine().time().as_double();
+	if (primlog_at >= 0 && now >= primlog_at && now < primlog_at + 0.05)
+	{
+		logerror("SPR %08x xy %d,%d wh %dx%d uv %08x col %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x 1c %06x 1e %06x\n",
+				header, x0, y0, w, h, uv, col, m_w84, m_w88, m_w86, m_w87, m_w8d, m_w1c, m_w1e);
+		if (BIT(flags, 0))
+			log_texture();
+	}
 	for (int j = 0; j < h; j++)
 		for (int i = 0; i < w; i++)
 		{

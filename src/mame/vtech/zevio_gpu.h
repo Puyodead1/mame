@@ -66,6 +66,7 @@ private:
 	// 2D
 	void prim2d(u32 header, u32 &addr);
 	void sprite(u32 header, u32 &addr);
+	void log_texture() const;
 
 	// pixels
 	bool texel(float u, float v, bool normalized, float &r, float &g, float &b, float &a) const;
