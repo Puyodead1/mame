@@ -307,6 +307,7 @@ private:
 	void cd_latch_subq();
 	void cd_queue_push(u32 data_addr, s32 frame);
 	TIMER_CALLBACK_MEMBER(cd_sector_cb);
+	void line_timer_arm(int line);
 	void prof_dump()
 	{
 		std::vector<std::pair<u32, u32>> v;
@@ -1038,7 +1039,29 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::line_cb)
 		m_disp_status |= 0x01; // TODO: guessed bit for the +0x020 line interrupt
 		disp_update_irq();
 	}
-	m_line_timer->adjust(m_screen->time_until_pos((line + 1) % m_screen->height()));
+	line_timer_arm(line);
+}
+
+// next line with something to do: vblank, line compare, line interrupt
+void vsmilpro_state::line_timer_arm(int line)
+{
+	const int lines[3] = { m_screen->visible_area().bottom() + 1, int(m_disp_regs[0x1048 / 4] & 0x7ff), int((m_disp_regs[0x020 / 4] >> 16) & 0x7ff) };
+	const int height = m_screen->height();
+	int best = -1, bestd = height + 1;
+	for (int l : lines)
+	{
+		if (l < 0 || l >= height)
+			continue;
+		int d = l - line;
+		if (d <= 0)
+			d += height;
+		if (d < bestd)
+		{
+			bestd = d;
+			best = l;
+		}
+	}
+	m_line_timer->adjust(best >= 0 ? m_screen->time_until_pos(best) : attotime::never);
 }
 
 u32 vsmilpro_state::disp_r(offs_t offset)
@@ -1071,6 +1094,8 @@ void vsmilpro_state::disp_w(offs_t offset, u32 data, u32 mem_mask)
 	LOGMASKED(LOG_VIDEO, "%08x: disp %04x = %08x\n", m_maincpu->pc(), offset * 4, data);
 	if (offset == 0x00c / 4 || offset == 0x008 / 4)
 		disp_update_screen_size();
+	if (offset == 0x00c / 4 || offset == 0x008 / 4 || offset == 0x1048 / 4 || offset == 0x020 / 4)
+		line_timer_arm(m_screen->vpos());
 }
 
 static inline rgb_t bgr555(u16 p)

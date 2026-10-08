@@ -56,7 +56,7 @@ DEFINE_DEVICE_TYPE(ZEVIO_GPU, zevio_gpu_device, "zevio_gpu", "Zevio 1020 GPU")
 
 namespace {
 
-constexpr int ZW = 1024, ZH = 1024;
+constexpr int ZW = 1024, ZH = 2048; // depth buffer in absolute GPU coordinates
 
 inline void bgr555_to_f(u16 c, float &r, float &g, float &b)
 {
@@ -153,6 +153,8 @@ void zevio_gpu_device::device_reset()
 	std::fill(std::begin(m_clut), std::end(m_clut), 0);
 	m_vtxbase = m_xfer = 0;
 	std::fill_n(&m_zbuf[0], ZW * ZH, std::numeric_limits<float>::max());
+	m_zdirty_y0 = ZH;
+	m_zdirty_y1 = -1;
 	update_irq();
 }
 
@@ -511,12 +513,11 @@ void zevio_gpu_device::plot(const rstate &s, int x, int y, float z, float r, flo
 {
 	if (!in_clip(s, x, y))
 		return;
-	const int zx = x - int(s.clip0 & 0xfff), zy = y - int((s.clip0 >> 12) & 0xfff);
-	if (depth && zx >= 0 && zy >= 0 && zx < ZW && zy < ZH)
+	if (depth && y < ZH)
 	{
 		// 0x84 bit 0 = depth test, bit 1 = depth write (Cars draws its sky and
 		// ground with both clear, models with both set)
-		float &zb = m_zbuf[zy * ZW + zx];
+		float &zb = m_zbuf[y * ZW + x];
 		if (BIT(s.w84, 0) && z > zb)
 			return;
 		if (BIT(s.w84, 1) && !BIT(s.w88, 1)) // translucent pass tests but does not write
@@ -1151,9 +1152,34 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 void zevio_gpu_device::draw_fill(const rcmd &c, int band_y0, int band_y1)
 {
 	const int x = c.a0 & 0xffff, y = c.a0 >> 16, w = c.a1 & 0xffff, h = c.a1 >> 16;
+	const u16 col = c.a3;
 	for (int j = std::max(0, band_y0 - y); j < std::min(h, band_y1 - y); j++)
-		for (int i = 0; i < w; i++)
-			vram_w(x + i, y + j, c.a3);
+	{
+		// runs of up to 32 pixels are contiguous in the tiled layout
+		for (int i = 0; i < w; )
+		{
+			const int xx = (x + i) & 1023;
+			const int run = std::min(w - i, 32 - (xx & 31));
+			const u32 off = vram_addr(xx, y + j) - m_ram_base;
+			if (off + run * 2 <= m_ram_size)
+			{
+#ifdef LSB_FIRST
+				std::fill_n(reinterpret_cast<u16 *>(m_ram) + (off >> 1), run, col);
+#else
+				for (int k = 0; k < run; k++)
+					vram_w(xx + k, y + j, col);
+#endif
+			}
+			i += run;
+		}
+	}
+}
+
+void zevio_gpu_device::draw_zclear(const rcmd &c, int band_y0, int band_y1)
+{
+	const int y0 = std::max<int>(c.a0, band_y0), y1 = std::min<int>(c.a1 + 1, band_y1);
+	if (y1 > y0)
+		std::fill_n(&m_zbuf[y0 * ZW], (y1 - y0) * ZW, std::numeric_limits<float>::max());
 }
 
 
@@ -1190,13 +1216,26 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 		c.ymin = c.a0 >> 16;
 		c.ymax = c.ymin + int(c.a1 >> 16) - 1;
 		break;
+	case CMD_ZCLEAR:
+		c.ymin = c.a0;
+		c.ymax = c.a1;
+		break;
 	}
 	c.ymin = std::max({ c.ymin, int((c.st.clip0 >> 12) & 0xfff), 0 });
 	c.ymax = std::min({ c.ymax, int((c.st.clip1 >> 12) & 0xfff), ZH - 1 });
-	if (c.type == CMD_FILL)
-		c.ymax = (c.a0 >> 16) + int(c.a1 >> 16) - 1; // fills are not clipped
+	if (c.type == CMD_FILL || c.type == CMD_ZCLEAR)
+	{
+		// not clipped
+		c.ymin = (c.type == CMD_FILL) ? int(c.a0 >> 16) : int(c.a0);
+		c.ymax = (c.type == CMD_FILL) ? int(c.a0 >> 16) + int(c.a1 >> 16) - 1 : int(c.a1);
+	}
 	if (c.ymin > c.ymax)
 		return;
+	if ((c.type == CMD_TRI3D || c.type == CMD_POINT) && BIT(c.st.w84, 1))
+	{
+		m_zdirty_y0 = std::min(m_zdirty_y0, c.ymin);
+		m_zdirty_y1 = std::max(m_zdirty_y1, c.ymax);
+	}
 	if (m_count_stats)
 	{
 		// debug statistics are counted in order on this thread
@@ -1314,6 +1353,9 @@ void zevio_gpu_device::exec_band(const std::vector<rcmd> &cmds, int y0, int y1)
 			break;
 		case CMD_FILL:
 			draw_fill(c, y0, y1);
+			break;
+		case CMD_ZCLEAR:
+			draw_zclear(c, y0, y1);
 			break;
 		}
 	}
@@ -1450,15 +1492,29 @@ void zevio_gpu_device::run_list(u32 addr)
 			const int x = pos & 0xffff, y = pos >> 16, w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 8192);
 			const int ww = m_regs[0x94 / 4] & 0xffff, wh = m_regs[0x94 / 4] >> 16;
 			const bool windowed = (x + w <= ww) && (y + h <= wh);
-			if (!windowed)
+			const u32 woff = m_regs[0x98 / 4] - 0x0ffd0000;
+			if (!windowed || !(woff & 0x3fff))
 			{
+				// the +0x98 area starts on an 8-row boundary: absolute rows
 				rcmd c{};
 				c.type = CMD_FILL;
 				c.st = cur_state();
-				c.a0 = pos;
+				c.a0 = windowed ? ((x & 0xffff) | (u32(y + (woff >> 14) * 8) << 16)) : pos;
 				c.a1 = u32(w) | (u32(h) << 16);
 				c.a3 = col;
 				add_cmd(std::move(c));
+				if (windowed && m_zdirty_y1 >= m_zdirty_y0)
+				{
+					// FA clears depth this way: reset the rows drawn with depth since
+					rcmd z{};
+					z.type = CMD_ZCLEAR;
+					z.st = cur_state();
+					z.a0 = m_zdirty_y0;
+					z.a1 = m_zdirty_y1;
+					add_cmd(std::move(z));
+					m_zdirty_y0 = ZH;
+					m_zdirty_y1 = -1;
+				}
 				break;
 			}
 			sync(); // the +0x98 area and the depth buffer
@@ -1470,7 +1526,11 @@ void zevio_gpu_device::run_list(u32 addr)
 					wr16(base + (yy >> 3) * 16384 + (xb >> 6) * 512 + (yy & 7) * 64 + (xb & 63), col);
 				}
 			if (windowed)
+			{
 				std::fill_n(&m_zbuf[0], ZW * ZH, std::numeric_limits<float>::max());
+				m_zdirty_y0 = ZH;
+				m_zdirty_y1 = -1;
+			}
 			break;
 		}
 		case 0xd2: // VRAM to VRAM copy: destination, size, source

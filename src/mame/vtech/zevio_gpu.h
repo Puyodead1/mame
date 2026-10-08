@@ -112,7 +112,7 @@ private:
 		u16 pal[256];
 		u32 key = ~0U;
 	};
-	enum : u8 { CMD_TRI3D, CMD_TRI2D, CMD_LINE, CMD_POINT, CMD_SPRITE, CMD_FILL };
+	enum : u8 { CMD_TRI3D, CMD_TRI2D, CMD_LINE, CMD_POINT, CMD_SPRITE, CMD_FILL, CMD_ZCLEAR };
 	struct rcmd
 	{
 		u8 type;
@@ -140,6 +140,8 @@ private:
 	void draw_line(const rstate &s, const vertex_t &a, const vertex_t &b, int y0, int y1);
 	void draw_sprite(const rstate &s, rcache &pc, const rcmd &c, int y0, int y1);
 	void draw_fill(const rcmd &c, int y0, int y1);
+	void draw_zclear(const rcmd &c, int y0, int y1);
+	int m_zdirty_y0 = 0, m_zdirty_y1 = -1; // rows written with depth since the last clear
 
 	static constexpr int MAX_BANDS = 16;
 	struct band_job { zevio_gpu_device *gpu; const std::vector<rcmd> *cmds; int y0, y1; };
