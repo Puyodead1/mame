@@ -66,8 +66,9 @@
 #define LOG_UART    (1U << 9)
 #define LOG_SYS     (1U << 10)
 #define LOG_DEBUGTX (1U << 11)
+#define LOG_CDR     (1U << 12)
 
-#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_CD)
+#define VERBOSE (LOG_UNKNOWN)
 #include "logmacro.h"
 
 #include <deque>
@@ -288,6 +289,9 @@ private:
 	void cd_w(offs_t offset, u32 data, u32 mem_mask);
 	void cd_update_irq();
 	s32 m_cd_head;      // absolute frame under the pickup (LBA + 150)
+	s32 m_cd_expect;    // next frame the decoder accepts (header match)
+	bool m_cd_mute;     // $A audio control MUTE: no data reaches the decoder
+	u32 m_cd_tmo;       // sector timeout countdown armed by +0x60 bits 31-24
 	s32 m_cd_dir;       // direction of the last sled command
 	s32 m_cd_jump_n;    // 2N track jump count from the last $7x command
 	bool m_cd_sled_armed;
@@ -1379,6 +1383,16 @@ void vsmilpro_state::cd_servo_write(int nbits, u64 value, bool sens)
 			m_cd_cal = value & 0xff; // swept by FA's balance calibration (sub_109E5610)
 		break;
 	case 32:
+		// $Ax audio control: D21 (MUTE) also cuts the data the decoder
+		// sees, which FA relies on to pause right after the requested sectors
+		if ((value >> 26) == (0xa0 >> 2))
+			m_cd_mute = BIT(value, 25);
+		// $9x function specification: D22 (DSPB) selects double speed
+		if ((cmd & 0xf0) == 0x90)
+		{
+			const int speed = BIT(value, 26) ? 2 : 1;
+			m_cd_timer->adjust(m_cd_timer->remaining(), 0, attotime::from_hz(75 * speed));
+		}
 		// traverse count for a long sled move (count in bits 27-12). The init
 		// sequence also writes $B0 values, so only act while the disc spins.
 		// The direction comes from a preceding $22/$23 when there is one;
@@ -1499,11 +1513,31 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 		return;
 
 	const u32 ctrl = m_cd_regs[0x40 / 4];
-	if ((ctrl & 4) && m_cd_running)
+	const u32 mode = ctrl & 0x18;
+	const bool capture = (mode == 0x08) && (ctrl & 0x80);
+	// the decoder only takes the sector whose header matches the next
+	// expected address; FA pauses by seeking back and letting the drive
+	// re-read sectors the decoder already has
+	// +0x60 bits 31-24 arm a timeout (IRQ 0x8000) for a running decoder that
+	// sees no data (counted in EFM frames, 98 per sector); FA uses it to end
+	// a muted pause, which makes it take the last buffered sector and restart
+	const bool deliver = (ctrl & 4) && m_cd_running && !m_cd_mute && (capture || m_cd_head == m_cd_expect);
+	if ((ctrl & 4) && m_cd_running && (m_cd_regs[0x60 / 4] >> 24))
+	{
+		if (!m_cd_mute)
+			m_cd_tmo = m_cd_regs[0x60 / 4] >> 24;
+		else if (m_cd_tmo)
+		{
+			m_cd_tmo = (m_cd_tmo > 98) ? (m_cd_tmo - 98) : 0;
+			if (!m_cd_tmo)
+				m_cd_regs[0x64 / 4] |= 0x8000;
+		}
+	}
+	if (deliver)
 	{
 		// deliver the sector under the head
-		const u32 mode = ctrl & 0x18;
-		const bool capture = (mode == 0x08) && (ctrl & 0x80);
+		if (!capture)
+			m_cd_expect++;
 		const s32 lba = m_cd_head - 150;
 		u32 size;
 		if (capture)
@@ -1539,9 +1573,18 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 		}
 		LOGMASKED(LOG_CD, "cd sector lba %d -> %08x (%d bytes)\n", lba, m_cd_ptr, size);
 
+		// the watermark fires when the write pointer reaches it, which
+		// includes passing it in this step (ring wrap aware)
+		const u32 old_ptr = m_cd_ptr;
 		m_cd_ptr += size;
 		if ((ctrl & 0x40) && m_cd_ptr > m_cd_regs[0x2c / 4])
-			m_cd_ptr = m_cd_regs[0x28 / 4];
+			m_cd_ptr = m_cd_regs[0x28 / 4] + (m_cd_ptr - m_cd_regs[0x2c / 4] - 4);
+		const u32 wm = m_cd_regs[0x80 / 4];
+		const u32 ring_size = (ctrl & 0x40) ? (m_cd_regs[0x2c / 4] + 4 - m_cd_regs[0x28 / 4]) : 0;
+		u32 dist = wm - old_ptr;
+		if (ring_size && dist >= ring_size)
+			dist += ring_size; // wm behind old_ptr in the ring
+		const bool wm_hit = (dist != 0) && (dist <= size);
 
 		if (!(m_cd_regs[0x20 / 4] & 0x1000000))
 		{
@@ -1552,7 +1595,7 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 				m_cd_regs[0x64 / 4] |= 0x10;
 			}
 		}
-		if (m_cd_running && m_cd_ptr == m_cd_regs[0x80 / 4])
+		if (m_cd_running && wm_hit)
 		{
 			if (m_cd_regs[0x84 / 4] & 1)
 			{
@@ -1572,6 +1615,8 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 
 u32 vsmilpro_state::cd_r(offs_t offset)
 {
+	if (!machine().side_effects_disabled() && offset != 0x18 / 4 && offset != 0x14 / 4)
+		LOGMASKED(LOG_CDR, "%08x: cd read %02x = %08x (head %d)\n", m_maincpu->pc(), offset * 4, offset == 0x24 / 4 ? m_cd_ptr : m_cd_regs[offset], m_cd_head);
 	switch (offset)
 	{
 	case 0x10 / 4: return m_cd_rx; // servo RX data
@@ -1625,7 +1670,13 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 		{
 			const u32 start = m_cd_regs[0x1c / 4];
 			if (!(start & 0x1000000))
-				m_cd_head = (from_bcd(start >> 16) * 60 + from_bcd(start >> 8)) * 75 + from_bcd(start);
+			{
+				m_cd_expect = (from_bcd(start >> 16) * 60 + from_bcd(start >> 8)) * 75 + from_bcd(start);
+				// the seek model is coarse: if the head is not shortly before
+				// the target, put it there
+				if (m_cd_head > m_cd_expect || m_cd_expect - m_cd_head > 300)
+					m_cd_head = m_cd_expect;
+			}
 			m_cd_ptr = m_cd_regs[0x24 / 4];
 			m_cd_len = m_cd_regs[0x20 / 4] & 0xffffff;
 			m_cd_running = true;
@@ -1641,6 +1692,30 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 		}
 		return;
 	}
+	case 0x60 / 4:
+	{
+		const u32 old = m_cd_regs[offset];
+		COMBINE_DATA(&m_cd_regs[offset]);
+		if ((m_cd_regs[offset] >> 24) && !(old >> 24))
+			m_cd_tmo = m_cd_regs[offset] >> 24;
+		LOGMASKED(LOG_CD, "%08x: cd 60 = %08x\n", m_maincpu->pc(), m_cd_regs[offset]);
+		return;
+	}
+	case 0x84 / 4:
+		COMBINE_DATA(&m_cd_regs[offset]);
+		// a watermark programmed where the decoder already is takes effect now
+		if (m_cd_running && m_cd_ptr == m_cd_regs[0x80 / 4])
+		{
+			if (m_cd_regs[offset] & 1)
+			{
+				m_cd_running = false;
+				m_cd_regs[0x64 / 4] |= 0x10;
+			}
+			else
+				m_cd_regs[0x64 / 4] |= 0x10000;
+			cd_update_irq();
+		}
+		return;
 	case 0x74 / 4:
 	{
 		u32 st = m_cd_regs[0x70 / 4];
@@ -1779,6 +1854,9 @@ void vsmilpro_state::machine_start()
 	save_item(NAME(m_dcdma_regs));
 	save_item(NAME(m_cd_regs));
 	save_item(NAME(m_cd_head));
+	save_item(NAME(m_cd_expect));
+	save_item(NAME(m_cd_mute));
+	save_item(NAME(m_cd_tmo));
 	save_item(NAME(m_cd_dir));
 	save_item(NAME(m_cd_jump_n));
 	save_item(NAME(m_cd_ptr));
@@ -1837,6 +1915,9 @@ void vsmilpro_state::machine_reset()
 	}
 	m_joy_timer->adjust(attotime::from_hz(100), 0, attotime::from_hz(100));
 	m_cd_head = -3000;
+	m_cd_expect = 0;
+	m_cd_mute = false;
+	m_cd_tmo = 0;
 	m_cd_dir = 1;
 	m_cd_jump_n = 0;
 	m_cd_sled_armed = false;
@@ -1845,7 +1926,7 @@ void vsmilpro_state::machine_reset()
 	m_cd_ptr = 0;
 	m_cd_len = 0;
 	m_cd_running = false;
-	m_cd_timer->adjust(attotime::from_hz(75 * 4), 0, attotime::from_hz(75 * 4)); // TODO: 1x/4x speed switching
+	m_cd_timer->adjust(attotime::from_hz(75), 0, attotime::from_hz(75));
 }
 
 
