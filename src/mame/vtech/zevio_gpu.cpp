@@ -43,6 +43,7 @@
 #include "zevio_gpu.h"
 
 #include <map>
+#include <thread>
 
 #define LOG_UNKNOWN (1U << 1)
 #define LOG_LIST    (1U << 2)
@@ -87,6 +88,8 @@ zevio_gpu_device::zevio_gpu_device(const machine_config &mconfig, const char *ta
 void zevio_gpu_device::device_start()
 {
 	m_zbuf = std::make_unique<float[]>(ZW * ZH);
+	m_bands = std::clamp<int>(std::thread::hardware_concurrency(), 1, MAX_BANDS);
+	m_queue = (m_bands > 1) ? osd_work_queue_alloc(WORK_QUEUE_FLAG_MULTI | WORK_QUEUE_FLAG_HIGH_FREQ) : nullptr;
 	save_item(NAME(m_regs));
 	save_item(NAME(m_cvt));
 	save_item(NAME(m_r));
@@ -104,6 +107,13 @@ void zevio_gpu_device::device_start()
 	save_item(NAME(m_clut));
 	save_item(NAME(m_vtxbase));
 	save_item(NAME(m_xfer));
+}
+
+void zevio_gpu_device::device_stop()
+{
+	if (m_queue)
+		osd_work_queue_free(m_queue);
+	m_queue = nullptr;
 }
 
 void zevio_gpu_device::device_reset()
@@ -135,10 +145,17 @@ void zevio_gpu_device::device_reset()
 
 float zevio_gpu_device::f16_to_float(u16 v)
 {
-	if (!(v & 0x7fff))
-		return 0.0f;
-	const float f = ldexpf(1.0f + (v & 0x1ff) / 512.0f, int((v >> 9) & 0x3f) - 31);
-	return (v & 0x8000) ? -f : f;
+	static const auto table = [] ()
+	{
+		auto t = std::make_unique<float[]>(0x10000);
+		for (int i = 0; i < 0x10000; i++)
+		{
+			const float f = (i & 0x7fff) ? ldexpf(1.0f + (i & 0x1ff) / 512.0f, int((i >> 9) & 0x3f) - 31) : 0.0f;
+			t[i] = (i & 0x8000) ? -f : f;
+		}
+		return t;
+	}();
+	return table[v];
 }
 
 u16 zevio_gpu_device::float_to_f16(float f)
@@ -209,6 +226,82 @@ void zevio_gpu_device::update_irq()
 	m_irq_cb((m_regs[0x14 / 4] & m_regs[0x10 / 4] & 0x3f) ? ASSERT_LINE : CLEAR_LINE);
 }
 
+/*
+    FA's GPU driver queues hundreds of small display lists per frame and
+    starts each from the end-of-list interrupt (tag 0xFD): mark the finished
+    entry done (status word 3), count--, read index++, then status 1 and kick
+    for the next entry. Doing that bookkeeping here and running the next list
+    directly saves an interrupt round trip per list, which was most of the
+    emulated CPU time. The handler is found by its code and its literal pool;
+    if it is not there, or a hook is installed, the real interrupt is used.
+*/
+static const u32 fa_gpu_irq_sig[] = {
+	0xe52de004, 0xe24dd010, 0xe58d000c, 0xe59f30f4, 0xe5933000, 0xe58d3008, 0xe59d2008, 0xe59f30e8,
+	0xe0023003, 0xe58d3008, 0xe59f20d8, 0xe3a0303f, 0xe5823000, 0xe59f20d4, 0xe3a03c01, 0xe5823000,
+	0xe59d3008, 0xe2033008, 0xe3530000, 0x0a000022, 0xe59d3008, 0xe2033cff, 0xe3530cfd, 0x1a00001e
+};
+
+u32 zevio_gpu_device::fa_find_irq_handler()
+{
+	// FA's code lives in the upper part of SDRAM
+	for (u32 a = 0x10900000; a < 0x10c00000; a += 4)
+	{
+		if (rd32(a) != fa_gpu_irq_sig[0])
+			continue;
+		bool match = true;
+		for (int i = 1; i < std::size(fa_gpu_irq_sig) && match; i++)
+			match = rd32(a + i * 4) == fa_gpu_irq_sig[i];
+		if (match && rd32(a + 0x108) == 0xa8000014 && rd32(a + 0x110) == 0xdc000004)
+			return a;
+	}
+	return 0;
+}
+
+bool zevio_gpu_device::fa_queue_hle()
+{
+	static const bool off = getenv("ZGPU_NO_QUEUE_HLE") != nullptr;
+	if (off || m_regs[0x14 / 4] != 0xfd08 || !(m_regs[0x10 / 4] & 0x08))
+		return false;
+	// look for the handler again at most once per emulated second
+	if (!m_fa_handler || rd32(m_fa_handler) != fa_gpu_irq_sig[0])
+	{
+		const double now = machine().time().as_double();
+		if (now < m_fa_next_scan)
+			return false;
+		m_fa_next_scan = now + 1.0;
+		m_fa_handler = fa_find_irq_handler();
+		if (!m_fa_handler)
+			return false;
+		logerror("FA GPU queue handler at %08x\n", m_fa_handler);
+	}
+	const u32 q = rd32(m_fa_handler + 0x114), busy = rd32(m_fa_handler + 0x118), hook = rd32(m_fa_handler + 0x11c);
+	if (rd32(hook) != 0 || rd32(q + 4) != 1)
+		return false;
+	u32 idx = rd32(q + 0x10);
+	const u32 list = rd32(rd32(q + 0x0c) + idx * 12 + 4);
+	if (list != m_regs[0x28 / 4])
+		return false;
+
+	wr32(list, 3);
+	s32 count = s32(rd32(q + 0x18)) - 1;
+	if (count < 0)
+		count = 0;
+	wr32(q + 0x18, count);
+	if (s32(++idx) >= s32(rd32(q + 0x08)))
+		idx = 0;
+	wr32(q + 0x10, idx);
+	m_regs[0x14 / 4] = 0; // acknowledged
+	if (count <= 0)
+	{
+		wr32(busy, 0);
+		return false;
+	}
+	const u32 next = rd32(rd32(q + 0x0c) + idx * 12 + 4);
+	wr32(next, 1);
+	m_regs[0x28 / 4] = next;
+	return true;
+}
+
 u32 zevio_gpu_device::regs_r(offs_t offset)
 {
 	if (offset == 0)
@@ -228,7 +321,14 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 	{
 	case 0x00 / 4:
 		if (data == 1)
+		{
+			m_defer_irq = true;
 			run_list(m_regs[0x28 / 4]);
+			while (fa_queue_hle())
+				run_list(m_regs[0x28 / 4]);
+			m_defer_irq = false;
+			update_irq();
+		}
 		else if (data == 3)
 		{
 			m_regs[0x14 / 4] = 0;
@@ -417,8 +517,11 @@ void zevio_gpu_device::plot(int x, int y, float z, float r, float g, float b, fl
 		g = g * kg + dg * (1.0f - kg);
 		b = b * kb + db * (1.0f - kb);
 	}
-	m_stat_pixels++;
-	m_total_pixels++;
+	if (m_count_stats)
+	{
+		m_stat_pixels++;
+		m_total_pixels++;
+	}
 	vram_w(x, y, f_to_bgr555(r, g, b));
 }
 
@@ -524,20 +627,23 @@ bool zevio_gpu_device::project(vertex_t &v) const
 	return true;
 }
 
-void zevio_gpu_device::draw_triangle(const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured)
+void zevio_gpu_device::draw_triangle(const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured, int band_y0, int band_y1)
 {
 	// screen-space edge functions over the bounding box, perspective-correct UVs
 	const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-	m_stat_tris++;
-	m_total_tris++;
+	if (m_count_stats)
+	{
+		m_stat_tris++;
+		m_total_tris++;
+	}
 	if (std::fabs(area) < 1e-6f)
 		return;
 	const int cx0 = std::max<int>(m_clip0 & 0xfff, 0), cy0 = std::max<int>((m_clip0 >> 12) & 0xfff, 0);
 	const int cx1 = std::min<int>(m_clip1 & 0xfff, 1023), cy1 = std::min<int>((m_clip1 >> 12) & 0xfff, ZH - 1);
 	const int minx = std::max(cx0, int(std::floor(std::min({ a.x, b.x, c.x }))));
 	const int maxx = std::min(cx1, int(std::ceil(std::max({ a.x, b.x, c.x }))));
-	const int miny = std::max(cy0, int(std::floor(std::min({ a.y, b.y, c.y }))));
-	const int maxy = std::min(cy1, int(std::ceil(std::max({ a.y, b.y, c.y }))));
+	const int miny = std::max({ cy0, band_y0, int(std::floor(std::min({ a.y, b.y, c.y }))) });
+	const int maxy = std::min({ cy1, band_y1 - 1, int(std::ceil(std::max({ a.y, b.y, c.y }))) });
 	if (minx > maxx || miny > maxy)
 		return;
 	const bool depth = true;
@@ -579,7 +685,6 @@ void zevio_gpu_device::draw_triangle(const vertex_t &a, const vertex_t &b, const
 void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 {
 	if (m_no3d) return;
-	const bool textured = BIT(m_w1c, 6);
 	// clip against the near plane in eye space, then project
 	const float near_z = 1.0f / 4096.0f;
 	vertex_t in[3] = { a, b, c };
@@ -608,9 +713,60 @@ void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 		return;
 	for (int i = 0; i < n; i++)
 		project(out[i]);
-	draw_triangle(out[0], out[1], out[2], textured);
+	m_batch.push_back({ out[0], out[1], out[2] });
 	if (n == 4)
-		draw_triangle(out[0], out[2], out[3], textured);
+		m_batch.push_back({ out[0], out[2], out[3] });
+}
+
+// render the queued triangles of one primitive; large batches are split
+// into horizontal bands rendered on worker threads (bands touch disjoint
+// rows of VRAM and the depth buffer, so the result does not depend on them)
+void *zevio_gpu_device::band_cb(void *param, int threadid)
+{
+	auto *const job = reinterpret_cast<band_job *>(param);
+	zevio_gpu_device &gpu = *job->gpu;
+	for (const auto &t : gpu.m_batch)
+		gpu.draw_triangle(t.a, t.b, t.c, job->textured, job->y0, job->y1);
+	return nullptr;
+}
+
+void zevio_gpu_device::flush_batch()
+{
+	if (m_batch.empty())
+		return;
+	const bool textured = BIT(m_w1c, 6);
+	float area = 0, ymin = 1e9f, ymax = -1e9f;
+	for (const auto &t : m_batch)
+	{
+		area += std::fabs((t.b.x - t.a.x) * (t.c.y - t.a.y) - (t.b.y - t.a.y) * (t.c.x - t.a.x)) * 0.5f;
+		ymin = std::min({ ymin, t.a.y, t.b.y, t.c.y });
+		ymax = std::max({ ymax, t.a.y, t.b.y, t.c.y });
+	}
+	const int y0 = std::max<int>(std::floor(ymin), int((m_clip0 >> 12) & 0xfff));
+	const int y1 = std::min<int>(std::ceil(ymax) + 1, std::min<int>(((m_clip1 >> 12) & 0xfff) + 1, ZH));
+	if (!m_queue || m_count_stats || area < 6000.0f || y1 - y0 < 32)
+	{
+		for (const auto &t : m_batch)
+			draw_triangle(t.a, t.b, t.c, textured);
+	}
+	else
+	{
+		// the workers only read the CLUT cache, so fill it first
+		if (textured)
+		{
+			if (((m_w86 >> 9) & 3) == 1)
+				load_palette(0, 256);
+			else if (((m_w86 >> 9) & 3) > 1)
+				load_palette(3, 16);
+		}
+		const int bands = std::min(m_bands, (y1 - y0) / 16);
+		band_job jobs[MAX_BANDS];
+		for (int i = 0; i < bands; i++)
+			jobs[i] = { this, y0 + (y1 - y0) * i / bands, y0 + (y1 - y0) * (i + 1) / bands, textured };
+		osd_work_item_queue_multiple(m_queue, band_cb, bands, jobs, sizeof(band_job), WORK_ITEM_FLAG_AUTO_RELEASE);
+		osd_work_queue_wait(m_queue, osd_ticks_per_second() * 10);
+	}
+	m_batch.clear();
 }
 
 void zevio_gpu_device::draw_line(const vertex_t &a, const vertex_t &b)
@@ -687,6 +843,7 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 	static double primlog_at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
 	const double now = machine().time().as_double();
 	const bool primlog = primlog_at >= 0 && now >= primlog_at && now < primlog_at + 0.05;
+	m_count_stats = primlog || (VERBOSE & LOG_LIST);
 	const int pix0 = m_stat_pixels, tri0 = m_stat_tris;
 
 	switch (kind)
@@ -716,6 +873,7 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 		LOGMASKED(LOG_UNKNOWN, "unknown 3D primitive %08x\n", header);
 		break;
 	}
+	flush_batch();
 	if (primlog && n)
 	{
 		float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
@@ -1028,7 +1186,8 @@ void zevio_gpu_device::run_list(u32 addr)
 		case 0x00: case 0x12: case 0x89: case 0x95: case 0x96: case 0x8e: break; // 00: padding after sub-list calls
 		case 0x14:
 			m_regs[0x14 / 4] = (cmd & 0xff00) | 0x08;
-			update_irq();
+			if (!m_defer_irq)
+				update_irq();
 			if (VERBOSE & LOG_LIST)
 			{
 				LOGMASKED(LOG_LIST, "list done: tris %d pixels %d fills %d clip %06x-%06x base %08x r81 %06x f %f %f near %f\n",
