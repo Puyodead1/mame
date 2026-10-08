@@ -50,6 +50,17 @@ public:
 	virtual ~arm7_cpu_device();
 
 	void set_high_vectors() { m_vectorbase = 0xffff0000; }
+	// fetch instructions directly instead of emulating the ARM7 prefetch
+	// buffer (for cached cores where software flushes caches after writing code)
+	void set_direct_fetch(bool enable) { m_direct_fetch = enable; }
+
+	// fast RAM: physical ranges of plain little-endian RAM accessed through a
+	// host pointer instead of the address space (no taps or watchpoints there)
+	void add_fastram(offs_t start, offs_t end, void *base)
+	{
+		assert(m_fastram_count < std::size(m_fastram));
+		m_fastram[m_fastram_count++] = { start, end - start, reinterpret_cast<uint8_t *>(base) };
+	}
 
 	// 26-bit data space (CP15 DATA32 clear on the parts with the 26-bit modes): a data address with bits 31:26 set takes
 	// the address exception (vector 0x14, SVC mode).  Disabling it gives the old cpu/arm behaviour of silently masking
@@ -244,6 +255,22 @@ protected:
 	bool ldm_loads_base(uint32_t insn, uint32_t rb) const;
 	bool check_data_address(offs_t &addr);
 	virtual bool translate_vaddr_to_paddr(offs_t &addr, const int flags);
+
+	// small direct-mapped cache of successful 1K-page translations, indexed by
+	// the TLB access flags; flushed on CP15 writes, reset and state load
+	static constexpr unsigned XLAT_CACHE_SIZE = 64;
+	struct xlat_cache_entry { uint32_t tag = ~0U; uint32_t ppage = 0; };
+	xlat_cache_entry m_xlat_cache[16][XLAT_CACHE_SIZE];
+	void xlat_cache_flush();
+
+	// direct instruction fetch (see set_direct_fetch)
+	bool m_direct_fetch = false;
+	uint32_t m_dfetch_vbase = ~0U, m_dfetch_pbase = 0, m_dfetch_priv = 0;
+	uint8_t *m_dfetch_host = nullptr;
+	bool direct_fetch(offs_t vaddr, bool thumb, uint32_t &insn);
+	// inline cache check before the virtual translate (cache entries only
+	// come from arm7_cpu_device::translate_vaddr_to_paddr)
+	bool translate_fast(offs_t &vaddr, const int flags);
 	bool page_table_finish_translation(offs_t &vaddr, const uint8_t type, const uint32_t lvl1, const uint32_t lvl2, const int flags, const uint32_t lvl1a, const uint32_t lvl2a);
 	bool page_table_translate(offs_t &vaddr, const int flags);
 	tlb_entry *tlb_map_entry(const offs_t vaddr, const int flags);
@@ -263,6 +290,19 @@ protected:
 	virtual uint8_t arm7_cpu_read8(offs_t addr);
 
 	virtual uint32_t insn_fetch_word(offs_t addr) { return m_pr32(addr); }
+
+	struct fastram_range { offs_t start; offs_t span; uint8_t *base; };
+	fastram_range m_fastram[4];
+	unsigned m_fastram_count = 0;
+	uint8_t *fastram_ptr(offs_t addr) const
+	{
+#ifdef LSB_FIRST
+		for (unsigned i = 0; i < m_fastram_count; i++)
+			if (addr - m_fastram[i].start <= m_fastram[i].span)
+				return m_fastram[i].base + (addr - m_fastram[i].start);
+#endif
+		return nullptr;
+	}
 
 	// Coprocessor support
 	virtual void arm7_do_callback(uint32_t insn);

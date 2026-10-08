@@ -1142,6 +1142,16 @@ bool arm7_cpu_device::translate_vaddr_to_paddr(offs_t &vaddr, const int flags)
 			LOGMASKED(LOG_TLB, "%s: translate_vaddr_to_paddr: vaddr < 32M, adding PID (%08x) = %08x\n", machine().describe_context(), m_pid_offset, vaddr);
 	}
 
+	// fast path: recently translated 1K page with the same access type and
+	// privilege (flushed on any CP15 write, reset and state load)
+	const uint32_t xtag = (vaddr >> 10) | ((GET_CPSR & 0xf) ? 0x80000000U : 0);
+	xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][(vaddr >> 10) & (XLAT_CACHE_SIZE - 1)];
+	if (xe.tag == xtag)
+	{
+		vaddr = xe.ppage | (vaddr & 0x3ff);
+		return true;
+	}
+
 	tlb_entry *entry = tlb_probe(vaddr, flags);
 
 	if (entry)
@@ -1156,6 +1166,8 @@ bool arm7_cpu_device::translate_vaddr_to_paddr(offs_t &vaddr, const int flags)
 		if (access_result == 0)
 		{
 			vaddr = tlb_translate(entry, vaddr);
+			xe.tag = xtag;
+			xe.ppage = vaddr & ~0x3ffU;
 			return true;
 		}
 		else if (flags & ARM7_TLB_ABORT_P)
@@ -1176,8 +1188,17 @@ bool arm7_cpu_device::translate_vaddr_to_paddr(offs_t &vaddr, const int flags)
 	{
 		if (m_tlb_log)
 			LOGMASKED(LOG_MMU, "No TLB entry for %08x yet, running page_table_translate\n", vaddr);
+		// the walk fills the TLB; the next access through here caches it
 		return page_table_translate(vaddr, flags);
 	}
+}
+
+void arm7_cpu_device::xlat_cache_flush()
+{
+	m_dfetch_vbase = ~0U;
+	for (auto &t : m_xlat_cache)
+		for (auto &e : t)
+			e.tag = ~0U;
 }
 
 void arm7_cpu_device::translate_insn_command(const std::vector<std::string_view> &params)
@@ -1247,11 +1268,13 @@ bool arm7_cpu_device::memory_translate(int spacenum, int intention, offs_t &addr
 
 void arm7_cpu_device::postload()
 {
+	xlat_cache_flush();
 	update_reg_ptr();
 }
 
 void arm7_cpu_device::device_start()
 {
+	xlat_cache_flush();
 	init_ce_kernel_addrs();
 
 	m_program = &space(AS_PROGRAM);
@@ -1431,6 +1454,7 @@ void arm7_cpu_device::state_string_export(const device_state_entry &entry, std::
 
 void arm7_cpu_device::device_reset()
 {
+	xlat_cache_flush();
 	const uint32_t old_pc = m_r[eR15];
 	const uint32_t old_cpsr = m_r[eCPSR];
 
@@ -1495,6 +1519,52 @@ void arm7_cpu_device::device_reset()
 }
 
 
+inline bool arm7_cpu_device::translate_fast(offs_t &vaddr, const int flags)
+{
+	if (vaddr >= 0x2000000)
+	{
+		const uint32_t xtag = (vaddr >> 10) | ((GET_CPSR & 0xf) ? 0x80000000U : 0);
+		const xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][(vaddr >> 10) & (XLAT_CACHE_SIZE - 1)];
+		if (xe.tag == xtag)
+		{
+			vaddr = xe.ppage | (vaddr & 0x3ff);
+			return true;
+		}
+	}
+	return translate_vaddr_to_paddr(vaddr, flags);
+}
+
+// direct instruction fetch (no prefetch buffer) through a one-entry cache of
+// the current 1K code page; cores with caches (ARM9) do not depend on the
+// ARM7 prefetch behaviour
+bool arm7_cpu_device::direct_fetch(offs_t vaddr, bool thumb, uint32_t &insn)
+{
+	const uint32_t priv = (GET_CPSR & 0xf) ? 1 : 0;
+	if (((vaddr ^ m_dfetch_vbase) & ~0x3ffU) || priv != m_dfetch_priv)
+	{
+		offs_t phys = vaddr & ~0x3ffU;
+		if ((m_control & COPRO_CTRL_MMU_EN) && !translate_fast(phys, ARM7_TLB_ABORT_P | ARM7_TLB_READ))
+		{
+			m_dfetch_vbase = ~0U;
+			return false;
+		}
+		m_dfetch_vbase = vaddr & ~0x3ffU;
+		m_dfetch_pbase = phys;
+		m_dfetch_priv = priv;
+		uint8_t *const first = fastram_ptr(phys), *const last = fastram_ptr(phys + 0x3ff);
+		m_dfetch_host = (first && last == first + 0x3ff) ? first : nullptr;
+	}
+	const uint32_t off = vaddr & 0x3ff;
+	if (m_dfetch_host)
+	{
+		insn = thumb ? *reinterpret_cast<const uint16_t *>(m_dfetch_host + (off & ~1U)) : *reinterpret_cast<const uint32_t *>(m_dfetch_host + (off & ~3U));
+		return true;
+	}
+	const uint32_t w = insn_fetch_word(m_dfetch_pbase | (off & ~3U));
+	insn = thumb ? uint16_t(w >> ((off & 2) ? m_prefetch_word1_shift : m_prefetch_word0_shift)) : w;
+	return true;
+}
+
 void arm7_cpu_device::update_insn_prefetch(uint32_t curr_pc)
 {
 	curr_pc &= ~3;
@@ -1512,24 +1582,29 @@ void arm7_cpu_device::update_insn_prefetch(uint32_t curr_pc)
 	}
 
 	const uint32_t to_fetch = m_insn_prefetch_depth - m_insn_prefetch_count;
-	const uint32_t start_index = (m_insn_prefetch_depth + (m_insn_prefetch_index - to_fetch)) % m_insn_prefetch_depth;
+	uint32_t start_index = m_insn_prefetch_depth + m_insn_prefetch_index - to_fetch;
+	if (start_index >= m_insn_prefetch_depth)
+		start_index -= m_insn_prefetch_depth;
 	//printf("need to prefetch %d instructions starting at index %d\n", to_fetch, start_index);
 
 	LOGMASKED(LOG_PREFETCH, "Need to fetch %d entries starting from index %d\n", to_fetch, start_index);
 	uint32_t pc = curr_pc + m_insn_prefetch_count * 4;
 	for (uint32_t i = 0; i < to_fetch; i++)
 	{
-		uint32_t index = (i + start_index) % m_insn_prefetch_depth;
+		uint32_t index = i + start_index;
+		if (index >= m_insn_prefetch_depth)
+			index -= m_insn_prefetch_depth;
 		LOGMASKED(LOG_PREFETCH, "About to get prefetch index %d from addr %08x\n", index, pc);
 		m_insn_prefetch_valid[index] = true;
 		offs_t physical_pc = pc;
-		if ((m_control & COPRO_CTRL_MMU_EN) && !translate_vaddr_to_paddr(physical_pc, ARM7_TLB_ABORT_P | ARM7_TLB_READ))
+		if ((m_control & COPRO_CTRL_MMU_EN) && !translate_fast(physical_pc, ARM7_TLB_ABORT_P | ARM7_TLB_READ))
 		{
 			LOGMASKED(LOG_PREFETCH, "Unable to fetch, bailing\n");
 			m_insn_prefetch_valid[index] = false;
 			break;
 		}
-		uint32_t op = insn_fetch_word(physical_pc);
+		const uint8_t *const fp = fastram_ptr(physical_pc);
+		uint32_t op = fp ? *reinterpret_cast<const uint32_t *>(fp) : insn_fetch_word(physical_pc);
 		LOGMASKED(LOG_PREFETCH, "Got op %08x\n", op);
 		//printf("ipb[%d] <- %08x(%08x)\n", index, op, pc);
 		m_insn_prefetch_buffer[index] = op;
@@ -1545,7 +1620,7 @@ bool arm7_cpu_device::insn_fetch_thumb(uint32_t pc, uint32_t &out_insn)
 	{
 		out_insn = (uint16_t)(m_insn_prefetch_buffer[m_insn_prefetch_index] >> m_prefetch_word1_shift);
 		bool valid = m_insn_prefetch_valid[m_insn_prefetch_index];
-		m_insn_prefetch_index = (m_insn_prefetch_index + 1) % m_insn_prefetch_depth;
+		if (++m_insn_prefetch_index == m_insn_prefetch_depth) m_insn_prefetch_index = 0;
 		m_insn_prefetch_count--;
 		return valid;
 	}
@@ -1559,7 +1634,7 @@ bool arm7_cpu_device::insn_fetch_arm(uint32_t pc, uint32_t &out_insn)
 	out_insn = m_insn_prefetch_buffer[m_insn_prefetch_index];
 	bool valid = m_insn_prefetch_valid[m_insn_prefetch_index];
 	LOGMASKED(LOG_PREFETCH, "Fetched op %08x for PC %08x with %s entry from %08x\n", out_insn, pc, valid ? "valid" : "invalid", m_insn_prefetch_address[m_insn_prefetch_index]);
-	m_insn_prefetch_index = (m_insn_prefetch_index + 1) % m_insn_prefetch_depth;
+	if (++m_insn_prefetch_index == m_insn_prefetch_depth) m_insn_prefetch_index = 0;
 	m_insn_prefetch_count--;
 	return valid;
 }
@@ -1776,7 +1851,8 @@ void arm7_cpu_device::execute_run()
 			printf("\n");
 		}
 #endif
-		update_insn_prefetch(pc);
+		if (!m_direct_fetch)
+			update_insn_prefetch(pc);
 
 		m_tlb_log = 0;
 		debugger_instruction_hook(pc);
@@ -1790,7 +1866,7 @@ void arm7_cpu_device::execute_run()
 			// "In Thumb state, bit [0] is undefined and must be ignored. Bits [31:1] contain the PC."
 			offs_t const raddr = pc & ~uint32_t(1);
 
-			if (!insn_fetch_thumb(raddr, insn))
+			if (!(m_direct_fetch ? direct_fetch(raddr, true, insn) : insn_fetch_thumb(raddr, insn)))
 			{
 				prefetch_abort(raddr);
 				m_pendingAbtP = true;
@@ -1806,7 +1882,7 @@ void arm7_cpu_device::execute_run()
 			// "In ARM state, bits [1:0] of r15 are undefined and must be ignored. Bits [31:2] contain the PC."
 			offs_t const raddr = pc & ~uint32_t(3);
 
-			if (!insn_fetch_arm(raddr, insn))
+			if (!(m_direct_fetch ? direct_fetch(raddr, false, insn) : insn_fetch_arm(raddr, insn)))
 			{
 #if PRINT_CE_KERNEL
 				if (raddr >= 0xf0000000)
@@ -2223,6 +2299,7 @@ uint32_t arm7_cpu_device::arm7_rt_r_callback(offs_t offset)
 
 void arm7_cpu_device::arm7_rt_w_callback(offs_t offset, uint32_t data)
 {
+	xlat_cache_flush(); // any CP15 write may change translation or permissions
 	uint32_t opcode = offset;
 	uint8_t cReg = ( opcode & INSN_COPRO_CREG ) >> INSN_COPRO_CREG_SHIFT;
 	uint8_t op2 =  ( opcode & INSN_COPRO_OP2 )  >> INSN_COPRO_OP2_SHIFT;
@@ -2786,13 +2863,14 @@ void arm7_cpu_device::arm7_cpu_write32(offs_t addr, uint32_t data)
 
 	if( COPRO_CTRL & COPRO_CTRL_MMU_EN )
 	{
-		if (!translate_vaddr_to_paddr( addr, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE ))
+		if (!translate_fast( addr, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE ))
 		{
 			return;
 		}
 	}
 
 	addr &= ~3;
+	if (uint8_t *const p = fastram_ptr(addr)) { *reinterpret_cast<uint32_t *>(p) = data; return; }
 	m_program->write_dword(addr, data);
 }
 
@@ -2806,13 +2884,14 @@ void arm7_cpu_device::arm7_cpu_write16(offs_t addr, uint16_t data)
 
 	if( COPRO_CTRL & COPRO_CTRL_MMU_EN )
 	{
-		if (!translate_vaddr_to_paddr( addr, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE ))
+		if (!translate_fast( addr, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE ))
 		{
 			return;
 		}
 	}
 
 	addr &= ~1;
+	if (uint8_t *const p = fastram_ptr(addr)) { *reinterpret_cast<uint16_t *>(p) = data; return; }
 	m_program->write_word(addr, data);
 }
 
@@ -2825,12 +2904,13 @@ void arm7_cpu_device::arm7_cpu_write8(offs_t addr, uint8_t data)
 
 	if( COPRO_CTRL & COPRO_CTRL_MMU_EN )
 	{
-		if (!translate_vaddr_to_paddr( addr, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE ))
+		if (!translate_fast( addr, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE ))
 		{
 			return;
 		}
 	}
 
+	if (uint8_t *const p = fastram_ptr(addr)) { *p = data; return; }
 	m_program->write_byte(addr, data);
 }
 
@@ -2845,12 +2925,14 @@ uint32_t arm7_cpu_device::arm7_cpu_read32(offs_t addr)
 
 	if( COPRO_CTRL & COPRO_CTRL_MMU_EN )
 	{
-		if (!translate_vaddr_to_paddr( addr, ARM7_TLB_ABORT_D | ARM7_TLB_READ ))
+		if (!translate_fast( addr, ARM7_TLB_ABORT_D | ARM7_TLB_READ ))
 		{
 			return 0;
 		}
 	}
 
+	if (uint8_t *const p = fastram_ptr(addr & ~3))
+		return std::rotr(*reinterpret_cast<const uint32_t *>(p), 8 * (addr & 3));
 	if (addr & 3)
 	{
 		result = std::rotr(m_program->read_dword(addr & ~3), 8 * (addr & 3));
@@ -2874,13 +2956,16 @@ uint32_t arm7_cpu_device::arm7_cpu_read16(offs_t addr)
 
 	if( COPRO_CTRL & COPRO_CTRL_MMU_EN )
 	{
-		if (!translate_vaddr_to_paddr( addr, ARM7_TLB_ABORT_D | ARM7_TLB_READ ))
+		if (!translate_fast( addr, ARM7_TLB_ABORT_D | ARM7_TLB_READ ))
 		{
 			return 0;
 		}
 	}
 
-	result = m_program->read_word(addr & ~1);
+	if (uint8_t *const p = fastram_ptr(addr & ~1))
+		result = *reinterpret_cast<const uint16_t *>(p);
+	else
+		result = m_program->read_word(addr & ~1);
 
 	if (addr & 1)
 	{
@@ -2899,12 +2984,14 @@ uint8_t arm7_cpu_device::arm7_cpu_read8(offs_t addr)
 
 	if( COPRO_CTRL & COPRO_CTRL_MMU_EN )
 	{
-		if (!translate_vaddr_to_paddr( addr, ARM7_TLB_ABORT_D | ARM7_TLB_READ ))
+		if (!translate_fast( addr, ARM7_TLB_ABORT_D | ARM7_TLB_READ ))
 		{
 			return 0;
 		}
 	}
 
 	// Handle through normal 8 bit handler (for 32 bit cpu)
+	if (uint8_t *const p = fastram_ptr(addr))
+		return *p;
 	return m_program->read_byte(addr);
 }

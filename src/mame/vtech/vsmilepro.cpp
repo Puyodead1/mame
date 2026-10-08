@@ -307,6 +307,23 @@ private:
 	void cd_latch_subq();
 	void cd_queue_push(u32 data_addr, s32 frame);
 	TIMER_CALLBACK_MEMBER(cd_sector_cb);
+	void prof_dump()
+	{
+		std::vector<std::pair<u32, u32>> v;
+		u64 total = 0;
+		for (auto &e : m_prof) { v.emplace_back(e.second, e.first); total += e.second; }
+		std::sort(v.rbegin(), v.rend());
+		for (int i = 0; i < std::min<int>(v.size(), 30); i++)
+			printf("PROF %08x %5.1f%%\n", v[i].second, 100.0 * v[i].first / std::max<u64>(total, 1));
+		const double secs = std::max(machine().time().as_double() - m_prof_start, 0.001);
+		for (int i = 0; i < 32; i++)
+			if (m_prof_irq[i])
+				printf("IRQ %2d serviced %u (%.0f/s)\n", i, m_prof_irq[i], m_prof_irq[i] / secs);
+	}
+	bool m_prof_on = false;
+	double m_prof_start = 0;
+	std::map<u32, u32> m_prof;
+	u32 m_prof_irq[32] = { };
 
 	// DSP memory window
 	std::unique_ptr<u16[]> m_dsp_mem;
@@ -358,7 +375,15 @@ u32 vsmilpro_state::intc_r(offs_t offset)
 		const u32 p = m_int_pending & m_int_enable[BIT(offset, 6)];
 		for (int i = 0; i < 32; i++)
 			if (BIT(p, i))
+			{
+				if (m_prof_on && !machine().side_effects_disabled())
+				{
+					if (!m_prof_start)
+						m_prof_start = machine().time().as_double();
+					m_prof_irq[i]++;
+				}
 				return i;
+			}
 		return 0;
 	}
 
@@ -801,6 +826,14 @@ void vsmilpro_state::joy_build_report(int port, u8 *raw)
 
 TIMER_CALLBACK_MEMBER(vsmilpro_state::joy_cb)
 {
+	if (m_prof_on)
+	{
+		// detuned from the 100 Hz tick so samples are not aligned with its IRQ
+		if (m_joy_timer->period() != attotime::from_hz(97))
+			m_joy_timer->adjust(attotime::from_hz(97), 0, attotime::from_hz(97));
+		const u32 pc = m_maincpu->pc();
+		m_prof[pc < 0x1000 ? pc : (pc & ~0x3f)]++;
+	}
 	for (int port = 0; port < 2; port++)
 	{
 		joy_t &j = m_joy[port];
@@ -1826,6 +1859,18 @@ void vsmilpro_state::machine_start()
 	// Speedup: the boot ROM's idle task (0x1001098C) is an endless counting
 	// loop whose counter lives at 0x101E05E4; sleep until the next interrupt
 	// TODO: equivalent for FA's idle task
+	// the ARM926 has caches, so the ARM7 prefetch buffer model is not needed
+	m_maincpu->set_direct_fetch(true);
+
+	// direct SDRAM access for the CPU core, except the boot ROM idle counter
+	// (watched by the tap below); off with the debugger so watchpoints work
+	if (!(machine().debug_flags & DEBUG_FLAG_ENABLED))
+	{
+		u8 *const sdram = reinterpret_cast<u8 *>(m_sdram.target());
+		m_maincpu->add_fastram(0x10000000, 0x101e05e3, sdram);
+		m_maincpu->add_fastram(0x101e05e8, 0x10ffffff, sdram + 0x1e05e8);
+	}
+
 	m_maincpu->space(AS_PROGRAM).install_write_tap(0x101e05e4, 0x101e05e7, "idle_tap",
 			[this] (offs_t offset, u32 &data, u32 mem_mask)
 			{
@@ -1833,6 +1878,12 @@ void vsmilpro_state::machine_start()
 				if (pc >= 0x10010990 && pc <= 0x100109cc && ram_r32(0x100109a0) == 0xe58d3000)
 					m_maincpu->spin_until_interrupt();
 			});
+
+	// debug: ZPROF=1 samples the CPU PC at 100 Hz (in joy_cb) and prints a
+	// histogram (64-byte buckets) at exit
+	m_prof_on = getenv("ZPROF") != nullptr;
+	if (m_prof_on)
+		machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&vsmilpro_state::prof_dump, this));
 
 	save_item(NAME(m_int_raw));
 	save_item(NAME(m_int_pending));
