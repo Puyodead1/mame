@@ -1163,7 +1163,19 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		const int x0 = a & 0x7ff, y0 = (a >> 16) & 0x7ff, x1 = b & 0x7ff, y1 = (b >> 16) & 0x7ff;
 		const int w = x1 - x0 + 1;
 		const u32 yb = m_disp_regs[0x164 / 4], ub = m_disp_regs[0x168 / 4], vb = m_disp_regs[0x16c / 4];
-		if (w > 2 && in_sdram(yb) && in_sdram(ub) && in_sdram(vb))
+		if (BIT(enable, 14))
+		{
+			// +0x100 bit 14: linear BGR555 instead of YCbCr (the boot ROM's
+			// V.Flash splash while a disc starts)
+			if (w > 0 && in_sdram(yb))
+				for (int y = std::max(y0, cliprect.top()); y <= std::min(y1, cliprect.bottom()); y++)
+				{
+					u32 *dst = &bitmap.pix(y);
+					for (int x = std::max(x0, cliprect.left()); x <= std::min(x1, cliprect.right()); x++)
+						dst[x] = bgr555(ram_r16(yb + ((y - y0) * w + (x - x0)) * 2));
+				}
+		}
+		else if (w > 2 && in_sdram(yb) && in_sdram(ub) && in_sdram(vb))
 			for (int y = std::max(y0, cliprect.top()); y <= std::min(y1, cliprect.bottom()); y++)
 			{
 				u32 *dst = &bitmap.pix(y);
