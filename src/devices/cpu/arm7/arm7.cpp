@@ -2102,7 +2102,8 @@ void arm7_cpu_device::execute_run()
 
 skip_exec:
 
-		arm7_check_irq_state();
+		if (m_pending_interrupt)
+			arm7_check_irq_state();
 
 		/* All instructions remove 3 cycles.. Others taking less / more will have adjusted this # prior to here */
 		m_icount -= 3;
