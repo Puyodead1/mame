@@ -322,6 +322,7 @@ private:
 				printf("IRQ %2d serviced %u (%.0f/s)\n", i, m_prof_irq[i], m_prof_irq[i] / secs);
 	}
 	bool m_prof_on = false;
+	int m_irq_line = -1, m_fiq_line = -1; // last state given to the CPU (-1: none yet)
 	double m_prof_start = 0;
 	std::map<u32, u32> m_prof;
 	u32 m_prof_irq[32] = { };
@@ -359,8 +360,13 @@ void vsmilpro_state::set_irq(int source, int state)
 
 void vsmilpro_state::update_cpu_irqs()
 {
-	m_maincpu->set_input_line(arm7_cpu_device::ARM7_IRQ_LINE, (m_int_pending & m_int_enable[0]) ? ASSERT_LINE : CLEAR_LINE);
-	m_maincpu->set_input_line(arm7_cpu_device::ARM7_FIRQ_LINE, (m_int_pending & m_int_enable[1]) ? ASSERT_LINE : CLEAR_LINE);
+	// only touch the lines when they change: each set_input_line synchronizes
+	const int irq = (m_int_pending & m_int_enable[0]) ? ASSERT_LINE : CLEAR_LINE;
+	const int fiq = (m_int_pending & m_int_enable[1]) ? ASSERT_LINE : CLEAR_LINE;
+	if (irq != m_irq_line)
+		m_maincpu->set_input_line(arm7_cpu_device::ARM7_IRQ_LINE, m_irq_line = irq);
+	if (fiq != m_fiq_line)
+		m_maincpu->set_input_line(arm7_cpu_device::ARM7_FIRQ_LINE, m_fiq_line = fiq);
 }
 
 u32 vsmilpro_state::intc_r(offs_t offset)
@@ -1893,8 +1899,8 @@ void vsmilpro_state::machine_start()
 	if (!(machine().debug_flags & DEBUG_FLAG_ENABLED))
 	{
 		u8 *const sdram = reinterpret_cast<u8 *>(m_sdram.target());
+		m_maincpu->add_fastram(0x101e05e8, 0x10ffffff, sdram + 0x1e05e8); // FA code, data and stacks: check first
 		m_maincpu->add_fastram(0x10000000, 0x101e05e3, sdram);
-		m_maincpu->add_fastram(0x101e05e8, 0x10ffffff, sdram + 0x1e05e8);
 	}
 
 	m_maincpu->space(AS_PROGRAM).install_write_tap(0x101e05e4, 0x101e05e7, "idle_tap",
@@ -1911,6 +1917,7 @@ void vsmilpro_state::machine_start()
 	if (m_prof_on)
 		machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&vsmilpro_state::prof_dump, this));
 
+	machine().save().register_postload(save_prepost_delegate(NAME([this] () { m_irq_line = m_fiq_line = -1; update_cpu_irqs(); })));
 	save_item(NAME(m_int_raw));
 	save_item(NAME(m_int_pending));
 	save_item(NAME(m_int_latched));
@@ -1944,6 +1951,7 @@ void vsmilpro_state::machine_start()
 
 void vsmilpro_state::machine_reset()
 {
+	m_irq_line = m_fiq_line = -1;
 	m_int_raw = m_int_pending = m_int_latched = 0;
 	m_int_enable[0] = m_int_enable[1] = 0;
 	std::fill(std::begin(m_int_regs), std::end(m_int_regs), 0);
