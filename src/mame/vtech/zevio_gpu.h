@@ -45,8 +45,23 @@ private:
 	u8 rd8(u32 addr) const { return rd32(addr & ~3) >> ((addr & 3) * 8); }
 	void wr32(u32 addr, u32 data);
 	void wr16(u32 addr, u16 data);
-	u32 vram_addr(int x, int y) const;
-	u16 vram_r(int x, int y) const { return rd16(vram_addr(x, y)); }
+	// GPU coordinates are absolute in the tiled surface whose origin is 0x0FFD0000
+	static u32 vram_addr(int x, int y)
+	{
+		const u32 xb = (x & 1023) * 2;
+		return 0x0ffd0000 + (y >> 3) * 16384 + (xb >> 6) * 512 + (y & 7) * 64 + (xb & 63);
+	}
+	u16 vram_r(int x, int y) const
+	{
+		const u32 off = vram_addr(x, y) - m_ram_base;
+		if (off >= m_ram_size)
+			return 0;
+#ifdef LSB_FIRST
+		return reinterpret_cast<const u16 *>(m_ram)[off >> 1];
+#else
+		return m_ram[off >> 2] >> (BIT(off, 1) * 16);
+#endif
+	}
 	void vram_w(int x, int y, u16 data);
 
 	void run_list(u32 addr);
@@ -71,6 +86,8 @@ private:
 	// pixels
 	bool texel(float u, float v, bool normalized, float &r, float &g, float &b, float &a) const;
 	bool texel_point(int tu, int tv, float &r, float &g, float &b, float &a) const;
+	int texel_raw(int tu, int tv) const;
+	void load_palette(int which, int n) const;
 	void plot(int x, int y, float z, float r, float g, float b, float a, bool depth);
 	bool in_clip(int x, int y) const;
 
@@ -89,6 +106,8 @@ private:
 	u32 m_w1c, m_w1e, m_w84, m_w88, m_w81, m_w85, m_w86, m_w87, m_w8d;
 	u32 m_clip0, m_clip1;
 	u32 m_clut[6];         // 0x8F-0x94
+	mutable u16 m_pal[256];      // CLUT entries for the current texture
+	mutable int m_pal_valid = -1; // which CLUT m_pal holds (0 or 3), -1 none
 	u32 m_vtxbase, m_xfer;
 
 	std::unique_ptr<float[]> m_zbuf; // 1024 x 1024, GPU coordinates

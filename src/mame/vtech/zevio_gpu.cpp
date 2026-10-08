@@ -192,11 +192,6 @@ void zevio_gpu_device::wr16(u32 addr, u16 data)
 // not an origin; FA points it at the only 512x240 area that is not a display
 // buffer (with +0x90/+0x94 = 240 << 16 | 512), so it is probably the depth
 // buffer. TODO: confirm, and whether rows 0-95 (below SDRAM) are memory.
-u32 zevio_gpu_device::vram_addr(int x, int y) const
-{
-	const u32 xb = (x & 1023) * 2;
-	return 0x0ffd0000 + (y >> 3) * 16384 + (xb >> 6) * 512 + (y & 7) * 64 + (xb & 63);
-}
 
 
 void zevio_gpu_device::vram_w(int x, int y, u16 data)
@@ -223,6 +218,12 @@ u32 zevio_gpu_device::regs_r(offs_t offset)
 
 void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 {
+	static int irqlog = getenv("ZGPU_IRQLOG") ? 400 : 0;
+	if (irqlog && offset <= 0x30 / 4)
+	{
+		irqlog--;
+		logerror("%s: gpu w %02x = %08x (14 %08x 10 %08x)\n", machine().describe_context(), offset * 4, data, m_regs[0x14 / 4], m_regs[0x10 / 4]);
+	}
 	switch (offset)
 	{
 	case 0x00 / 4:
@@ -317,14 +318,25 @@ bool zevio_gpu_device::texel(float u, float v, bool normalized, float &r, float 
 	return true;
 }
 
-bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b, float &a) const
+// cache a CLUT; invalidated at the start of every primitive and when the
+// texture or CLUT registers change
+void zevio_gpu_device::load_palette(int which, int n) const
+{
+	const int px = m_clut[which] & 0xfff, py = (m_clut[which] >> 12) & 0xfff;
+	for (int i = 0; i < n; i++)
+		m_pal[i] = vram_r(px + i, py);
+	m_pal_valid = which;
+}
+
+// raw texel after the CLUT: -1 if transparent (palette index 0; for
+// non-ARGB4444 textures also 0x0000 and bit 15 set: Bratz panel backgrounds
+// are 0x0000, Cars uses 0x8000 billboards, 0xFC1F text boxes, 0xFFFF icons)
+int zevio_gpu_device::texel_raw(int tu, int tv) const
 {
 	const u32 mode = m_w86;
-	const int w = 8 << (mode & 7), h = 8 << ((mode >> 3) & 7);
-	tu &= w - 1;
-	tv &= h - 1;
+	tu &= (8 << (mode & 7)) - 1;
+	tv &= (8 << ((mode >> 3) & 7)) - 1;
 	const int x0 = m_w87 & 0xfff, y0 = (m_w87 >> 12) & 0xfff;
-	const bool argb4444 = BIT(mode, 8);
 	u16 c;
 	switch ((mode >> 9) & 3)
 	{
@@ -333,24 +345,39 @@ bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b,
 		break;
 	case 1:
 	{
-		const u16 hw = vram_r(x0 + tu / 2, y0 + tv);
+		const u16 hw = vram_r(x0 + (tu >> 1), y0 + tv);
 		const u8 idx = BIT(tu, 0) ? (hw >> 8) : (hw & 0xff);
 		if (!idx)
-			return false; // palette index 0 is transparent
-		c = vram_r((m_clut[0] & 0xfff) + idx, (m_clut[0] >> 12) & 0xfff);
+			return -1;
+		if (m_pal_valid != 0)
+			load_palette(0, 256);
+		c = m_pal[idx];
 		break;
 	}
 	default:
 	{
-		const u16 hw = vram_r(x0 + tu / 4, y0 + tv);
+		const u16 hw = vram_r(x0 + (tu >> 2), y0 + tv);
 		const u8 idx = (hw >> ((tu & 3) * 4)) & 0x0f;
 		if (!idx)
-			return false;
-		c = vram_r((m_clut[3] & 0xfff) + idx, (m_clut[3] >> 12) & 0xfff);
+			return -1;
+		if (m_pal_valid != 3)
+			load_palette(3, 16);
+		c = m_pal[idx];
 		break;
 	}
 	}
-	if (argb4444)
+	if (!BIT(mode, 8) && (c == 0 || BIT(c, 15)))
+		return -1;
+	return c;
+}
+
+bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b, float &a) const
+{
+	const int t = texel_raw(tu, tv);
+	if (t < 0)
+		return false;
+	const u16 c = t;
+	if (BIT(m_w86, 8)) // ARGB4444
 	{
 		r = (c & 15) / 15.0f;
 		g = ((c >> 4) & 15) / 15.0f;
@@ -358,10 +385,6 @@ bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b,
 		a = ((c >> 12) & 15) / 15.0f;
 		return a > 0.0f;
 	}
-	// 0x0000 and bit 15 set are transparent (Bratz: 0x0000 panel backgrounds;
-	// Cars: 0x8000 billboards, 0xFC1F menu text boxes, 0xFFFF icon backgrounds)
-	if (c == 0 || BIT(c, 15))
-		return false;
 	bgr555_to_f(c, r, g, b);
 	a = 1.0f;
 	return true;
@@ -603,6 +626,7 @@ void zevio_gpu_device::draw_line(const vertex_t &a, const vertex_t &b)
 
 void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 {
+	m_pal_valid = -1; // the CLUT may have been rewritten since
 	static const bool no3d = getenv("ZGPU_NO_3D") != nullptr;
 	m_no3d = no3d;
 	// debug: ZGPU_ONLY=<hex upper half> draws only primitives with that header
@@ -780,6 +804,7 @@ void zevio_gpu_device::transform_to_memory(u32 header, u32 &addr)
 
 void zevio_gpu_device::prim2d(u32 header, u32 &addr)
 {
+	m_pal_valid = -1; // the CLUT may have been rewritten since
 	const u8 op = header >> 24, flags = (header >> 16) & 0xff;
 	const int count = header & 0xff;
 	const int wpv = 2 + (BIT(flags, 0) ? 1 + (BIT(flags, 2) ? 1 : 0) : 1) + (BIT(flags, 3) ? 1 : 0);
@@ -876,6 +901,7 @@ void zevio_gpu_device::prim2d(u32 header, u32 &addr)
 
 void zevio_gpu_device::sprite(u32 header, u32 &addr)
 {
+	m_pal_valid = -1; // the CLUT may have been rewritten since
 	const u8 flags = (header >> 16) & 0xff;
 	const int count = header & 0xff;
 	const u32 xy = rd32(addr + 4), wh = rd32(addr + 8);
@@ -901,6 +927,40 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 		if (BIT(flags, 0))
 			log_texture();
 	}
+
+	// fast path: opaque (no 0x88 blend), non-ARGB4444 texels, integer colour
+	// modulation, clipped once per sprite
+	static const bool nofast = getenv("ZGPU_NOFAST") != nullptr;
+	if (!nofast && !BIT(m_w88, 1) && !BIT(m_w86, 8))
+	{
+		const int cx0 = std::max({ int(m_clip0 & 0xfff), x0, 0 });
+		const int cy0 = std::max({ int((m_clip0 >> 12) & 0xfff), y0, 0 });
+		const int cx1 = std::min({ int(m_clip1 & 0xfff), x0 + w - 1, 1023 });
+		const int cy1 = std::min({ int((m_clip1 >> 12) & 0xfff), y0 + h - 1 });
+		const int mr = (col & 0xff) + 1, mg = ((col >> 8) & 0xff) + 1, mb = ((col >> 16) & 0xff) + 1;
+		const bool modulate = (col & 0xffffff) != 0xffffff;
+		const u16 flat = 0x8000 | (((col >> 19) & 0x1f) << 10) | (((col >> 11) & 0x1f) << 5) | ((col >> 3) & 0x1f);
+		for (int y = cy0; y <= cy1; y++)
+			for (int x = cx0; x <= cx1; x++)
+			{
+				u16 c;
+				if (BIT(flags, 0))
+				{
+					const int t = texel_raw(int(uv & 0xffff) + (x - x0), int(uv >> 16) + (y - y0));
+					if (t < 0)
+						continue;
+					c = t;
+					if (modulate)
+						c = (((((c >> 10) & 0x1f) * mb) >> 8) << 10) | (((((c >> 5) & 0x1f) * mg) >> 8) << 5) | (((c & 0x1f) * mr) >> 8);
+					c |= 0x8000;
+				}
+				else
+					c = flat;
+				vram_w(x, y, c);
+			}
+		return;
+	}
+
 	for (int j = 0; j < h; j++)
 		for (int i = 0; i < w; i++)
 		{
@@ -998,6 +1058,7 @@ void zevio_gpu_device::run_list(u32 addr)
 		case 0x8d: m_w8d = cmd & 0xffffff; break;
 		case 0x8f: case 0x90: case 0x91: case 0x92: case 0x93: case 0x94:
 			m_clut[op - 0x8f] = cmd & 0xffffff;
+			m_pal_valid = -1;
 			break;
 		case 0x40: case 0x44: case 0x48: case 0x4c: case 0x50:
 			prim3d(cmd, addr);
