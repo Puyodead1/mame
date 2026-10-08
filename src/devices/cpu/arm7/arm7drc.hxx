@@ -224,36 +224,15 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 		// Execution continues after the tail.
 		auto tail = [&] (int cost, offs_t nextpc)
 		{
-			const code_label irq = nextlabel++, ooc = nextlabel++, resume = nextlabel++;
+			const code_label ooc = nextlabel++;
 			load(I0, &m_icount);
 			UML_SUB(block, I0, I0, cost);
 			store(&m_icount, I0);
 			UML_CMP(block, I0, 0);
 			UML_JMPc(block, uml::COND_LE, ooc);
-			UML_LABEL(block, resume);
 
-			stubs.emplace_back([&, irq, ooc, resume, cost, nextpc] ()
+			stubs.emplace_back([&, ooc, nextpc] ()
 			{
-				const code_label dyn = nextlabel++;
-				UML_LABEL(block, irq);
-				UML_MOV(block, I0, nextpc);
-				store(&m_r[eR15], I0);
-				UML_CALLC(block, &arm7_cpu_device::drc_check_irq, this);
-				load(I0, &m_icount);
-				UML_SUB(block, I0, I0, cost);
-				store(&m_icount, I0);
-				UML_CMP(block, I0, 0);
-				UML_CALLHc(block, uml::COND_LE, *m_drc_out_of_cycles);
-				load(I1, &m_r[eR15]);
-				UML_CMP(block, I1, nextpc);
-				UML_JMPc(block, uml::COND_NE, dyn);
-				load(I0, &m_r[eCPSR]);
-				UML_AND(block, I0, I0, 0x2f);
-				UML_CMP(block, I0, mode);
-				UML_JMPc(block, uml::COND_E, resume);
-				UML_LABEL(block, dyn);
-				dynamic_dispatch();
-
 				UML_LABEL(block, ooc);
 				UML_MOV(block, I0, nextpc);
 				store(&m_r[eR15], I0);
