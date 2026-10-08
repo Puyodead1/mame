@@ -1653,6 +1653,44 @@ void arm7_cpu_device::add_ce_kernel_addr(offs_t addr, std::string value)
 
 #include "cecalls.hxx"
 
+namespace {
+struct arm_cond_table
+{
+	uint16_t v[16];
+	constexpr arm_cond_table() : v()
+	{
+		for (int c = 0; c < 16; c++)
+			for (int f = 0; f < 16; f++)
+			{
+				const bool n = f & 8, z = f & 4, cy = f & 2, ov = f & 1;
+				bool ok;
+				switch (c)
+				{
+				case 0: ok = z; break;              // EQ
+				case 1: ok = !z; break;             // NE
+				case 2: ok = cy; break;             // CS
+				case 3: ok = !cy; break;            // CC
+				case 4: ok = n; break;              // MI
+				case 5: ok = !n; break;             // PL
+				case 6: ok = ov; break;             // VS
+				case 7: ok = !ov; break;            // VC
+				case 8: ok = cy && !z; break;       // HI
+				case 9: ok = !cy || z; break;       // LS
+				case 10: ok = n == ov; break;       // GE
+				case 11: ok = n != ov; break;       // LT
+				case 12: ok = !z && n == ov; break; // GT
+				case 13: ok = z || n != ov; break;  // LE
+				default: ok = true; break;          // AL (NV handled separately)
+				}
+				if (ok)
+					v[c] |= 1 << f;
+			}
+	}
+};
+constexpr arm_cond_table s_cond = arm_cond_table();
+}
+#define s_cond_table s_cond.v
+
 void arm7_cpu_device::execute_run()
 {
 	auto const UNEXECUTED = [this] { m_r[eR15] += 4; m_icount += 2; }; // Any unexecuted instruction only takes 1 cycle (page 193)
@@ -1910,71 +1948,15 @@ void arm7_cpu_device::execute_run()
 			/* process condition codes for this instruction */
 			if ((insn >> INSN_COND_SHIFT) != COND_AL)
 			{
-				switch (insn >> INSN_COND_SHIFT)
+				const uint32_t cond = insn >> INSN_COND_SHIFT;
+				if (cond == COND_NV)
 				{
-					case COND_EQ:
-						if (Z_IS_CLEAR(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_NE:
-						if (Z_IS_SET(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_CS:
-						if (C_IS_CLEAR(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_CC:
-						if (C_IS_SET(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_MI:
-						if (N_IS_CLEAR(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_PL:
-						if (N_IS_SET(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_VS:
-						if (V_IS_CLEAR(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_VC:
-						if (V_IS_SET(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_HI:
-						if (C_IS_CLEAR(m_r[eCPSR]) || Z_IS_SET(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_LS:
-						if (C_IS_SET(m_r[eCPSR]) && Z_IS_CLEAR(m_r[eCPSR]))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_GE:
-						if (!(m_r[eCPSR] & N_MASK) != !(m_r[eCPSR] & V_MASK)) /* Use x ^ (x >> ...) method */
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_LT:
-						if (!(m_r[eCPSR] & N_MASK) == !(m_r[eCPSR] & V_MASK))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_GT:
-						if (Z_IS_SET(m_r[eCPSR]) || (!(m_r[eCPSR] & N_MASK) != !(m_r[eCPSR] & V_MASK)))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_LE:
-						if (Z_IS_CLEAR(m_r[eCPSR]) && (!(m_r[eCPSR] & N_MASK) == !(m_r[eCPSR] & V_MASK)))
-							{ UNEXECUTED();  goto skip_exec; }
-						break;
-					case COND_NV:
-						if (m_archRev < 5)
-						  { UNEXECUTED();  goto skip_exec; }
-						else
-							op_offset = 0x10;
-						break;
+					if (m_archRev < 5)
+						{ UNEXECUTED();  goto skip_exec; }
+					op_offset = 0x10;
 				}
+				else if (!BIT(s_cond_table[cond], GET_CPSR >> 28))
+					{ UNEXECUTED();  goto skip_exec; }
 			}
 			/*******************************************************************/
 			/* If we got here - condition satisfied, so decode the instruction */
@@ -2030,6 +2012,62 @@ void arm7_cpu_device::execute_run()
 					}
 					HandleALU(insn);
 					goto skip_exec;
+				}
+				// push / pop on fast RAM within one 1K page: STMDB Rb{!}, {list
+				// without PC} and LDMIA Rb{!}, {list} (S clear, Rb not PC and, for
+				// loads, not in the list); exactly as HandleMemBlock does them
+				if (cls == 0x08000000 && m_fast_mem && (insn & 0xffff) && !(insn & INSN_BDT_S) && ((insn >> 16) & 15) != 15)
+				{
+					const uint32_t rb = (insn >> 16) & 15, list = insn & 0xffff;
+					const uint32_t n = std::popcount(list);
+					if ((insn & 0x01900000) == 0x01000000 && !(list & 0x8000)) // STMDB
+					{
+						const uint32_t start = GetRegister(rb) - n * 4;
+						offs_t pa = start;
+						if (((start ^ (start + n * 4 - 1)) & ~0x3ffU) == 0 && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_WRITE))
+						{
+							if (uint8_t *p = fastram_ptr(pa & ~3))
+							{
+								for (int i = 0; i < 16; i++)
+									if (BIT(list, i))
+									{
+										*reinterpret_cast<uint32_t *>(p) = GetRegister(i);
+										p += 4;
+									}
+								if (insn & INSN_BDT_W)
+									SetRegister(rb, GetRegister(rb) - n * 4);
+								ARM7_ICOUNT += 2 - int(n); // (n-1)S + 2N, then the -3 below
+								R15 += 4;
+								goto skip_exec;
+							}
+						}
+					}
+					else if ((insn & 0x01900000) == 0x00900000 && !BIT(list, rb)) // LDMIA
+					{
+						const uint32_t start = GetRegister(rb) & ~3;
+						offs_t pa = start;
+						if (((start ^ (start + n * 4 - 1)) & ~0x3ffU) == 0 && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
+						{
+							const uint8_t *p = fastram_ptr(pa);
+							// a loaded PC with bit 0 set switches to Thumb: leave that to the handler
+							if (p && !((list & 0x8000) && (reinterpret_cast<const uint32_t *>(p)[n - 1] & 1)))
+							{
+								for (int i = 0; i < 16; i++)
+									if (BIT(list, i))
+									{
+										SetRegister(i, *reinterpret_cast<const uint32_t *>(p));
+										p += 4;
+									}
+								if (insn & INSN_BDT_W)
+									SetRegister(rb, GetRegister(rb) + n * 4);
+								// LDM: nS + 1N + 1I, PC loads 2 more
+								ARM7_ICOUNT += 1 - int(n) - ((list & 0x8000) ? 2 : 0);
+								if (!(list & 0x8000))
+									R15 += 4;
+								goto skip_exec;
+							}
+						}
+					}
 				}
 				// B / BL
 				if (cls == 0x0a000000 && !(m_archFlags & ARCHFLAG_MODE26))
