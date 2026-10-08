@@ -1658,6 +1658,7 @@ void arm7_cpu_device::execute_run()
 	auto const UNEXECUTED = [this] { m_r[eR15] += 4; m_icount += 2; }; // Any unexecuted instruction only takes 1 cycle (page 193)
 
 	m_tlb_log = m_actual_log;
+	const bool debugging = machine().debug_flags & DEBUG_FLAG_ENABLED;
 
 	uint32_t insn;
 
@@ -1860,9 +1861,12 @@ void arm7_cpu_device::execute_run()
 		if (!m_direct_fetch)
 			update_insn_prefetch(pc);
 
-		m_tlb_log = 0;
-		debugger_instruction_hook(pc);
-		m_tlb_log = m_actual_log;
+		if (debugging)
+		{
+			m_tlb_log = 0;
+			debugger_instruction_hook(pc);
+			m_tlb_log = m_actual_log;
+		}
 
 		/* handle Thumb instructions if active */
 		if (T_IS_SET(m_r[eCPSR]))
@@ -1984,8 +1988,66 @@ void arm7_cpu_device::execute_run()
 				const uint32_t cls = insn & 0x0e000000;
 				if ((cls == 0x02000000 || (cls == 0 && !(insn & 0x10))) && (insn & 0x01900000) != 0x01000000)
 				{
+					// immediate operand, Rd and Rn not PC: HandleALU without the
+					// operand decode and R15 cases
+					const uint32_t rdn = (insn >> 12) & 15, rnn = (insn >> 16) & 15;
+					if (cls == 0x02000000 && rdn != 15 && rnn != 15)
+					{
+						const uint32_t by = (insn >> 8) & 15;
+						const uint32_t op2 = std::rotr<uint32_t>(insn & 0xff, by << 1);
+						const uint32_t sc = by ? (op2 & SIGN_BIT) : (GET_CPSR & C_MASK);
+						const uint32_t rn = GetRegister(rnn);
+						uint32_t rd;
+						switch ((insn >> 21) & 15)
+						{
+						case OPCODE_AND: case OPCODE_TST: rd = rn & op2; HandleALULogicalFlags(rd, sc); break;
+						case OPCODE_EOR: case OPCODE_TEQ: rd = rn ^ op2; HandleALULogicalFlags(rd, sc); break;
+						case OPCODE_SUB: case OPCODE_CMP: rd = rn - op2; HandleALUSubFlags(rd, rn, op2); break;
+						case OPCODE_RSB: rd = op2 - rn; HandleALUSubFlags(rd, op2, rn); break;
+						case OPCODE_ADD: case OPCODE_CMN: rd = rn + op2; HandleALUAddFlags(rd, rn, op2); break;
+						case OPCODE_ADC: rd = rn + op2 + ((GET_CPSR & C_MASK) >> C_BIT); HandleALUAddFlags(rd, rn, op2); break;
+						case OPCODE_SBC: rd = rn - op2 - (GET_CPSR & C_MASK ? 0 : 1); HandleALUSubFlags(rd, rn, op2); break;
+						case OPCODE_RSC: rd = op2 - rn - (GET_CPSR & C_MASK ? 0 : 1); HandleALUSubFlags(rd, op2, rn); break;
+						case OPCODE_ORR: rd = rn | op2; HandleALULogicalFlags(rd, sc); break;
+						case OPCODE_MOV: rd = op2; HandleALULogicalFlags(rd, sc); break;
+						case OPCODE_BIC: rd = rn & ~op2; HandleALULogicalFlags(rd, sc); break;
+						default: /* MVN */ rd = ~op2; HandleALULogicalFlags(rd, sc); break;
+						}
+						if ((insn & 0x01800000) != 0x01000000) // not TST/TEQ/CMP/CMN
+							SetRegister(rdn, rd);
+						ARM7_ICOUNT += 2;
+						goto skip_exec;
+					}
 					HandleALU(insn);
 					goto skip_exec;
+				}
+				// LDR/STR(B) Rd, [Rn, #+-imm] (no write-back, Rd != PC) on fast RAM
+				if ((insn & 0x0f200000) == 0x05000000 && (insn & 0xf000) != 0xf000 && m_fast_mem)
+				{
+					const uint32_t rn = (insn >> 16) & 15;
+					const uint32_t base = (rn == 15) ? R15 + 8 : GetRegister(rn);
+					const uint32_t addr = (insn & INSN_SDT_U) ? base + (insn & 0xfff) : base - (insn & 0xfff);
+					offs_t pa = addr;
+					const bool load = insn & INSN_SDT_L, byte = insn & INSN_SDT_B;
+					if (xlat_hit(pa, load ? (ARM7_TLB_ABORT_D | ARM7_TLB_READ) : (ARM7_TLB_ABORT_D | ARM7_TLB_WRITE)))
+					{
+						if (uint8_t *const p = fastram_ptr(byte ? pa : (pa & ~3)))
+						{
+							const uint32_t rd = (insn >> 12) & 15;
+							if (load)
+								SetRegister(rd, byte ? *p : std::rotr(*reinterpret_cast<const uint32_t *>(p), 8 * (addr & 3)));
+							else
+							{
+								if (byte)
+									*p = uint8_t(GetRegister(rd));
+								else
+									*reinterpret_cast<uint32_t *>(p) = GetRegister(rd);
+								ARM7_ICOUNT += 1; // stores take 2N
+							}
+							R15 += 4;
+							goto skip_exec;
+						}
+					}
 				}
 				if (cls == 0x04000000 || (cls == 0x06000000 && !(insn & 0x10)))
 				{
