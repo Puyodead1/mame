@@ -65,7 +65,7 @@
 #define LOG_SYS     (1U << 10)
 #define LOG_DEBUGTX (1U << 11)
 
-#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_CD)
+#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_DMA)
 #include "logmacro.h"
 
 #include <deque>
@@ -282,6 +282,10 @@ private:
 	// DMA
 	u32 m_bcdma_regs[0x200 / 4];
 	u32 m_dcdma_regs[0x200 / 4];
+	u32 m_bcdma_busy;
+	emu_timer *m_bcdma_timer[8];
+	void bcdma_update_irq();
+	TIMER_CALLBACK_MEMBER(bcdma_done_cb);
 	u32 bcdma_r(offs_t offset);
 	void bcdma_w(offs_t offset, u32 data, u32 mem_mask);
 	u32 dcdma_r(offs_t offset);
@@ -1409,8 +1413,20 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 u32 vsmilpro_state::bcdma_r(offs_t offset)
 {
 	if (offset == 0x0c / 4)
-		return 0; // nothing busy
+		return m_bcdma_busy;
 	return m_bcdma_regs[offset];
+}
+
+void vsmilpro_state::bcdma_update_irq()
+{
+	set_irq(IRQ_BCDMA, (m_bcdma_regs[0x1c / 4] & m_bcdma_regs[0x18 / 4] & 0xff) != 0);
+}
+
+TIMER_CALLBACK_MEMBER(vsmilpro_state::bcdma_done_cb)
+{
+	m_bcdma_busy &= ~(1 << param);
+	m_bcdma_regs[0x1c / 4] |= 1 << param;
+	bcdma_update_irq();
 }
 
 void vsmilpro_state::bcdma_w(offs_t offset, u32 data, u32 mem_mask)
@@ -1418,7 +1434,7 @@ void vsmilpro_state::bcdma_w(offs_t offset, u32 data, u32 mem_mask)
 	if (offset == 0x1c / 4)
 	{
 		m_bcdma_regs[offset] &= ~data;
-		set_irq(IRQ_BCDMA, (m_bcdma_regs[0x1c / 4] & 0xff) != 0);
+		bcdma_update_irq();
 		return;
 	}
 	COMBINE_DATA(&m_bcdma_regs[offset]);
@@ -1439,9 +1455,11 @@ void vsmilpro_state::bcdma_w(offs_t offset, u32 data, u32 mem_mask)
 			LOGMASKED(LOG_DMA, "bcdma ch%d %08x -> %08x count %d x %d (cfg %08x)\n", ch, src, dst, count, bytes_per, cfg);
 			for (u32 i = 0; i < count * bytes_per; i++)
 				ram_w8(dst + i, ram_r8(src + i));
-			m_bcdma_regs[0x1c / 4] |= 1 << ch;
+			// the data moves at once; completion is signalled after a short
+			// delay (~4 bytes per 75 MHz bus clock) so drivers see it busy first
+			m_bcdma_busy |= 1 << ch;
+			m_bcdma_timer[ch]->adjust(attotime::from_ticks(count * bytes_per / 4 + 16, 75'000'000), ch);
 		}
-		set_irq(IRQ_BCDMA, (m_bcdma_regs[0x1c / 4] & m_bcdma_regs[0x18 / 4] & 0xff) != 0);
 	}
 }
 
@@ -1810,7 +1828,7 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 			LOGMASKED(LOG_CD, "%08x: cd servo %s %d bits tx %09x\n", m_maincpu->pc(), read ? "read" : "write", nbits, value);
 			if (!read)
 				cd_servo_write(nbits, value, BIT(m_cd_regs[0x14 / 4], 3));
-			m_cd_regs[0x14 / 4] &= ~1; // start bit clears when the transfer completes
+			m_cd_regs[0x14 / 4] &= ~3; // start and read bits clear when the transfer completes
 			m_cd_regs[0x64 / 4] |= read ? 2 : 1;
 			cd_update_irq();
 		}
@@ -1934,6 +1952,9 @@ void vsmilpro_state::machine_start()
 	m_spu->set_ram(m_sdram.target(), SDRAM_BASE, SDRAM_SIZE);
 
 	m_tick_timer = timer_alloc(FUNC(vsmilpro_state::tick_cb), this);
+	for (auto &t : m_bcdma_timer)
+		t = timer_alloc(FUNC(vsmilpro_state::bcdma_done_cb), this);
+	save_item(NAME(m_bcdma_busy));
 	m_ch1_wrap_timer = timer_alloc(FUNC(vsmilpro_state::ch1_wrap_cb), this);
 	m_line_timer = timer_alloc(FUNC(vsmilpro_state::line_cb), this);
 	m_joy_timer = timer_alloc(FUNC(vsmilpro_state::joy_cb), this);
@@ -1984,6 +2005,12 @@ void vsmilpro_state::machine_reset()
 	std::fill(std::begin(m_sysctl), std::end(m_sysctl), 0);
 	std::fill(std::begin(m_pll), std::end(m_pll), 0);
 	std::fill(std::begin(m_rtc), std::end(m_rtc), 0);
+	// The always-on block survives power-off; the ROM marks it with 0xC01DB007
+	// after the first cold start and otherwise powers down until a key press
+	m_rtc[0x88 / 4] = 0xc01db007;
+	// +0x8C = 0x1230FFAB records a power-key wake-up; without it the startup
+	// task treats the boot as spurious and returns to standby
+	m_rtc[0x8c / 4] = 0x1230ffab;
 	for (int b = 0; b < 2; b++)
 		for (int l = 0; l < 4; l++)
 			m_gpio_dir[b][l] = m_gpio_out[b][l] = 0;
@@ -1994,6 +2021,9 @@ void vsmilpro_state::machine_reset()
 	std::fill(std::begin(m_gpu_cvt), std::end(m_gpu_cvt), 0);
 	std::fill(std::begin(m_disp_regs), std::end(m_disp_regs), 0);
 	std::fill(std::begin(m_bcdma_regs), std::end(m_bcdma_regs), 0);
+	m_bcdma_busy = 0;
+	for (auto &t : m_bcdma_timer)
+		t->adjust(attotime::never);
 	std::fill(std::begin(m_dcdma_regs), std::end(m_dcdma_regs), 0);
 	std::fill(std::begin(m_cd_regs), std::end(m_cd_regs), 0);
 	m_gpu_clip[0] = 0;
@@ -2044,7 +2074,9 @@ static INPUT_PORTS_START( vsmilpro )
 	PORT_BIT( 0xfcfefefc, IP_ACTIVE_HIGH, IPT_UNUSED )
 
 	PORT_START("STRAPS") // 0x900D0018 bits 0-3, wiring unknown
-	PORT_DIPNAME( 0x01, 0x01, "Power-on condition" )
+	// bit 0 set skips the disc task entirely (the ROM then waits on nothing);
+	// with it clear the ROM waits for the CD drive init and boots discs
+	PORT_DIPNAME( 0x01, 0x00, "Boot mode strap" )
 	PORT_DIPSETTING(    0x00, DEF_STR( Off ) )
 	PORT_DIPSETTING(    0x01, DEF_STR( On ) )
 	PORT_DIPNAME( 0x02, 0x00, "Strap 1" )
