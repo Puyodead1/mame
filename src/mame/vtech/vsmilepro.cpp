@@ -42,6 +42,8 @@
 
 #include "emu.h"
 
+#include "zevio_spu.h"
+
 #include "cpu/arm7/arm7.h"
 #include "imagedev/cdromimg.h"
 #include "machine/nvram.h"
@@ -63,7 +65,7 @@
 #define LOG_SYS     (1U << 10)
 #define LOG_DEBUGTX (1U << 11)
 
-#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_SYS)
+#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_CD)
 #include "logmacro.h"
 
 #include <deque>
@@ -80,6 +82,7 @@ public:
 		m_screen(*this, "screen"),
 		m_cdrom(*this, "cdrom"),
 		m_nvram(*this, "spiflash"),
+		m_spu(*this, "spu"),
 		m_sdram(*this, "sdram"),
 		m_spi_region(*this, "spi"),
 		m_io_keys(*this, "KEYS"),
@@ -130,6 +133,7 @@ private:
 	required_device<screen_device> m_screen;
 	required_device<cdrom_image_device> m_cdrom;
 	required_device<nvram_device> m_nvram;
+	required_device<zevio_spu_device> m_spu;
 	required_shared_ptr<u32> m_sdram;
 	optional_memory_region m_spi_region;
 	required_ioport m_io_keys;
@@ -284,9 +288,6 @@ private:
 	void dcdma_w(offs_t offset, u32 data, u32 mem_mask);
 
 	// sound (registers only for now)
-	u32 m_snd_regs[0x2000 / 4];
-	u32 snd_r(offs_t offset);
-	void snd_w(offs_t offset, u32 data, u32 mem_mask);
 
 	// CD
 	u32 m_cd_regs[0x100 / 4];
@@ -296,6 +297,7 @@ private:
 	s32 m_cd_head;      // absolute frame under the pickup (LBA + 150)
 	s32 m_cd_dir;       // direction of the last sled command
 	s32 m_cd_jump_n;    // 2N track jump count from the last $7x command
+	bool m_cd_sled_armed;
 	u32 m_cd_ptr;       // decoder write pointer
 	s32 m_cd_len;
 	bool m_cd_running;
@@ -1492,26 +1494,6 @@ void vsmilpro_state::dcdma_w(offs_t offset, u32 data, u32 mem_mask)
 
 
 /***************************************************************************
-    Sound (0xB0000000) - registers only
-***************************************************************************/
-
-u32 vsmilpro_state::snd_r(offs_t offset)
-{
-	if (offset < 0x1000 / 4 && (offset & 0xf) == 0x28 / 4)
-		return m_snd_regs[offset & ~0xf]; // play address = start
-	if (offset < 0x1000 / 4 && (offset & 0xf) == 0x34 / 4)
-		return 0;
-	return m_snd_regs[offset];
-}
-
-void vsmilpro_state::snd_w(offs_t offset, u32 data, u32 mem_mask)
-{
-	COMBINE_DATA(&m_snd_regs[offset]);
-	LOGMASKED(LOG_SOUND, "%08x: snd %04x = %08x\n", m_maincpu->pc(), offset * 4, data);
-}
-
-
-/***************************************************************************
     CD sector decoder and servo serial link (0xC4000000)
 
     The servo DSP (Sony CXD3059AR) is modelled at the level the ROM's MAIKO
@@ -1587,13 +1569,17 @@ void vsmilpro_state::cd_servo_write(int nbits, u64 value, bool sens)
 	switch (nbits)
 	{
 	case 8:
-		if (cmd == 0x22) // sled out
+		if (cmd == 0x20)
+			m_cd_sled_armed = false;
+		else if (cmd == 0x22) // sled out
 		{
+			m_cd_sled_armed = true;
 			m_cd_dir = 1;
 			m_cd_head = std::max(m_cd_head, CD_HOME + 1000);
 		}
 		else if (cmd == 0x23) // sled in
 		{
+			m_cd_sled_armed = true;
 			m_cd_dir = -1;
 			m_cd_head = std::max(CD_HOME, m_cd_head - 1000);
 		}
@@ -1614,8 +1600,11 @@ void vsmilpro_state::cd_servo_write(int nbits, u64 value, bool sens)
 			m_cd_jump_n = (value >> 4) & 0xffff;
 		break;
 	case 32:
-		if ((cmd & 0xf0) == 0xb0) // traverse count for a long sled move
+		// traverse count for a long sled move; only meaningful right after a
+		// $22/$23 sled command (the init sequence also writes $B0 values)
+		if ((cmd & 0xf0) == 0xb0 && m_cd_sled_armed)
 		{
+			m_cd_sled_armed = false;
 			const s32 c = (value >> 8) & 0xfffff;
 			const s32 tracks = (c <= 2399) ? c * 100 / 60 : c * 100 / 90;
 			cd_jump_tracks(m_cd_dir * tracks);
@@ -1623,7 +1612,10 @@ void vsmilpro_state::cd_servo_write(int nbits, u64 value, bool sens)
 		break;
 	}
 	if (sens)
+	{
 		m_cd_regs[0x18 / 4] = (m_cd_regs[0x18 / 4] & ~2) | (cd_sens(cmd) ? 2 : 0);
+		LOGMASKED(LOG_CD, "cd sens %02x = %d (head %d)\n", cmd, BIT(m_cd_regs[0x18 / 4], 1), m_cd_head);
+	}
 }
 
 // subcode Q for the current head position
@@ -1817,7 +1809,8 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 			const u64 value = (u64(m_cd_regs[3]) << 32 | m_cd_regs[2]) & util::make_bitmask<u64>(std::min(nbits, 64));
 			LOGMASKED(LOG_CD, "%08x: cd servo %s %d bits tx %09x\n", m_maincpu->pc(), read ? "read" : "write", nbits, value);
 			if (!read)
-				cd_servo_write(nbits, value, BIT(data, 3));
+				cd_servo_write(nbits, value, BIT(m_cd_regs[0x14 / 4], 3));
+			m_cd_regs[0x14 / 4] &= ~1; // start bit clears when the transfer completes
 			m_cd_regs[0x64 / 4] |= read ? 2 : 1;
 			cd_update_irq();
 		}
@@ -1912,7 +1905,7 @@ void vsmilpro_state::vsmilpro_map(address_map &map)
 	map(0xa1000000, 0xa100003f).rw(FUNC(vsmilpro_state::spi_r), FUNC(vsmilpro_state::spi_w));
 	map(0xa4000000, 0xa400003f).rw(FUNC(vsmilpro_state::gpucvt_r), FUNC(vsmilpro_state::gpucvt_w));
 	map(0xa8000000, 0xa80003ff).rw(FUNC(vsmilpro_state::gpu_r), FUNC(vsmilpro_state::gpu_w));
-	map(0xb0000000, 0xb0001fff).rw(FUNC(vsmilpro_state::snd_r), FUNC(vsmilpro_state::snd_w));
+	map(0xb0000000, 0xb0001fff).rw(m_spu, FUNC(zevio_spu_device::read), FUNC(zevio_spu_device::write));
 	map(0xb8000000, 0xb8002fff).rw(FUNC(vsmilpro_state::disp_r), FUNC(vsmilpro_state::disp_w)); // +0x800-0xFFF on-chip SRAM / palettes
 	map(0xbc000000, 0xbc0001ff).rw(FUNC(vsmilpro_state::bcdma_r), FUNC(vsmilpro_state::bcdma_w));
 	map(0xc0000000, 0xc00001ff).rw(FUNC(vsmilpro_state::dcdma_r), FUNC(vsmilpro_state::dcdma_w));
@@ -1938,6 +1931,7 @@ void vsmilpro_state::machine_start()
 	m_nvram->set_base(&m_sflash[0], SFLASH_SIZE);
 
 	m_dsp_mem = std::make_unique<u16[]>(0x80000);
+	m_spu->set_ram(m_sdram.target(), SDRAM_BASE, SDRAM_SIZE);
 
 	m_tick_timer = timer_alloc(FUNC(vsmilpro_state::tick_cb), this);
 	m_ch1_wrap_timer = timer_alloc(FUNC(vsmilpro_state::ch1_wrap_cb), this);
@@ -1972,7 +1966,6 @@ void vsmilpro_state::machine_start()
 	save_item(NAME(m_disp_status));
 	save_item(NAME(m_bcdma_regs));
 	save_item(NAME(m_dcdma_regs));
-	save_item(NAME(m_snd_regs));
 	save_item(NAME(m_cd_regs));
 	save_item(NAME(m_cd_head));
 	save_item(NAME(m_cd_dir));
@@ -2002,7 +1995,6 @@ void vsmilpro_state::machine_reset()
 	std::fill(std::begin(m_disp_regs), std::end(m_disp_regs), 0);
 	std::fill(std::begin(m_bcdma_regs), std::end(m_bcdma_regs), 0);
 	std::fill(std::begin(m_dcdma_regs), std::end(m_dcdma_regs), 0);
-	std::fill(std::begin(m_snd_regs), std::end(m_snd_regs), 0);
 	std::fill(std::begin(m_cd_regs), std::end(m_cd_regs), 0);
 	m_gpu_clip[0] = 0;
 	m_gpu_clip[1] = 0xffffff;
@@ -2033,6 +2025,7 @@ void vsmilpro_state::machine_reset()
 	m_cd_head = -3000;
 	m_cd_dir = 1;
 	m_cd_jump_n = 0;
+	m_cd_sled_armed = false;
 	m_cd_ptr = 0;
 	m_cd_len = 0;
 	m_cd_running = false;
@@ -2121,6 +2114,11 @@ void vsmilpro_state::vsmilpro(machine_config &config)
 	m_screen->set_screen_update(FUNC(vsmilpro_state::screen_update));
 
 	SPEAKER(config, "speaker", 2).front();
+
+	ZEVIO_SPU(config, m_spu);
+	m_spu->irq_cb().set([this] (int state) { set_irq(IRQ_SOUND, state); });
+	m_spu->add_route(0, "speaker", 1.0, 0);
+	m_spu->add_route(1, "speaker", 1.0, 1);
 
 	CDROM(config, m_cdrom).set_interface("vsmile_vdisk");
 
