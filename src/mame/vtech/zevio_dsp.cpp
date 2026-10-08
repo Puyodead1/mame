@@ -131,6 +131,8 @@ zevio_dsp_hle_device::zevio_dsp_hle_device(const machine_config &mconfig, const 
 void zevio_dsp_hle_device::device_start()
 {
 	m_frame_timer = timer_alloc(FUNC(zevio_dsp_hle_device::frame_cb), this);
+	std::fill(std::begin(m_jpeg_header_save), std::end(m_jpeg_header_save), 0);
+	m_jpeg_header_len = 0;
 	save_item(NAME(m_mbox));
 	save_item(NAME(m_prog_words));
 	save_item(NAME(m_running));
@@ -149,6 +151,19 @@ void zevio_dsp_hle_device::device_start()
 	save_item(NAME(m_height));
 	save_item(NAME(m_frames));
 	save_item(NAME(m_frame));
+	save_item(NAME(m_jpeg_header_save));
+	save_item(NAME(m_jpeg_header_len));
+}
+
+void zevio_dsp_hle_device::device_pre_save()
+{
+	m_jpeg_header_len = std::min<u32>(m_jpeg_header.size(), sizeof(m_jpeg_header_save));
+	std::copy_n(m_jpeg_header.begin(), m_jpeg_header_len, m_jpeg_header_save);
+}
+
+void zevio_dsp_hle_device::device_post_load()
+{
+	m_jpeg_header.assign(m_jpeg_header_save, m_jpeg_header_save + m_jpeg_header_len);
 }
 
 void zevio_dsp_hle_device::device_reset()

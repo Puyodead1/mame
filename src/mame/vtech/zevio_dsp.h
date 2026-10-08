@@ -26,6 +26,8 @@ public:
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void device_pre_save() override;
+	virtual void device_post_load() override;
 
 private:
 	enum : u32 { MSG = 0x104 / 4, DOORBELL = 0x108 / 4, REPLY = 0x110 / 4, STATUS = 0x114 / 4 };
@@ -65,6 +67,8 @@ private:
 	u32 m_aud[2], m_aud_wp[2], m_aud_size;
 	u32 m_width, m_height, m_frames, m_frame;
 	std::vector<u8> m_jpeg_header;
+	u8 m_jpeg_header_save[4096]; // m_jpeg_header for save states
+	u32 m_jpeg_header_len;
 };
 
 DECLARE_DEVICE_TYPE(ZEVIO_DSP_HLE, zevio_dsp_hle_device)
