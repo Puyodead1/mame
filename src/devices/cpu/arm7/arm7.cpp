@@ -1975,6 +1975,48 @@ void arm7_cpu_device::execute_run()
 			/*******************************************************************/
 			/* If we got here - condition satisfied, so decode the instruction */
 			/*******************************************************************/
+			if (!op_offset)
+			{
+				// the common classes, straight to their handlers: data processing
+				// (immediate, or register with an immediate shift, excluding the
+				// PSR transfer space that also holds the v5 DSP multiplies) and
+				// single data transfers without the media bit pattern
+				const uint32_t cls = insn & 0x0e000000;
+				if ((cls == 0x02000000 || (cls == 0 && !(insn & 0x10))) && (insn & 0x01900000) != 0x01000000)
+				{
+					HandleALU(insn);
+					goto skip_exec;
+				}
+				if (cls == 0x04000000 || (cls == 0x06000000 && !(insn & 0x10)))
+				{
+					HandleMemSingle(insn);
+					R15 += 4;
+					goto skip_exec;
+				}
+				// halfword transfers and multiplies (not UMAAL, not swaps)
+				if (cls == 0 && (insn & 0x90) == 0x90 && m_archRev >= 3)
+				{
+					if (insn & 0x60)
+					{
+						HandleHalfWordDT(insn);
+						goto skip_exec;
+					}
+					if (!(insn & 0x01000000) && (insn & 0x0ff000f0) != 0x00400090)
+					{
+						if (insn & 0x800000)
+						{
+							if (insn & 0x00400000)
+								HandleSMulLong(insn);
+							else
+								HandleUMulLong(insn);
+						}
+						else
+							HandleMul(insn);
+						R15 += 4;
+						goto skip_exec;
+					}
+				}
+			}
 			(this->*ops_handler[((insn & 0xF000000) >> 24) + op_offset])(insn);
 		}
 
