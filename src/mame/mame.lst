@@ -49458,6 +49458,7 @@ vsmilebfp
 @source:vtech/vsmilepro.cpp
 vsmilpro
 vsmilprof
+vflash
 
 @source:vtech/vtech1.cpp
 fellow
