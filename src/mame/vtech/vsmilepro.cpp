@@ -65,7 +65,7 @@
 #define LOG_SYS     (1U << 10)
 #define LOG_DEBUGTX (1U << 11)
 
-#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_DMA)
+#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_CD)
 #include "logmacro.h"
 
 #include <deque>
@@ -1852,8 +1852,14 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 			m_cd_running = true;
 			LOGMASKED(LOG_CD, "cd run from frame %d to %08x len %06x\n", m_cd_head, m_cd_ptr, m_cd_len);
 		}
-		else if (!(m_cd_regs[offset] & 4))
+		else if (!(m_cd_regs[offset] & 4) && m_cd_running)
+		{
+			// stopping an active transfer completes it with a transfer-end
+			// interrupt; Cd_startRead relies on this to restart with a new request
 			m_cd_running = false;
+			m_cd_regs[0x64 / 4] |= 0x10;
+			cd_update_irq();
+		}
 		return;
 	}
 	case 0x74 / 4:
