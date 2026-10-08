@@ -42,6 +42,8 @@
 #include "emu.h"
 #include "zevio_gpu.h"
 
+#include <map>
+
 #define LOG_UNKNOWN (1U << 1)
 #define LOG_LIST    (1U << 2)
 
@@ -289,8 +291,36 @@ bool zevio_gpu_device::texel(float u, float v, bool normalized, float &r, float 
 {
 	const u32 mode = m_w86;
 	const int w = 8 << (mode & 7), h = 8 << ((mode >> 3) & 7);
-	int tu = normalized ? int(std::floor(u * w)) : int(u);
-	int tv = normalized ? int(std::floor(v * h)) : int(v);
+	if (!normalized || !(mode & 0xc0))
+		return texel_point(normalized ? int(std::floor(u * w)) : int(u), normalized ? int(std::floor(v * h)) : int(v), r, g, b, a);
+
+	// bilinear filtering (texture mode bits 6-7, set by the 3D engine)
+	// TODO: confirm what the two bits select
+	const float fu = u * w - 0.5f, fv = v * h - 0.5f;
+	const int iu = int(std::floor(fu)), iv = int(std::floor(fv));
+	const float du = fu - iu, dv = fv - iv;
+	float sr = 0, sg = 0, sb = 0, sa = 0, wsum = 0;
+	for (int k = 0; k < 4; k++)
+	{
+		const int ou = k & 1, ov = k >> 1;
+		const float wt = (ou ? du : 1.0f - du) * (ov ? dv : 1.0f - dv);
+		float cr, cg, cb, ca;
+		if (texel_point(iu + ou, iv + ov, cr, cg, cb, ca))
+		{
+			sr += cr * wt; sg += cg * wt; sb += cb * wt; sa += ca * wt;
+			wsum += wt;
+		}
+	}
+	if (wsum < 0.5f)
+		return false; // mostly transparent here
+	r = sr / wsum; g = sg / wsum; b = sb / wsum; a = sa / wsum;
+	return true;
+}
+
+bool zevio_gpu_device::texel_point(int tu, int tv, float &r, float &g, float &b, float &a) const
+{
+	const u32 mode = m_w86;
+	const int w = 8 << (mode & 7), h = 8 << ((mode >> 3) & 7);
 	tu &= w - 1;
 	tv &= h - 1;
 	const int x0 = m_w87 & 0xfff, y0 = (m_w87 >> 12) & 0xfff;
@@ -416,7 +446,7 @@ void zevio_gpu_device::transform(vertex_t &v) const
 	const float z = reg_f(0x46) * sx + reg_f(0x47) * sy + reg_f(0x48) * sz + reg_f(0x4e);
 	v.x = x;
 	v.y = y;
-	v.z = z; // positive eye Z is in front (particles at z=+0.03 project on-screen)
+	v.z = -z; // eye space looks down -Z (Bratz menu: character z -1.3..-0.6); keep positive depth
 
 	// lighting only for vertices with normals: ambient (0x70) plus three
 	// directional lights (directions 0x60/0x64/0x68, colours 0x6C-0x6E)
@@ -519,17 +549,6 @@ void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 {
 	if (m_no3d) return;
 	const bool textured = BIT(m_w1c, 6);
-	// Bratz draws particles at eye z > 0 and full-screen quads at z < 0, so
-	// the divide seems sign-blind: mirror triangles entirely at negative z
-	// (same x/z, y/z) so depth and clipping work on positive z.
-	// TODO: confirm on hardware
-	if (a.z < 0 && b.z < 0 && c.z < 0)
-		for (vertex_t *p : { &a, &b, &c })
-		{
-			p->x = -p->x;
-			p->y = -p->y;
-			p->z = -p->z;
-		}
 	// clip against the near plane in eye space, then project
 	const float near_z = 1.0f / 4096.0f;
 	vertex_t in[3] = { a, b, c };
@@ -577,6 +596,10 @@ void zevio_gpu_device::draw_line(const vertex_t &a, const vertex_t &b)
 void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 {
 	m_no3d = getenv("ZGPU_NO_3D") != nullptr;
+	// debug: ZGPU_ONLY=<hex upper half> draws only primitives with that header
+	static const char *only = getenv("ZGPU_ONLY");
+	if (only && (header >> 16) != strtoul(only, nullptr, 16))
+		m_no3d = true;
 	const u8 kind = header >> 24;
 	const u8 fmt = (header >> 16) & 0xff;
 	const int n = header & 0xffff;
@@ -601,6 +624,20 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 	}
 	for (auto &v : verts)
 		transform(v);
+	if (getenv("ZGPU_ZLOG") && n)
+	{
+		static std::map<u32, std::pair<float, float>> zr;
+		static int cnt = 0;
+		auto &e = zr.try_emplace(header >> 16, std::make_pair(1e9f, -1e9f)).first->second;
+		for (auto &v : verts)
+		{
+			e.first = std::min(e.first, v.z);
+			e.second = std::max(e.second, v.z);
+		}
+		if (++cnt % 50000 == 0)
+			for (auto &k : zr)
+				LOGMASKED(LOG_UNKNOWN, "ZRANGE %04x z %f .. %f d84 %06x d88 %06x\n", k.first, k.second.first, k.second.second, m_w84, m_w88);
+	}
 	if ((VERBOSE & LOG_LIST) && n && (m_stat_dbg++ % 5000) == 0)
 	{
 		m_stat_dbg++;
@@ -691,7 +728,8 @@ void zevio_gpu_device::prim2d(u32 header, u32 &addr)
 	case 0xc3: n = 2; break;
 	default: n = 1; break;
 	}
-	const int ox = m_w85 & 0xfff, oy = (m_w85 >> 12) & 0xfff;
+	// 2D positions: surface origin (clip top-left) + 0x85 offset + signed x/y
+	const int ox = (m_clip0 & 0xfff) + (m_w85 & 0xfff), oy = ((m_clip0 >> 12) & 0xfff) + ((m_w85 >> 12) & 0xfff);
 	std::vector<vertex_t> v(n);
 	for (int i = 0; i < n; i++)
 	{
@@ -786,7 +824,8 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 		col = rd32(addr + k++ * 4);
 	addr += count * 4;
 
-	const int ox = m_w85 & 0xfff, oy = (m_w85 >> 12) & 0xfff;
+	// 2D positions: surface origin (clip top-left) + 0x85 offset + signed x/y
+	const int ox = (m_clip0 & 0xfff) + (m_w85 & 0xfff), oy = ((m_clip0 >> 12) & 0xfff) + ((m_w85 >> 12) & 0xfff);
 	const int x0 = ox + s16(xy & 0xffff), y0 = oy + s16(xy >> 16);
 	const int w = wh & 0xffff, h = wh >> 16;
 	const float cr = (col & 0xff) / 255.0f, cg = ((col >> 8) & 0xff) / 255.0f, cb = ((col >> 16) & 0xff) / 255.0f;
@@ -813,26 +852,41 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 void zevio_gpu_device::run_list(u32 addr)
 {
 	LOGMASKED(LOG_LIST, "list %08x\n", addr);
-	u32 ret = 0;
-	bool in_call = false;
+	// debug: ZGPU_TRACE=<seconds> writes every command executed in the 0.05 s
+	// after that emulated time to gputrace.txt
+	static FILE *trace = nullptr;
+	static double trace_at = getenv("ZGPU_TRACE") ? atof(getenv("ZGPU_TRACE")) : -1.0;
+	const double now = machine().time().as_double();
+	const bool tracing = trace_at >= 0 && now >= trace_at && now < trace_at + 0.05;
+	if (tracing && !trace)
+		trace = fopen("gputrace.txt", "w");
+	if (tracing)
+	{
+		fprintf(trace, "LIST %08x t=%f base98 %08x r90 %08x r94 %08x\n", addr, now, m_regs[0x98 / 4], m_regs[0x90 / 4], m_regs[0x94 / 4]);
+		fflush(trace);
+	}
+	std::vector<u32> stack;
+	const u32 start = addr;
 	for (int guard = 0; guard < 0x400000; guard++)
 	{
 		const u32 cmd = rd32(addr);
+		if (tracing)
+			fprintf(trace, "%08x: %08x %08x %08x %08x %08x %08x\n", addr, cmd, rd32(addr + 4), rd32(addr + 8), rd32(addr + 12), rd32(addr + 16), rd32(addr + 20));
 		addr += 4;
 		const u8 op = cmd >> 24;
 		switch (op)
 		{
-		case 0x04:
-			if (in_call)
+		case 0x04: // return from a 0x09 call (nested calls are allowed)
+			if (!stack.empty())
 			{
-				addr = ret;
-				in_call = false;
+				addr = stack.back();
+				stack.pop_back();
 			}
 			break;
 		case 0x08: addr = rd32(addr); break;
 		case 0x09:
-			ret = addr + 4;
-			in_call = true;
+			if (stack.size() < 16)
+				stack.push_back(addr + 4);
 			addr = rd32(addr);
 			break;
 		case 0x0a: m_vtxbase = rd32(addr); addr += 4; break;
@@ -906,21 +960,42 @@ void zevio_gpu_device::run_list(u32 addr)
 					wr16(m_xfer + (j * w + i) * 2, vram_r(x + i, y + j));
 			break;
 		}
-		case 0xd3: // fill, relative to the +0x98 base (FA clears its depth area with it)
+		case 0xd3: // fill
 		{
+			// Absolute coordinates, except a rectangle inside the +0x90/+0x94
+			// window (512x240 in FA), which addresses the +0x98 area: FA clears
+			// its frame with (surface, colour 0) and its +0x98 area (probably
+			// depth) with (0,0) 512x240, 0x3732
 			const u32 pos = rd32(addr), size = rd32(addr + 4), col = rd32(addr + 8);
 			addr += 12;
 			m_stat_fills++;
 			const int x = pos & 0xffff, y = pos >> 16, w = size & 0xffff, h = size >> 16;
-			const u32 base = m_regs[0x98 / 4];
+			const int ww = m_regs[0x94 / 4] & 0xffff, wh = m_regs[0x94 / 4] >> 16;
+			const bool windowed = (x + w <= ww) && (y + h <= wh);
+			const u32 base = windowed ? m_regs[0x98 / 4] : 0x0ffd0000;
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 				{
 					const u32 xb = ((x + i) & 1023) * 2, yy = y + j;
 					wr16(base + (yy >> 3) * 16384 + (xb >> 6) * 512 + (yy & 7) * 64 + (xb & 63), col);
-					if (yy < ZH)
-						m_zbuf[yy * ZW + ((x + i) & 1023)] = std::numeric_limits<float>::max();
 				}
+			if (windowed)
+				std::fill_n(&m_zbuf[0], ZW * ZH, std::numeric_limits<float>::max());
+			break;
+		}
+		case 0xd2: // VRAM to VRAM copy: destination, size, source
+		{
+			const u32 dst = rd32(addr), size = rd32(addr + 4), src = rd32(addr + 8);
+			addr += 12;
+			const int dx = dst & 0xffff, dy = dst >> 16, sx = src & 0xffff, sy = src >> 16;
+			const int w = size & 0xffff, h = size >> 16;
+			std::vector<u16> tmp(w * h);
+			for (int j = 0; j < h; j++)
+				for (int i = 0; i < w; i++)
+					tmp[j * w + i] = vram_r(sx + i, sy + j);
+			for (int j = 0; j < h; j++)
+				for (int i = 0; i < w; i++)
+					vram_w(dx + i, dy + j, tmp[j * w + i]);
 			break;
 		}
 		default:
@@ -928,5 +1003,8 @@ void zevio_gpu_device::run_list(u32 addr)
 			break;
 		}
 	}
-	LOGMASKED(LOG_UNKNOWN, "list runaway\n");
+	// never leave the engine waiting: finish as if the end command was reached
+	LOGMASKED(LOG_UNKNOWN, "list runaway: started %08x, stopped at %08x (%08x %08x %08x)\n", start, addr, rd32(addr), rd32(addr + 4), rd32(addr + 8));
+	m_regs[0x14 / 4] = 0xfd08;
+	update_irq();
 }
