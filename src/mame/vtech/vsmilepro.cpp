@@ -65,7 +65,7 @@
 #define LOG_SYS     (1U << 10)
 #define LOG_DEBUGTX (1U << 11)
 
-#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX | LOG_CD)
+#define VERBOSE (LOG_UNKNOWN | LOG_DEBUGTX)
 #include "logmacro.h"
 
 #include <deque>
@@ -188,6 +188,7 @@ private:
 
 	// system control / PLL / RTC / GPIO
 	u32 m_sysctl[0x1000 / 4];
+	bool m_resume;
 	u32 m_pll[0x40 / 4];
 	u32 m_rtc[0x100 / 4];
 	u32 m_gpio_dir[2][4], m_gpio_out[2][4];
@@ -402,7 +403,13 @@ u32 vsmilpro_state::sysctl_r(offs_t offset)
 {
 	switch (offset)
 	{
-	case 0x00c / 4: return 0; // reset cause: cold boot
+	case 0x00c / 4: // reset cause: bit 1 = resume from standby, bit 0 = warm restart
+	{
+		const u32 cause = m_resume ? 2 : 0;
+		if (!machine().side_effects_disabled())
+			m_resume = false;
+		return cause;
+	}
 	case 0x018 / 4: return m_io_keys->read();
 	case 0x01c / 4: return 0;
 	case 0x030 / 4: return m_sysctl[offset];
@@ -422,6 +429,16 @@ void vsmilpro_state::sysctl_w(offs_t offset, u32 data, u32 mem_mask)
 		{
 			logerror("%08x: power off\n", m_maincpu->pc());
 			machine().schedule_exit();
+		}
+		else if (data == 1)
+		{
+			// Standby. Games use it to start their OS: vboot installs FA's
+			// vectors at 0x1000FF00 and enters the ROM's standby routine; on
+			// wake the reset code sees "resume" in +0x0C and jumps to the RAM
+			// resume handler. TODO: wake on the power key instead of at once
+			logerror("%08x: standby, waking with resume flag\n", m_maincpu->pc());
+			m_resume = true;
+			m_maincpu->pulse_input_line(INPUT_LINE_RESET, attotime::zero);
 		}
 		break;
 	case 0x02c / 4:
@@ -488,7 +505,11 @@ u32 vsmilpro_state::gpio_r(offs_t offset)
 	{
 		u32 val = m_gpio_out[Bank][lane];
 		if (Bank == 1 && lane == 0)
-			val = (val & ~0x0f) | (m_io_straps->read() & 0x0f);
+		{
+			// bits 0-3 are board straps; bit 4 is an input that games' vboot
+			// checks before starting FA (set = refuse to boot, enter standby)
+			val = (val & ~0x1f) | (m_io_straps->read() & 0x0f);
+		}
 		if (Bank == 0 && lane == 1)
 		{
 			// bit 14: low = disc lid closed (tied to a mounted image); bit 10: unknown switch
@@ -959,8 +980,9 @@ u8 vsmilpro_state::dataflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 
 void vsmilpro_state::gpu_update_irq()
 {
-	const u32 mask = m_gpu_regs[0x10 / 4];
-	set_irq(IRQ_GPU, (m_gpu_regs[0x14 / 4] & ~mask & 0x3f) != 0);
+	// +0x10 is an enable mask (FA writes 0x1F and waits for the list-end IRQ)
+	const u32 enable = m_gpu_regs[0x10 / 4];
+	set_irq(IRQ_GPU, (m_gpu_regs[0x14 / 4] & enable & 0x3f) != 0);
 }
 
 u32 vsmilpro_state::gpu_r(offs_t offset)
@@ -1071,6 +1093,13 @@ void vsmilpro_state::gpu_sprite(u32 flags, const u32 *args, int nargs)
 
 void vsmilpro_state::gpu_run_list(u32 addr)
 {
+	if (VERBOSE & LOG_GPU)
+	{
+		std::string words;
+		for (int i = 0; i < 48; i++)
+			words += util::string_format(" %08x", ram_r32(addr + i * 4));
+		LOGMASKED(LOG_GPU, "gpu list %08x:%s\n", addr, words);
+	}
 	std::vector<u32> callstack;
 	int guard = 0;
 	while (guard++ < 0x200000)
@@ -1117,12 +1146,12 @@ void vsmilpro_state::gpu_run_list(u32 addr)
 		case 0x1c: case 0x1e:
 			m_gpu_state[op] = cmd & 0xffffff;
 			break;
-		case 0x20: // register block write
+		case 0x20: // register block write: n 16-bit values, padded to a word
 		{
 			const u32 reg = (cmd >> 16) & 0xff, n = cmd & 0xffff;
 			for (u32 i = 0; i < n; i++)
-				m_gpu_state[(reg + i) & 0xff] = ram_r32(addr + i * 4);
-			addr += n * 4;
+				m_gpu_state[(reg + i) & 0xff] = ram_r16(addr + i * 2);
+			addr += (n * 2 + 3) & ~3;
 			break;
 		}
 		case 0x81: m_gpu_state[op] = cmd & 0xffffff; break;
@@ -1199,7 +1228,10 @@ void vsmilpro_state::gpu_run_list(u32 addr)
 			}
 			else
 			{
-				LOGMASKED(LOG_UNKNOWN, "gpu unknown command %08x at %08x, stopping list\n", cmd, addr - 4);
+				std::string ctx;
+				for (int i = -12; i < 8; i++)
+					ctx += util::string_format(i == -1 ? " [%08x]" : " %08x", ram_r32(addr + i * 4));
+				LOGMASKED(LOG_UNKNOWN, "gpu unknown command %08x at %08x, stopping list:%s\n", cmd, addr - 4, ctx);
 				m_gpu_regs[0x14 / 4] = 0xfd08;
 				gpu_update_irq();
 				return;
@@ -1354,7 +1386,8 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 	};
 
 	// main 16-bit layer from the tiled surface at the display start address
-	if (BIT(enable, 5) || !(enable & 0x0f))
+	// (+0x100 bit 4; FA enables 0x18, the boot ROM menu only tile layers)
+	if (BIT(enable, 4))
 	{
 		const u32 start = m_disp_regs[0x160 / 4];
 		const u32 off = start - VRAM_ORIGIN;
@@ -1982,6 +2015,8 @@ void vsmilpro_state::machine_start()
 	save_item(NAME(m_int_enable));
 	save_item(NAME(m_int_regs));
 	save_item(NAME(m_sysctl));
+	save_item(NAME(m_resume));
+	m_resume = false;
 	save_item(NAME(m_pll));
 	save_item(NAME(m_rtc));
 	save_item(NAME(m_gpio_dir));
