@@ -260,6 +260,9 @@ private:
 
 	// display
 	u32 m_disp_regs[0x3000 / 4];
+	u32 m_disp_shown[0xc00 / 4] = {}, m_disp_prev[0xc00 / 4] = {}; // display registers as of the previous frame
+	u64 m_disp_frame = ~0ULL;
+	bool m_disp_delayed = false;
 	u32 m_disp_status;
 	emu_timer *m_line_timer;
 	u32 disp_r(offs_t offset);
@@ -1123,21 +1126,37 @@ static inline rgb_t bgr555(u16 p)
 */
 u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
-	m_gpu->sync(); // finish drawing before reading VRAM
-	const u32 enable = m_disp_regs[0x100 / 4];
-	bitmap.fill(bgr555(m_disp_regs[0x10c / 4]), cliprect);
-
-	auto in_window = [this] (int reg, int x, int y)
+	// threaded rendering: the GPU layer shows the previous frame's buffer, whose
+	// drawing is finished while this frame renders. If work still queued draws
+	// into that buffer, finish everything instead.
+	if (screen.frame_number() != m_disp_frame)
 	{
-		const u32 a = m_disp_regs[reg / 4], b = m_disp_regs[reg / 4 + 1];
+		m_disp_frame = screen.frame_number();
+		std::copy_n(m_disp_prev, std::size(m_disp_prev), m_disp_shown);
+		const u32 off = m_disp_shown[0x160 / 4] - VRAM_ORIGIN;
+		const int sy = (off / 16384) * 8 + ((off % 16384) % 512) / 64;
+		const int sx = (((off % 16384) / 512) * 64 + (off % 64)) / 2;
+		const rectangle &vis = screen.visible_area();
+		const bool wraps = sx + vis.right() > 1023;
+		m_disp_delayed = m_gpu->frame_fence(wraps ? 0 : sx, sy, wraps ? 1023 : sx + vis.right(), sy + vis.bottom());
+		std::copy_n(m_disp_regs, std::size(m_disp_prev), m_disp_prev);
+	}
+	const u32 *const regs = m_disp_regs;
+	const u32 *const gregs = m_disp_delayed ? m_disp_shown : m_disp_regs; // GPU layer
+	const u32 enable = regs[0x100 / 4];
+	bitmap.fill(bgr555(regs[0x10c / 4]), cliprect);
+
+	auto in_window = [] (const u32 *r, int reg, int x, int y)
+	{
+		const u32 a = r[reg / 4], b = r[reg / 4 + 1];
 		return x >= int(a & 0x7ff) && x <= int(b & 0x7ff) && y >= int((a >> 16) & 0x7ff) && y <= int((b >> 16) & 0x7ff);
 	};
 
 	// main 16-bit layer from the tiled surface at the display start address
 	// (+0x100 bit 4; FA enables 0x18, the boot ROM menu only tile layers)
-	if (BIT(enable, 4))
+	if (BIT(gregs[0x100 / 4], 4))
 	{
-		const u32 start = m_disp_regs[0x160 / 4];
+		const u32 start = gregs[0x160 / 4];
 		const u32 off = start - VRAM_ORIGIN;
 		const u32 y0 = (off / 16384) * 8 + ((off % 16384) % 512) / 64;
 		const u32 xb0 = ((off % 16384) / 512) * 64 + (off % 64);
@@ -1146,7 +1165,7 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 			u32 *dst = &bitmap.pix(y);
 			for (int x = cliprect.left(); x <= cliprect.right(); x++)
 			{
-				if (!in_window(0x130, x, y))
+				if (!in_window(gregs, 0x130, x, y))
 					continue;
 				const u32 addr = tiled_addr(VRAM_ORIGIN, (xb0 + x * 2) & 2047, y0 + y);
 				const u16 p = in_sdram(addr) ? ram_r16(addr) : 0;
@@ -1159,10 +1178,10 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 	// stride = window width (DSP movie and photo output)
 	if (BIT(enable, 5))
 	{
-		const u32 a = m_disp_regs[0x138 / 4], b = m_disp_regs[0x13c / 4];
+		const u32 a = regs[0x138 / 4], b = regs[0x13c / 4];
 		const int x0 = a & 0x7ff, y0 = (a >> 16) & 0x7ff, x1 = b & 0x7ff, y1 = (b >> 16) & 0x7ff;
 		const int w = x1 - x0 + 1;
-		const u32 yb = m_disp_regs[0x164 / 4], ub = m_disp_regs[0x168 / 4], vb = m_disp_regs[0x16c / 4];
+		const u32 yb = regs[0x164 / 4], ub = regs[0x168 / 4], vb = regs[0x16c / 4];
 		if (BIT(enable, 14))
 		{
 			// +0x100 bit 14: linear BGR555 instead of YCbCr (the boot ROM's
@@ -1199,16 +1218,16 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 	{
 		if (!BIT(enable, layer))
 			continue;
-		const u32 map = m_disp_regs[(0x140 / 4) + layer];
-		const u32 tiles = m_disp_regs[(0x150 / 4) + layer];
+		const u32 map = regs[(0x140 / 4) + layer];
+		const u32 tiles = regs[(0x150 / 4) + layer];
 		// FA leaves layer 3 enabled with null pointers; show nothing for it
 		// TODO: check what the hardware fetches in that case
 		if (!in_sdram(map) || !in_sdram(tiles))
 			continue;
-		const u32 scroll = m_disp_regs[(0x110 / 4) + layer];
+		const u32 scroll = regs[(0x110 / 4) + layer];
 		// +0x104 byte n: bits 0-1 map width (16/32/64/128 tiles), bits 2-3 tile
 		// format (0 = 8bpp, 2 = 4bpp as in FA's text overlay)
-		const u8 mode = m_disp_regs[0x104 / 4] >> (layer * 8);
+		const u8 mode = regs[0x104 / 4] >> (layer * 8);
 		const int mapw = 16 << (mode & 3);
 		const bool bpp4 = ((mode >> 2) & 3) == 2;
 		const int sx = scroll & 0xfff, sy = (scroll >> 16) & 0xfff;
@@ -1217,7 +1236,7 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 			u32 *dst = &bitmap.pix(y);
 			for (int x = cliprect.left(); x <= cliprect.right(); x++)
 			{
-				if (!in_window(window_regs[layer], x, y))
+				if (!in_window(regs, window_regs[layer], x, y))
 					continue;
 				const int lx = (x + sx) & (mapw * 8 - 1), ly = (y + sy) & (mapw * 8 - 1);
 				const u16 entry = ram_r16(map + ((ly >> 3) * mapw + (lx >> 3)) * 2);
@@ -1230,7 +1249,7 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 				}
 				else
 					index = ram_r8(tiles + (entry & 0xfff) * 64 + (ly & 7) * 8 + (lx & 7));
-				const u16 color = m_disp_regs[(0x800 / 4) + (index >> 1)] >> (BIT(index, 0) * 16);
+				const u16 color = regs[(0x800 / 4) + (index >> 1)] >> (BIT(index, 0) * 16);
 				if (color == 0x83e0 || color == 0x0000) // UI transparency key, or empty colour
 					continue;
 				dst[x] = bgr555(color);
