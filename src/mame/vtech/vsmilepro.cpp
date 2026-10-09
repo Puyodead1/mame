@@ -432,6 +432,8 @@ u32 vsmilpro_state::sysctl_r(offs_t offset)
 {
 	switch (offset)
 	{
+	case 0x000 / 4: // status: FA's media player refuses to open a movie unless bit 4 is set
+		return m_sysctl[offset] | 0x10;
 	case 0x00c / 4: // reset cause: bit 1 = resume from standby, bit 0 = warm restart
 	{
 		const u32 cause = m_resume ? 2 : 0;
@@ -1158,28 +1160,6 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		return x >= int(a & 0x7ff) && x <= int(b & 0x7ff) && y >= int((a >> 16) & 0x7ff) && y <= int((b >> 16) & 0x7ff);
 	};
 
-	// main 16-bit layer from the tiled surface at the display start address
-	// (+0x100 bit 4; FA enables 0x18, the boot ROM menu only tile layers)
-	if (BIT(gregs[0x100 / 4], 4))
-	{
-		const u32 start = gregs[0x160 / 4];
-		const u32 off = start - VRAM_ORIGIN;
-		const u32 y0 = (off / 16384) * 8 + ((off % 16384) % 512) / 64;
-		const u32 xb0 = ((off % 16384) / 512) * 64 + (off % 64);
-		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
-		{
-			u32 *dst = &bitmap.pix(y);
-			for (int x = cliprect.left(); x <= cliprect.right(); x++)
-			{
-				if (!in_window(gregs, 0x130, x, y))
-					continue;
-				const u32 addr = tiled_addr(VRAM_ORIGIN, (xb0 + x * 2) & 2047, y0 + y);
-				const u16 p = in_sdram(addr) ? ram_r16(addr) : 0;
-				dst[x] = bgr555(p);
-			}
-		}
-	}
-
 	// layer 5: planar YCbCr 4:2:0 at +0x164/+0x168/+0x16C, window +0x138/+0x13C,
 	// stride = window width (DSP movie and photo output)
 	if (BIT(enable, 5))
@@ -1217,6 +1197,32 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 					dst[x] = rgb_t(r, g, bl);
 				}
 			}
+	}
+
+	// main 16-bit layer from the tiled surface at the display start address,
+	// over the video layer
+	const bool video = BIT(enable, 5);
+	// (+0x100 bit 4; FA enables 0x18, the boot ROM menu only tile layers)
+	if (BIT(gregs[0x100 / 4], 4))
+	{
+		const u32 start = gregs[0x160 / 4];
+		const u32 off = start - VRAM_ORIGIN;
+		const u32 y0 = (off / 16384) * 8 + ((off % 16384) % 512) / 64;
+		const u32 xb0 = ((off % 16384) / 512) * 64 + (off % 64);
+		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
+		{
+			u32 *dst = &bitmap.pix(y);
+			for (int x = cliprect.left(); x <= cliprect.right(); x++)
+			{
+				if (!in_window(gregs, 0x130, x, y))
+					continue;
+				const u32 addr = tiled_addr(VRAM_ORIGIN, (xb0 + x * 2) & 2047, y0 + y);
+				const u16 p = in_sdram(addr) ? ram_r16(addr) : 0;
+				if (video && !(p & 0x7fff))
+					continue; // black shows the video layer underneath (Wacky Race's movie window)
+				dst[x] = bgr555(p);
+			}
+		}
 	}
 
 	static const int window_regs[4] = { 0x170, 0x120, 0x128, 0x178 };
