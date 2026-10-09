@@ -193,6 +193,7 @@ private:
 
 	// FA display list queue HLE (see fa_queue_hle)
 	bool m_defer_irq = false;
+	bool m_hle_handled = false; // the last kick's lists completed through fa_queue_hle
 	u32 m_fa_handler = 0;
 	double m_fa_next_scan = 0;
 	u32 fa_find_irq_handler();

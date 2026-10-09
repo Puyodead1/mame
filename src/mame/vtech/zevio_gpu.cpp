@@ -307,6 +307,7 @@ bool zevio_gpu_device::fa_queue_hle()
 		return false;
 
 	wr32(list, 3);
+	m_hle_handled = true;
 	s32 count = s32(rd32(q + 0x18)) - 1;
 	if (count < 0)
 		count = 0;
@@ -347,6 +348,7 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 		if (data == 1)
 		{
 			const u64 px0 = m_work_px;
+			m_hle_handled = false;
 			m_defer_irq = true;
 			run_list(m_regs[0x28 / 4]);
 			while (fa_queue_hle())
@@ -363,7 +365,9 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 			const double now = machine().time().as_double();
 			m_px_debt = std::max(0.0, m_px_debt - (now - m_px_time) * RATE) + double(m_work_px - px0);
 			m_px_time = now;
-			if (m_px_debt > FREE && m_stall && !notiming)
+			// only when FA's queue was handled here: games whose own interrupt
+			// handler runs the engine (Bratz) must not be stalled in it
+			if (m_px_debt > FREE && m_stall && !notiming && m_hle_handled)
 			{
 				m_stall->spin_until_time(attotime::from_double(m_px_debt / RATE));
 				m_px_time = now + m_px_debt / RATE;
@@ -708,7 +712,8 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 	if (minx > maxx || miny > maxy)
 		return;
 	const float inv_area = 1.0f / area;
-	const bool ztest = BIT(s.w84, 0), zwrite = BIT(s.w84, 1) && !BIT(s.w88, 1), blend = BIT(s.w88, 1);
+	// 0x84: bit 0 depth test, bit 1 depth write, bit 4 colour write
+	const bool ztest = BIT(s.w84, 0), zwrite = BIT(s.w84, 1) && !BIT(s.w88, 1), blend = BIT(s.w88, 1), cwrite = BIT(s.w84, 4);
 	// barycentrics step linearly along a row
 	const float d0 = (b.y - c.y) * inv_area, d1 = (c.y - a.y) * inv_area;
 	for (int y = miny; y <= maxy; y++)
@@ -754,6 +759,8 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 			}
 			if (zwrite)
 				zb = z;
+			if (!cwrite)
+				continue;
 			if (blend || alpha < 1.0f || m_count_stats)
 				plot(s, x, y, z, r, g, bl, alpha, false);
 			else
@@ -765,6 +772,8 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 {
 	if (m_no3d) return;
+	if (!BIT(m_w84, 4) && !BIT(m_w84, 1))
+		return; // writes neither colour nor depth (Wacky Race's menu draws such a quad)
 	// clip against the near plane in eye space, then project
 	const float near_z = 1.0f / 4096.0f;
 	vertex_t in[3] = { a, b, c };
@@ -938,6 +947,8 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 		}
 		logerror("PRIM %08x tris %d pix %d x %.0f..%.0f y %.0f..%.0f z %.3f..%.3f 1c %06x 1e %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x clip %06x-%06x\n",
 				header, m_stat_tris - tri0, m_stat_pixels - pix0, x0, x1, y0, y1, z0, z1, m_w1c, m_w1e, m_w84, m_w88, m_w86, m_w87, m_w8d, m_clip0, m_clip1);
+		for (int i = 0; i < std::min(n, 4); i++)
+			logerror("  VTX %d hi %04x rgb %.2f %.2f %.2f uv %.3f %.3f lit %d\n", i, verts[i].hi, verts[i].r, verts[i].g, verts[i].b, verts[i].u, verts[i].v, verts[i].lit);
 		if (BIT(m_w1c, 6))
 			log_texture();
 	}
@@ -1139,8 +1150,8 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 	const double now = machine().time().as_double();
 	if (primlog_at >= 0 && now >= primlog_at && now < primlog_at + 0.05)
 	{
-		logerror("SPR %08x xy %d,%d wh %dx%d uv %08x col %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x 1c %06x 1e %06x\n",
-				header, x0, y0, w, h, uv, col, m_w84, m_w88, m_w86, m_w87, m_w8d, m_w1c, m_w1e);
+		logerror("SPR %08x xy %d,%d wh %dx%d uv %08x col %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x 1c %06x 1e %06x clip %06x-%06x 85 %06x raw %08x\n",
+				header, x0, y0, w, h, uv, col, m_w84, m_w88, m_w86, m_w87, m_w8d, m_w1c, m_w1e, m_clip0, m_clip1, m_w85, xy, m_w81);
 		if (BIT(flags, 0))
 			log_texture();
 	}

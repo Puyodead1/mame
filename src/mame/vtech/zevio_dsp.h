@@ -30,7 +30,8 @@ protected:
 	virtual void device_post_load() override;
 
 private:
-	enum : u32 { MSG = 0x104 / 4, DOORBELL = 0x108 / 4, REPLY = 0x110 / 4, STATUS = 0x114 / 4 };
+	// mailbox words, relative to 0x900A0100
+	enum : u32 { MSG = 0x04 / 4, DOORBELL = 0x08 / 4, REPLY = 0x10 / 4, STATUS = 0x14 / 4 };
 
 	u32 rd32(u32 addr) const;
 	u8 rd8(u32 addr) const { return rd32(addr & ~3) >> ((addr & 3) * 8); }

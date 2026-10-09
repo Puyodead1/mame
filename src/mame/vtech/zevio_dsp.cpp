@@ -51,6 +51,7 @@ DEFINE_DEVICE_TYPE(ZEVIO_DSP_HLE, zevio_dsp_hle_device, "zevio_dsp_hle", "Zevio 
 namespace {
 
 constexpr u32 MJP_PROGRAM_WORDS = 0x1ed0;
+constexpr u32 MJP_PROGRAM_WORDS_B = 0x1ea0; // Wacky Race: same protocol
 constexpr u32 CMD_BLOCK = 0x1c000;
 constexpr u32 MSG_BLOCK = 0x1c080;
 
@@ -88,16 +89,13 @@ std::vector<u8> fix_byte_stuffing(const std::vector<u8> &in)
 		if (b == 0xff && j + 1 < in.size())
 		{
 			const u8 n = in[j + 1];
-			if (n == 0x00 || (n >= 0xd0 && n <= 0xd7))
+			// the entropy data has no markers (and no EOI): every other 0xFF
+			// is data, including ones that look like RSTn or EOI
+			if (n == 0x00)
 			{
 				out.push_back(0xff);
 				out.push_back(n);
 				j += 2;
-			}
-			else if (n == 0xd9)
-			{
-				out.insert(out.end(), in.begin() + j, in.end());
-				return out;
 			}
 			else
 			{
@@ -303,7 +301,7 @@ void zevio_dsp_hle_device::post_message()
 void zevio_dsp_hle_device::command(u32 cmd)
 {
 	const u32 c = m_w + CMD_BLOCK;
-	if (m_prog_words != MJP_PROGRAM_WORDS)
+	if (m_prog_words != MJP_PROGRAM_WORDS && m_prog_words != MJP_PROGRAM_WORDS_B)
 	{
 		LOGMASKED(LOG_CMD, "DSP command %02x for unsupported program (%x words)\n", cmd, m_prog_words);
 		return;
@@ -349,7 +347,10 @@ void zevio_dsp_hle_device::command(u32 cmd)
 			m_playing = true;
 			m_paused = false;
 			m_awaiting_ack = false;
-			m_frame_timer->adjust(attotime::from_msec(5), 0, attotime::from_msec(2));
+			// decode at the movie's own rate: FA's driver reports "playing"
+			// between the first two frames and only polls every 10 ms
+			const attotime period = attotime::from_hz(std::max<u32>(fps, 1));
+			m_frame_timer->adjust(period, 0, period);
 		}
 		break;
 	}
@@ -445,7 +446,7 @@ bool zevio_dsp_hle_device::decode_frame()
 	wr32(m + 16, m_aud_wp[0]);
 	wr32(m + 20, asize);
 	wr32(m + 24, 0);
-	wr32(m + 28, frame_no);
+	wr32(m + 28, frame_no + 1); // frames count from 1: FA pauses when this reaches its target (0 = none)
 	wr32(m + 32, 0);
 	wr32(m + 36, vsize);
 	wr32(m + 40, 0);
