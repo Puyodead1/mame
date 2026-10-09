@@ -60,6 +60,9 @@ public:
 	// dynamic recompiler for ARM state (arm7drc.hxx); needs direct fetch and
 	// is not used with the debugger
 	void set_drc(bool enable) { m_drc_requested = enable; }
+	// idle loop: a recompiled block starting at pc ends the timeslice when the
+	// code from sig_start matches sig (an idle task spinning until interrupted)
+	void add_idle_loop(offs_t pc, offs_t sig_start, std::vector<uint32_t> sig) { m_idle_loops.push_back({ pc, sig_start, std::move(sig) }); }
 
 	// fast RAM: physical ranges of plain little-endian RAM accessed through a
 	// host pointer instead of the address space (no taps or watchpoints there)
@@ -282,6 +285,8 @@ protected:
 
 	// dynamic recompiler
 	bool m_drc_requested = false;
+	struct idle_loop { offs_t pc, sig_start; std::vector<uint32_t> sig; };
+	std::vector<idle_loop> m_idle_loops;
 	bool m_drc = false;
 	bool m_drc_dirty = true;
 	std::unique_ptr<drc_cache> m_drc_cache;
