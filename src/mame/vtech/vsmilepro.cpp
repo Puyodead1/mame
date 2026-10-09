@@ -841,8 +841,11 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::joy_cb)
 		// detuned from the 100 Hz tick so samples are not aligned with its IRQ
 		if (m_joy_timer->period() != attotime::from_hz(97))
 			m_joy_timer->adjust(attotime::from_hz(97), 0, attotime::from_hz(97));
+		// ZPROF_FROM=<seconds> starts sampling later
+		static const double from = getenv("ZPROF_FROM") ? atof(getenv("ZPROF_FROM")) : 0.0;
 		const u32 pc = m_maincpu->pc();
-		m_prof[pc < 0x1000 ? pc : (pc & ~0x3f)]++;
+		if (machine().time().as_double() >= from)
+			m_prof[pc < 0x1000 ? pc : (pc & ~0x3f)]++;
 	}
 	for (int port = 0; port < 2; port++)
 	{
@@ -926,6 +929,9 @@ void vsmilpro_state::spi_transfer(int nbytes)
 // SST25VF512A-like serial flash, one command per frame (chip select per frame)
 u8 vsmilpro_state::sflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 {
+	// SO is not driven during opcode/address bytes and reads 0: FA's AAI
+	// program waits for bit 0 to clear after a 2-byte 03 00 frame
+	static constexpr u8 UNDRIVEN = 0x00;
 	cmd.push_back(data);
 	const u8 op = cmd[0];
 	const u32 addr = cmd.size() > 3 ? ((cmd[1] << 16) | (cmd[2] << 8) | cmd[3]) & (SFLASH_SIZE - 1) : 0;
@@ -937,29 +943,29 @@ u8 vsmilpro_state::sflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 		const int first = (op == 0x0b) ? 5 : 4;
 		if (index >= first)
 			return m_sflash[(addr + index - first) & (SFLASH_SIZE - 1)];
-		return 0xff;
+		return UNDRIVEN;
 	}
 	case 0x05: // read status
-		return index >= 1 ? m_sflash_status : 0xff;
-	case 0x06: m_sflash_status |= 0x02; return 0xff; // write enable
-	case 0x04: m_sflash_status &= ~0x02; return 0xff; // write disable
-	case 0x50: return 0xff; // enable write status
-	case 0x01: if (index == 1) m_sflash_status = (m_sflash_status & 0x03) | (data & 0xbc); return 0xff;
+		return index >= 1 ? m_sflash_status : UNDRIVEN;
+	case 0x06: m_sflash_status |= 0x02; return UNDRIVEN; // write enable
+	case 0x04: m_sflash_status &= ~0x02; return UNDRIVEN; // write disable
+	case 0x50: return UNDRIVEN; // enable write status
+	case 0x01: if (index == 1) m_sflash_status = (m_sflash_status & 0x03) | (data & 0xbc); return UNDRIVEN;
 	case 0x90: case 0xab: // read id: manufacturer, device, repeated
 		if (index >= 4)
 			return ((index - 4) & 1) ? 0x48 : 0xbf; // SST25VF512A
-		return 0xff;
+		return UNDRIVEN;
 	case 0x9f: // JEDEC id
 		if (index == 1) return 0xbf;
 		if (index == 2) return 0x48;
-		return 0xff;
+		return UNDRIVEN;
 	case 0x02: // byte program
 		if (index == 4 && (m_sflash_status & 2))
 		{
 			m_sflash[addr] &= data;
 			m_sflash_status &= ~0x02;
 		}
-		return 0xff;
+		return UNDRIVEN;
 	case 0xaf: // auto address increment program
 		if (index == 4 && (m_sflash_status & 2))
 		{
@@ -968,7 +974,7 @@ u8 vsmilpro_state::sflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 		}
 		else if (cmd.size() == 2 && index == 1)
 			m_sflash[m_sflash_aai_addr++ & (SFLASH_SIZE - 1)] &= data;
-		return 0xff;
+		return UNDRIVEN;
 	case 0x20: case 0xd7: // 4K sector erase
 		if (index == 3 && (m_sflash_status & 2))
 		{
@@ -976,7 +982,7 @@ u8 vsmilpro_state::sflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 			std::fill_n(&m_sflash[a], 0x1000, 0xff);
 			m_sflash_status &= ~0x02;
 		}
-		return 0xff;
+		return UNDRIVEN;
 	case 0x52: case 0xd8: // 32K block erase
 		if (index == 3 && (m_sflash_status & 2))
 		{
@@ -984,18 +990,18 @@ u8 vsmilpro_state::sflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 			std::fill_n(&m_sflash[a], 0x8000, 0xff);
 			m_sflash_status &= ~0x02;
 		}
-		return 0xff;
+		return UNDRIVEN;
 	case 0x60: case 0xc7: // chip erase
 		if (index == 0 && (m_sflash_status & 2))
 		{
 			std::fill_n(&m_sflash[0], SFLASH_SIZE, 0xff);
 			m_sflash_status &= ~0x02;
 		}
-		return 0xff;
+		return UNDRIVEN;
 	default:
 		if (index == 0)
 			LOGMASKED(LOG_UNKNOWN, "%08x: serial flash unknown command %02x\n", m_maincpu->pc(), op);
-		return 0xff;
+		return UNDRIVEN;
 	}
 }
 
@@ -1899,6 +1905,7 @@ void vsmilpro_state::vsmilpro_map(address_map &map)
 
 void vsmilpro_state::machine_start()
 {
+	m_gpu->set_stall_cpu(m_maincpu); // waits out the engine's drawing time
 	m_sflash = std::make_unique<u8[]>(SFLASH_SIZE);
 	std::fill_n(&m_sflash[0], SFLASH_SIZE, 0xff);
 	if (m_spi_region)
@@ -2118,6 +2125,10 @@ void vsmilpro_state::vsmilpro(machine_config &config)
 	// the ARM926 has caches, so the ARM7 prefetch buffer model is not needed
 	m_maincpu->set_direct_fetch(true);
 	m_maincpu->set_drc(!getenv("VFLASH_NO_DRC"));
+	// the boot ROM kernel's idle task (copied to 0x10010994) counts forever
+	m_maincpu->add_idle_loop(0x100109a4, 0x10010994, {
+			0xe3a03000, 0xe5cd3007, 0xe3a03000, 0xe58d3000, 0xe59d3000, 0xe35300fe, 0x9a000000, 0xeafffff7,
+			0xe5dd3007, 0xe2833001, 0xe5cd3007, 0xe59d3000, 0xe2833001, 0xe58d3000, 0xeafffff4 });
 	m_maincpu->set_addrmap(AS_PROGRAM, &vsmilpro_state::vsmilpro_map);
 
 	NVRAM(config, m_nvram, nvram_device::DEFAULT_NONE);

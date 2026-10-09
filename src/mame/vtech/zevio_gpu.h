@@ -160,6 +160,15 @@ private:
 	std::condition_variable m_cv;
 	std::deque<std::vector<rcmd>> m_jobs;
 	bool m_busy = false, m_quit = false;
+
+	// drawing time: a CPU that kicks large batches waits as if the engine
+	// were drawing, so loops that redraw whenever it is done run at a real rate
+	device_execute_interface *m_stall = nullptr;
+	u64 m_work_px = 0; // pixels queued, roughly
+	double m_px_debt = 0, m_px_time = 0;
+public:
+	void set_stall_cpu(device_execute_interface *cpu) { m_stall = cpu; }
+private:
 	u64 m_seq_submitted = 0, m_seq_done = 0, m_fence = 0; // job counts, under m_mutex
 	std::vector<std::array<int, 4>> m_drawn; // areas drawn since the last fence
 	std::atomic<u32> m_pal_gen{ 0 };       // bumped when a palette may have changed

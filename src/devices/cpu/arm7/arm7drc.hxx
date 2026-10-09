@@ -290,6 +290,31 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 		UML_HASH(block, mode, startpc);
 		s_drc_compiles++;
 
+		for (const auto &il : m_idle_loops)
+		{
+			if (il.pc != startpc)
+				continue;
+			bool match = true;
+			for (size_t i = 0; i < il.sig.size() && match; i++)
+			{
+				offs_t a = il.sig_start + i * 4;
+				if ((m_control & COPRO_CTRL_MMU_EN) && !translate_fast(a, ARM7_TLB_ABORT_P | ARM7_TLB_READ))
+					match = false;
+				else
+				{
+					const uint8_t *const p = fastram_ptr(a);
+					match = p && *reinterpret_cast<const uint32_t *>(p) == il.sig[i];
+				}
+			}
+			if (match)
+			{
+				// nothing to do until an interrupt: the first instruction's
+				// cycle check ends the timeslice
+				UML_MOV(block, I0, 0);
+				store(&m_icount, I0);
+			}
+		}
+
 		offs_t pc = startpc;
 		bool ended = false;
 		for (int n = 0; n < DRC_MAX_INSNS && !ended; n++, pc += 4)

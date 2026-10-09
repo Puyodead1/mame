@@ -346,6 +346,7 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 	case 0x00 / 4:
 		if (data == 1)
 		{
+			const u64 px0 = m_work_px;
 			m_defer_irq = true;
 			run_list(m_regs[0x28 / 4]);
 			while (fa_queue_hle())
@@ -353,6 +354,21 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 			submit();
 			m_defer_irq = false;
 			update_irq();
+
+			// pixels drawn beyond what the engine could have done by now stall
+			// the CPU (as a busy bus would)
+			constexpr double RATE = 100e6; // pixels per second; TODO: measure
+			constexpr double FREE = 20000; // up to 0.2 ms ahead is free
+			static const bool notiming = getenv("ZGPU_NOTIMING") != nullptr;
+			const double now = machine().time().as_double();
+			m_px_debt = std::max(0.0, m_px_debt - (now - m_px_time) * RATE) + double(m_work_px - px0);
+			m_px_time = now;
+			if (m_px_debt > FREE && m_stall && !notiming)
+			{
+				m_stall->spin_until_time(attotime::from_double(m_px_debt / RATE));
+				m_px_time = now + m_px_debt / RATE;
+				m_px_debt = 0;
+			}
 		}
 		else if (data == 3)
 		{
@@ -1327,6 +1343,21 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 	}
 	if (c.ymin > c.ymax)
 		return;
+	{
+		// rough pixel count for the engine's drawing time
+		int w = 1;
+		if (c.type == CMD_TRI3D || c.type == CMD_TRI2D)
+		{
+			const float x0 = std::max<float>(std::min({ c.v[0].x, c.v[1].x, c.v[2].x }), c.st.clip0 & 0xfff);
+			const float x1 = std::min<float>(std::max({ c.v[0].x, c.v[1].x, c.v[2].x }), c.st.clip1 & 0xfff);
+			w = std::max(0, int(x1 - x0) + 1) / 2;
+		}
+		else if (c.type == CMD_SPRITE || c.type == CMD_FILL)
+			w = c.a1 & 0xffff;
+		else if (c.type == CMD_ZCLEAR)
+			w = 0;
+		m_work_px += u64(c.ymax - c.ymin + 1) * w;
+	}
 	if (c.type != CMD_ZCLEAR)
 	{
 		// areas drawn since the last frame fence
