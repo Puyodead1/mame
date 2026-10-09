@@ -89,8 +89,11 @@ zevio_gpu_device::zevio_gpu_device(const machine_config &mconfig, const char *ta
 void zevio_gpu_device::device_start()
 {
 	m_zbuf = std::make_unique<float[]>(ZW * ZH);
-	m_bands = std::clamp<int>(std::thread::hardware_concurrency(), 1, MAX_BANDS);
-	m_queue = (m_bands > 1) ? osd_work_queue_alloc(WORK_QUEUE_FLAG_MULTI | WORK_QUEUE_FLAG_HIGH_FREQ) : nullptr;
+	// more bands than threads so uneven rows balance out; a HIGH_FREQ queue
+	// would be capped at four threads
+	const int hw = std::max<int>(std::thread::hardware_concurrency(), 1);
+	m_bands = std::clamp<int>(hw * 3, 1, MAX_BANDS);
+	m_queue = (hw > 1) ? osd_work_queue_alloc(WORK_QUEUE_FLAG_MULTI) : nullptr;
 	m_async = !getenv("ZGPU_SYNC");
 	if (m_async)
 		m_thread = std::thread([this] { render_thread(); });
@@ -410,7 +413,7 @@ bool zevio_gpu_device::in_clip(const rstate &s, int x, int y) const
 }
 
 // sample the texture; u/v normalized (3D) or in texels (2D)
-bool zevio_gpu_device::texel(const rstate &s, rcache &pc, float u, float v, bool normalized, float &r, float &g, float &b, float &a) const
+ATTR_FORCE_INLINE bool zevio_gpu_device::texel(const rstate &s, rcache &pc, float u, float v, bool normalized, float &r, float &g, float &b, float &a) const
 {
 	const u32 mode = s.w86;
 	const int w = 8 << (mode & 7), h = 8 << ((mode >> 3) & 7);
@@ -466,7 +469,7 @@ bool zevio_gpu_device::texel(const rstate &s, rcache &pc, float u, float v, bool
 // raw texel after the CLUT: -1 if transparent (palette index 0; for
 // non-ARGB4444 textures also 0x0000 and bit 15 set: Bratz panel backgrounds
 // are 0x0000, Cars uses 0x8000 billboards, 0xFC1F text boxes, 0xFFFF icons)
-int zevio_gpu_device::texel_raw(const rstate &s, rcache &pc, int tu, int tv) const
+ATTR_FORCE_INLINE int zevio_gpu_device::texel_raw(const rstate &s, rcache &pc, int tu, int tv) const
 {
 	const u32 mode = s.w86;
 	tu &= (8 << (mode & 7)) - 1;
@@ -514,7 +517,7 @@ int zevio_gpu_device::texel_raw(const rstate &s, rcache &pc, int tu, int tv) con
 	return c;
 }
 
-bool zevio_gpu_device::texel_point(const rstate &s, rcache &pc, int tu, int tv, float &r, float &g, float &b, float &a) const
+ATTR_FORCE_INLINE bool zevio_gpu_device::texel_point(const rstate &s, rcache &pc, int tu, int tv, float &r, float &g, float &b, float &a) const
 {
 	const int t = texel_raw(s, pc, tu, tv);
 	if (t < 0)
@@ -689,6 +692,7 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 	if (minx > maxx || miny > maxy)
 		return;
 	const float inv_area = 1.0f / area;
+	const bool ztest = BIT(s.w84, 0), zwrite = BIT(s.w84, 1) && !BIT(s.w88, 1), blend = BIT(s.w88, 1);
 	// barycentrics step linearly along a row
 	const float d0 = (b.y - c.y) * inv_area, d1 = (c.y - a.y) * inv_area;
 	for (int y = miny; y <= maxy; y++)
@@ -712,6 +716,10 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 			inside = true;
 			const float iw = w0 * a.w + w1 * b.w + w2 * c.w;
 			const float z = 1.0f / iw;
+			// depth test first: occluded pixels need no texels (same result as plot)
+			float &zb = m_zbuf[y * ZW + x];
+			if (ztest && z > zb)
+				continue;
 			float r = w0 * a.r + w1 * b.r + w2 * c.r;
 			float g = w0 * a.g + w1 * b.g + w2 * c.g;
 			float bl = w0 * a.b + w1 * b.b + w2 * c.b;
@@ -728,7 +736,12 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 				bl *= tb;
 				alpha = ta;
 			}
-			plot(s, x, y, z, r, g, bl, alpha, true);
+			if (zwrite)
+				zb = z;
+			if (blend || alpha < 1.0f || m_count_stats)
+				plot(s, x, y, z, r, g, bl, alpha, false);
+			else
+				vram_w(x, y, f_to_bgr555(r, g, bl));
 		}
 	}
 }
@@ -1167,6 +1180,55 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 		return;
 	}
 
+	// blended and ARGB4444 sprites: the same in integers (8-bit weights)
+	{
+		const int cx0 = std::max({ int(s.clip0 & 0xfff), x0, 0 });
+		const int cy0 = std::max({ int((s.clip0 >> 12) & 0xfff), y0, 0, band_y0 });
+		const int cx1 = std::min({ int(s.clip1 & 0xfff), x0 + w - 1, 1023 });
+		const int cy1 = std::min({ int((s.clip1 >> 12) & 0xfff), y0 + h - 1, band_y1 - 1 });
+		const int mr = (col & 0xff) + 1, mg = ((col >> 8) & 0xff) + 1, mb = ((col >> 16) & 0xff) + 1;
+		const bool blend = BIT(s.w88, 1), argb4444 = BIT(s.w86, 8);
+		const int fr = (s.w8d & 0xff) + 1, fg = ((s.w8d >> 8) & 0xff) + 1, fb = ((s.w8d >> 16) & 0xff) + 1;
+		for (int y = cy0; y <= cy1; y++)
+			for (int x = cx0; x <= cx1; x++)
+			{
+				int r, g, b, a = 256; // 5-bit colour channels scaled by 8, alpha 0-256
+				if (BIT(flags, 0))
+				{
+					const int t = texel_raw(s, pc, int(uv & 0xffff) + (x - x0), int(uv >> 16) + (y - y0));
+					if (t < 0)
+						continue;
+					if (argb4444)
+					{
+						a = ((t >> 12) & 15) * 256 / 15;
+						if (!a)
+							continue;
+						r = (t & 15) * 255 / 15; g = ((t >> 4) & 15) * 255 / 15; b = ((t >> 8) & 15) * 255 / 15;
+					}
+					else
+					{
+						r = (t & 0x1f) * 255 / 31; g = ((t >> 5) & 0x1f) * 255 / 31; b = ((t >> 10) & 0x1f) * 255 / 31;
+					}
+					r = (r * mr) >> 8; g = (g * mg) >> 8; b = (b * mb) >> 8;
+				}
+				else
+				{
+					r = col & 0xff; g = (col >> 8) & 0xff; b = (col >> 16) & 0xff;
+				}
+				if (blend || a < 256)
+				{
+					const u16 d = vram_r(x, y);
+					const int dr = (d & 0x1f) * 255 / 31, dg = ((d >> 5) & 0x1f) * 255 / 31, db = ((d >> 10) & 0x1f) * 255 / 31;
+					const int kr = blend ? (fr * a) >> 8 : a, kg = blend ? (fg * a) >> 8 : a, kb = blend ? (fb * a) >> 8 : a;
+					r = (r * kr + dr * (256 - kr)) >> 8;
+					g = (g * kg + dg * (256 - kg)) >> 8;
+					b = (b * kb + db * (256 - kb)) >> 8;
+				}
+				vram_w(x, y, 0x8000 | (((b * 31 + 127) / 255) << 10) | (((g * 31 + 127) / 255) << 5) | ((r * 31 + 127) / 255));
+			}
+		return;
+	}
+
 	const float cr = (col & 0xff) / 255.0f, cg = ((col >> 8) & 0xff) / 255.0f, cb = ((col >> 16) & 0xff) / 255.0f;
 	for (int j = std::max(0, band_y0 - y0); j < std::min(h, band_y1 - y0); j++)
 		for (int i = 0; i < w; i++)
@@ -1265,6 +1327,23 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 	}
 	if (c.ymin > c.ymax)
 		return;
+	if (c.type != CMD_ZCLEAR)
+	{
+		// areas drawn since the last frame fence
+		const std::array<int, 4> r = (c.type == CMD_FILL)
+				? std::array<int, 4>{ int(c.a0 & 0xffff), c.ymin, int(c.a0 & 0xffff) + int(c.a1 & 0xffff) - 1, c.ymax }
+				: std::array<int, 4>{ int(c.st.clip0 & 0xfff), c.ymin, int(c.st.clip1 & 0xfff), c.ymax };
+		if (m_drawn.empty() || m_drawn.back() != r)
+		{
+			if (m_drawn.size() >= 64)
+			{
+				for (auto &d : m_drawn)
+					m_drawn[0] = { std::min(m_drawn[0][0], d[0]), std::min(m_drawn[0][1], d[1]), std::max(m_drawn[0][2], d[2]), std::max(m_drawn[0][3], d[3]) };
+				m_drawn.resize(1);
+			}
+			m_drawn.push_back(r);
+		}
+	}
 	if ((c.type == CMD_TRI3D || c.type == CMD_POINT) && BIT(c.st.w84, 1))
 	{
 		m_zdirty_y0 = std::min(m_zdirty_y0, c.ymin);
@@ -1296,6 +1375,7 @@ void zevio_gpu_device::submit()
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_jobs.emplace_back(std::move(m_cmds));
+		m_seq_submitted++;
 	}
 	m_cmds.clear();
 	m_cv.notify_all();
@@ -1308,6 +1388,26 @@ void zevio_gpu_device::sync()
 		return;
 	std::unique_lock<std::mutex> lock(m_mutex);
 	m_cv.wait(lock, [this] { return m_jobs.empty() && !m_busy; });
+}
+
+// once per displayed frame: the display shows the previous frame, so only the
+// work queued before then has to be finished and the CPU keeps running while
+// the current frame renders
+bool zevio_gpu_device::frame_fence(int x0, int y0, int x1, int y1)
+{
+	submit();
+	bool overlap = false;
+	for (const auto &r : m_drawn)
+		if (r[0] <= x1 && r[2] >= x0 && r[1] <= y1 && r[3] >= y0)
+			overlap = true;
+	m_drawn.clear();
+	if (!m_async)
+		return false;
+	std::unique_lock<std::mutex> lock(m_mutex);
+	const u64 target = overlap ? m_seq_submitted : m_fence;
+	m_cv.wait(lock, [this, target] { return m_seq_done >= target; });
+	m_fence = m_seq_submitted;
+	return !overlap; // after a full wait the current frame is complete
 }
 
 void zevio_gpu_device::render_thread()
@@ -1324,6 +1424,7 @@ void zevio_gpu_device::render_thread()
 		lock.unlock();
 		exec_batch(cmds);
 		lock.lock();
+		m_seq_done++;
 		m_busy = false;
 		m_cv.notify_all();
 	}
@@ -1333,6 +1434,7 @@ void *zevio_gpu_device::band_cb(void *param, int threadid)
 {
 	auto *const job = reinterpret_cast<band_job *>(param);
 	job->gpu->exec_band(*job->cmds, job->y0, job->y1);
+	job->left->fetch_sub(1, std::memory_order_release);
 	return nullptr;
 }
 
@@ -1352,12 +1454,19 @@ void zevio_gpu_device::exec_batch(const std::vector<rcmd> &cmds)
 		exec_band(cmds, 0, 1 << 20);
 		return;
 	}
-	const int bands = std::min(m_bands, rows / 16);
+	const int bands = std::min(m_bands, rows / 8);
 	band_job jobs[MAX_BANDS];
+	std::atomic<int> left(bands);
 	for (int i = 0; i < bands; i++)
-		jobs[i] = { this, &cmds, ymin + rows * i / bands, ymin + rows * (i + 1) / bands };
+		jobs[i] = { this, &cmds, ymin + rows * i / bands, ymin + rows * (i + 1) / bands, &left };
 	osd_work_item_queue_multiple(m_queue, band_cb, bands, jobs, sizeof(band_job), WORK_ITEM_FLAG_AUTO_RELEASE);
-	osd_work_queue_wait(m_queue, osd_ticks_per_second() * 10);
+	// the queue wait can return before the last item finishes: count them ourselves
+	while (left.load(std::memory_order_acquire))
+	{
+		osd_work_queue_wait(m_queue, osd_ticks_per_second() / 1000);
+		if (left.load(std::memory_order_acquire))
+			std::this_thread::yield();
+	}
 }
 
 void zevio_gpu_device::exec_band(const std::vector<rcmd> &cmds, int y0, int y1)

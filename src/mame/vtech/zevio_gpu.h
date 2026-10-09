@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -102,6 +103,9 @@ private:
 	*/
 public:
 	void sync();
+	// once per frame: wait for the work queued before the previous fence (or for
+	// everything if newer work draws into the given area); false if everything was finished (or rendering is synchronous)
+	bool frame_fence(int x0, int y0, int x1, int y1);
 private:
 	struct rstate
 	{
@@ -143,8 +147,8 @@ private:
 	void draw_zclear(const rcmd &c, int y0, int y1);
 	int m_zdirty_y0 = 0, m_zdirty_y1 = -1; // rows written with depth since the last clear
 
-	static constexpr int MAX_BANDS = 16;
-	struct band_job { zevio_gpu_device *gpu; const std::vector<rcmd> *cmds; int y0, y1; };
+	static constexpr int MAX_BANDS = 48;
+	struct band_job { zevio_gpu_device *gpu; const std::vector<rcmd> *cmds; int y0, y1; std::atomic<int> *left; };
 	static void *band_cb(void *param, int threadid);
 	std::vector<rcmd> m_cmds;              // being recorded
 	osd_work_queue *m_queue = nullptr;
@@ -156,6 +160,8 @@ private:
 	std::condition_variable m_cv;
 	std::deque<std::vector<rcmd>> m_jobs;
 	bool m_busy = false, m_quit = false;
+	u64 m_seq_submitted = 0, m_seq_done = 0, m_fence = 0; // job counts, under m_mutex
+	std::vector<std::array<int, 4>> m_drawn; // areas drawn since the last fence
 	std::atomic<u32> m_pal_gen{ 0 };       // bumped when a palette may have changed
 
 	devcb_write_line m_irq_cb;
