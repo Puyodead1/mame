@@ -1966,6 +1966,9 @@ void vsmilpro_state::machine_start()
 	save_item(NAME(m_gpio_dir));
 	save_item(NAME(m_gpio_out));
 	save_item(NAME(m_timer_regs));
+	save_item(NAME(m_ch1_start));
+	save_item(NAME(m_ch1_period_ticks));
+	save_item(NAME(m_ch1_running));
 	save_item(NAME(m_spi_regs));
 	save_item(NAME(m_disp_regs));
 	save_item(NAME(m_disp_status));
