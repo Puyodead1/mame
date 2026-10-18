@@ -71,7 +71,7 @@ inline u16 f_to_bgr555(float r, float g, float b)
 	const int ri = std::clamp(int(r * 31.0f + 0.5f), 0, 31);
 	const int gi = std::clamp(int(g * 31.0f + 0.5f), 0, 31);
 	const int bi = std::clamp(int(b * 31.0f + 0.5f), 0, 31);
-	return 0x8000 | (bi << 10) | (gi << 5) | ri;
+	return (bi << 10) | (gi << 5) | ri; // bit 15 clear: the display treats a set bit 15 as transparent
 }
 
 } // anonymous namespace
@@ -1185,7 +1185,7 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 		const int cy1 = std::min({ int((s.clip1 >> 12) & 0xfff), y0 + h - 1, band_y1 - 1 });
 		const int mr = (col & 0xff) + 1, mg = ((col >> 8) & 0xff) + 1, mb = ((col >> 16) & 0xff) + 1;
 		const bool modulate = (col & 0xffffff) != 0xffffff;
-		const u16 flat = 0x8000 | (((col >> 19) & 0x1f) << 10) | (((col >> 11) & 0x1f) << 5) | ((col >> 3) & 0x1f);
+		const u16 flat = (((col >> 19) & 0x1f) << 10) | (((col >> 11) & 0x1f) << 5) | ((col >> 3) & 0x1f);
 		for (int y = cy0; y <= cy1; y++)
 			for (int x = cx0; x <= cx1; x++)
 			{
@@ -1198,7 +1198,6 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 					t = r;
 					if (modulate)
 						t = (((((t >> 10) & 0x1f) * mb) >> 8) << 10) | (((((t >> 5) & 0x1f) * mg) >> 8) << 5) | (((t & 0x1f) * mr) >> 8);
-					t |= 0x8000;
 				}
 				else
 					t = flat;
@@ -1251,7 +1250,7 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 					g = (g * kg + dg * (256 - kg)) >> 8;
 					b = (b * kb + db * (256 - kb)) >> 8;
 				}
-				vram_w(x, y, 0x8000 | (((b * 31 + 127) / 255) << 10) | (((g * 31 + 127) / 255) << 5) | ((r * 31 + 127) / 255));
+				vram_w(x, y, (((b * 31 + 127) / 255) << 10) | (((g * 31 + 127) / 255) << 5) | ((r * 31 + 127) / 255));
 			}
 		return;
 	}

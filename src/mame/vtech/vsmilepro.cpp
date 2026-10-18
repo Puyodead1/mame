@@ -101,11 +101,15 @@ public:
 protected:
 	virtual void machine_start() override ATTR_COLD;
 	virtual void machine_reset() override ATTR_COLD;
+	void soc_reset();
 
 private:
 	static constexpr u32 SDRAM_BASE = 0x10000000;
 	static constexpr u32 SDRAM_SIZE = 0x01000000;
 	static constexpr u32 VRAM_ORIGIN = 0x0ffd0000;
+	// display +0x010 at power-on: bit 16 set (16-bit layer tiled). Inferred: no
+	// game code writes the register, and the boot ROM only ever clears bit 16
+	static constexpr u32 DISP_010_RESET = 0x00010000;
 	static constexpr u32 PERIPH_CLOCK = 37'500'000; // PLL out3 at boot settings
 	static constexpr u32 SFLASH_SIZE = 0x10000;
 
@@ -467,6 +471,10 @@ void vsmilpro_state::sysctl_w(offs_t offset, u32 data, u32 mem_mask)
 			// resume handler. TODO: wake on the power key instead of at once
 			logerror("%08x: standby, waking with resume flag\n", m_maincpu->pc());
 			m_resume = true;
+			// waking resets the on-chip blocks; among others this restores
+			// display +0x010 bit 16, which every ROM menu screen clears and FA
+			// needs set (it never writes it)
+			soc_reset();
 			m_maincpu->pulse_input_line(INPUT_LINE_RESET, attotime::zero);
 		}
 		break;
@@ -1177,7 +1185,13 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 				{
 					u32 *dst = &bitmap.pix(y);
 					for (int x = std::max(x0, cliprect.left()); x <= std::min(x1, cliprect.right()); x++)
-						dst[x] = bgr555(ram_r16(yb + ((y - y0) * w + (x - x0)) * 2));
+					{
+						// bit 15 set = transparent (the ROM's splash pixels all have it clear;
+						// homebrew drawn with it set shows only the backdrop on hardware)
+						const u16 p = ram_r16(yb + ((y - y0) * w + (x - x0)) * 2);
+						if (!BIT(p, 15))
+							dst[x] = bgr555(p);
+					}
 				}
 		}
 		else if (w > 2 && in_sdram(yb) && in_sdram(ub) && in_sdram(vb))
@@ -1199,11 +1213,35 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 			}
 	}
 
-	// main 16-bit layer from the tiled surface at the display start address,
-	// over the video layer
+	// main 16-bit layer at the display start address, over the video layer
+	// (+0x100 bit 4; FA enables 0x18). +0x010 bit 16 selects the layout: set (the
+	// power-on value, never written by FA) = the GPU's tiled surface; clear = linear
+	// lines one window wide, which is what the boot ROM's UI draws (UI_fillRect:
+	// buf + 2 * (320 * y + x)) after its UI screens clear the bit (ROM 0x10025EAC).
+	// Confirmed on hardware: tiled pixels shown after the menu came out as lines.
 	const bool video = BIT(enable, 5);
-	// (+0x100 bit 4; FA enables 0x18, the boot ROM menu only tile layers)
-	if (BIT(gregs[0x100 / 4], 4))
+	if (BIT(gregs[0x100 / 4], 4) && !BIT(gregs[0x010 / 4], 16))
+	{
+		const u32 start = gregs[0x160 / 4];
+		const u32 a = gregs[0x130 / 4], b = gregs[0x134 / 4];
+		const int x0 = a & 0x7ff, y0 = (a >> 16) & 0x7ff, x1 = b & 0x7ff;
+		const int w = x1 - x0 + 1;
+		if (w > 0)
+			for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
+			{
+				u32 *dst = &bitmap.pix(y);
+				for (int x = cliprect.left(); x <= cliprect.right(); x++)
+				{
+					if (!in_window(gregs, 0x130, x, y))
+						continue;
+					const u32 addr = start + ((y - y0) * w + (x - x0)) * 2;
+					const u16 p = in_sdram(addr) ? ram_r16(addr) : 0x8000;
+					if (!BIT(p, 15)) // bit 15 set = transparent
+						dst[x] = bgr555(p);
+				}
+			}
+	}
+	else if (BIT(gregs[0x100 / 4], 4))
 	{
 		const u32 start = gregs[0x160 / 4];
 		const u32 off = start - VRAM_ORIGIN;
@@ -1218,6 +1256,8 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 					continue;
 				const u32 addr = tiled_addr(VRAM_ORIGIN, (xb0 + x * 2) & 2047, y0 + y);
 				const u16 p = in_sdram(addr) ? ram_r16(addr) : 0;
+				if (BIT(p, 15))
+					continue; // transparent: confirmed on hardware with CPU-drawn pixels
 				if (video && !(p & 0x7fff))
 					continue; // black shows the video layer underneath (Wacky Race's movie window)
 				dst[x] = bgr555(p);
@@ -1993,27 +2033,26 @@ void vsmilpro_state::machine_start()
 	save_pointer(NAME(m_dsp_mem), 0x80000);
 }
 
-void vsmilpro_state::machine_reset()
+void vsmilpro_state::soc_reset()
 {
+	// on-chip blocks: reset at power-on and again when the chip wakes from
+	// standby (the ROM's standby routine puts SDRAM in self-refresh, gates the
+	// clocks and writes 0x900A0008 = 1; wake goes through the reset vector with
+	// "resume" in the reset cause register). External chips and the always-on
+	// block keep their state across standby.
 	m_irq_line = m_fiq_line = -1;
 	m_int_raw = m_int_pending = m_int_latched = 0;
 	m_int_enable[0] = m_int_enable[1] = 0;
 	std::fill(std::begin(m_int_regs), std::end(m_int_regs), 0);
 	std::fill(std::begin(m_sysctl), std::end(m_sysctl), 0);
 	std::fill(std::begin(m_pll), std::end(m_pll), 0);
-	std::fill(std::begin(m_rtc), std::end(m_rtc), 0);
-	// The always-on block survives power-off; the ROM marks it with 0xC01DB007
-	// after the first cold start and otherwise powers down until a key press
-	m_rtc[0x88 / 4] = 0xc01db007;
-	// +0x8C = 0x1230FFAB records a power-key wake-up; without it the startup
-	// task treats the boot as spurious and returns to standby
-	m_rtc[0x8c / 4] = 0x1230ffab;
 	for (int b = 0; b < 2; b++)
 		for (int l = 0; l < 4; l++)
 			m_gpio_dir[b][l] = m_gpio_out[b][l] = 0;
 	std::fill(std::begin(m_timer_regs), std::end(m_timer_regs), 0);
 	std::fill(std::begin(m_spi_regs), std::end(m_spi_regs), 0);
 	std::fill(std::begin(m_disp_regs), std::end(m_disp_regs), 0);
+	m_disp_regs[0x010 / 4] = DISP_010_RESET;
 	std::fill(std::begin(m_bcdma_regs), std::end(m_bcdma_regs), 0);
 	m_bcdma_busy = 0;
 	for (auto &t : m_bcdma_timer)
@@ -2021,10 +2060,12 @@ void vsmilpro_state::machine_reset()
 	std::fill(std::begin(m_dcdma_regs), std::end(m_dcdma_regs), 0);
 	std::fill(std::begin(m_cd_regs), std::end(m_cd_regs), 0);
 	m_disp_status = 0;
-	m_sflash_status = 0;
-	m_sflash_aai_addr = 0;
 	m_ch1_running = false;
 	m_ch1_period_ticks = 1;
+	// UARTs come up with IER = 0 and empty FIFOs. A game started from the ROM
+	// menu depends on this: the menu leaves UART1 IER = 1 and the detected
+	// controller keeps sending reports, but FA enables IRQ 2 before it installs
+	// its UART1 receive callback, so stale bytes would hold the level IRQ forever
 	for (auto &u : m_uart)
 	{
 		u.ier = u.lcr = u.mcr = u.scr = u.dll = u.dlm = u.fcr = 0;
@@ -2035,6 +2076,27 @@ void vsmilpro_state::machine_reset()
 	m_tick_timer->adjust(attotime::never);
 	m_ch1_wrap_timer->adjust(attotime::never);
 	m_line_timer->adjust(m_screen->time_until_pos(0));
+	// CD decoder (the servo and pickup are external)
+	m_cd_expect = 0;
+	m_cd_tmo = 0;
+	m_cd_ptr = 0;
+	m_cd_len = 0;
+	m_cd_running = false;
+	update_cpu_irqs();
+}
+
+void vsmilpro_state::machine_reset()
+{
+	soc_reset();
+	std::fill(std::begin(m_rtc), std::end(m_rtc), 0);
+	// The always-on block survives power-off; the ROM marks it with 0xC01DB007
+	// after the first cold start and otherwise powers down until a key press
+	m_rtc[0x88 / 4] = 0xc01db007;
+	// +0x8C = 0x1230FFAB records a power-key wake-up; without it the startup
+	// task treats the boot as spurious and returns to standby
+	m_rtc[0x8c / 4] = 0x1230ffab;
+	m_sflash_status = 0;
+	m_sflash_aai_addr = 0;
 	for (auto &j : m_joy)
 	{
 		j.cmd.clear();
@@ -2044,17 +2106,12 @@ void vsmilpro_state::machine_reset()
 	}
 	m_joy_timer->adjust(attotime::from_hz(100), 0, attotime::from_hz(100));
 	m_cd_head = -3000;
-	m_cd_expect = 0;
 	m_cd_mute = false;
-	m_cd_tmo = 0;
 	m_cd_dir = 1;
 	m_cd_jump_n = 0;
 	m_cd_sled_armed = false;
 	m_cd_cal = 0;
 	m_cd_rx = 0;
-	m_cd_ptr = 0;
-	m_cd_len = 0;
-	m_cd_running = false;
 	m_cd_timer->adjust(attotime::from_hz(75), 0, attotime::from_hz(75));
 }
 
