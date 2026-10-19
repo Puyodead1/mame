@@ -204,7 +204,7 @@ private:
 	bool m_resume;
 	u32 m_pll[0x40 / 4];
 	u32 m_rtc[0x100 / 4];
-	u32 m_gpio_dir[2][4], m_gpio_out[2][4];
+	u32 m_gpio_dir[2][4], m_gpio_out[2][4], m_gpio_irqcfg[2][4];
 	u32 sysctl_r(offs_t offset);
 	void sysctl_w(offs_t offset, u32 data, u32 mem_mask);
 	u32 pll_r(offs_t offset);
@@ -280,6 +280,7 @@ private:
 	u32 m_bcdma_regs[0x200 / 4];
 	u32 m_dcdma_regs[0x200 / 4];
 	u32 m_bcdma_busy;
+	u8 m_bcdma_irq_on_done[8];
 	emu_timer *m_bcdma_timer[8];
 	void bcdma_update_irq();
 	TIMER_CALLBACK_MEMBER(bcdma_done_cb);
@@ -527,7 +528,10 @@ void vsmilpro_state::rtc_w(offs_t offset, u32 data, u32 mem_mask)
 	COMBINE_DATA(&m_rtc[offset]);
 }
 
-// four 8-bit lanes per bank at +0x40*lane: +0x10 dir, +0x14 out, +0x18 readback, +0x20 pins
+// four 8-bit lanes per bank at +0x40*lane: +0x10 direction (1 = input, as the
+// firmware uses it [FW-backed INT]), +0x14 out, +0x18 pin level, +0x20 a
+// register of the pin-interrupt block (firmware read-modify-writes it while
+// arming the lid interrupt; it is never read as pins) [FW, system.md GPIO table]
 template <int Bank>
 u32 vsmilpro_state::gpio_r(offs_t offset)
 {
@@ -536,8 +540,8 @@ u32 vsmilpro_state::gpio_r(offs_t offset)
 	{
 	case 0x10: return m_gpio_dir[Bank][lane];
 	case 0x14: return m_gpio_out[Bank][lane];
+	case 0x20: return m_gpio_irqcfg[Bank][lane];
 	case 0x18:
-	case 0x20:
 	{
 		u32 val = m_gpio_out[Bank][lane];
 		if (Bank == 1 && lane == 0)
@@ -570,6 +574,7 @@ void vsmilpro_state::gpio_w(offs_t offset, u32 data, u32 mem_mask)
 	{
 	case 0x10: m_gpio_dir[Bank][lane] = data & 0xff; break;
 	case 0x14: case 0x18: m_gpio_out[Bank][lane] = data & 0xff; break;
+	case 0x20: m_gpio_irqcfg[Bank][lane] = data & 0xff; break;
 	default:
 		LOGMASKED(LOG_UNKNOWN, "%08x: gpio%d write %02x = %08x\n", m_maincpu->pc(), Bank, offset * 4, data);
 		break;
@@ -1047,11 +1052,17 @@ void vsmilpro_state::disp_update_screen_size()
 
 TIMER_CALLBACK_MEMBER(vsmilpro_state::line_cb)
 {
+	// Status bit 1 is raised by the +0x020 beam-position compare, not by a
+	// separate vblank: both the boot ROM and FA program +0x020 (y<<16 | x,
+	// y = 236 for 240 lines) right before enabling only bit 1, and FA flips its
+	// buffers on bit 1 (analysis/re/reports/display.md, +0x020 / section 3.3).
+	// Bit 6 follows the +0x1048 line compare (ROM Vid_waitLine230).
+	// TODO: the x field of +0x020 is ignored; bit 0 and bits 2-5, 7 have no
+	// known source
 	const int line = m_screen->vpos();
-	const rectangle &vis = m_screen->visible_area();
-	if (line == vis.bottom() + 1)
+	if (line == int((m_disp_regs[0x020 / 4] >> 16) & 0x7ff))
 	{
-		m_disp_status |= 0x02; // vblank
+		m_disp_status |= 0x02;
 		disp_update_irq();
 	}
 	if (line == int(m_disp_regs[0x1048 / 4] & 0x7ff))
@@ -1059,18 +1070,13 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::line_cb)
 		m_disp_status |= 0x40; // line compare
 		disp_update_irq();
 	}
-	if (line == int((m_disp_regs[0x020 / 4] >> 16) & 0x7ff))
-	{
-		m_disp_status |= 0x01; // TODO: guessed bit for the +0x020 line interrupt
-		disp_update_irq();
-	}
 	line_timer_arm(line);
 }
 
-// next line with something to do: vblank, line compare, line interrupt
+// next line with something to do: +0x020 position compare, +0x1048 line compare
 void vsmilpro_state::line_timer_arm(int line)
 {
-	const int lines[3] = { m_screen->visible_area().bottom() + 1, int(m_disp_regs[0x1048 / 4] & 0x7ff), int((m_disp_regs[0x020 / 4] >> 16) & 0x7ff) };
+	const int lines[2] = { int((m_disp_regs[0x020 / 4] >> 16) & 0x7ff), int(m_disp_regs[0x1048 / 4] & 0x7ff) };
 	const int height = m_screen->height();
 	int best = -1, bestd = height + 1;
 	for (int l : lines)
@@ -1277,11 +1283,15 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		if (!in_sdram(map) || !in_sdram(tiles))
 			continue;
 		const u32 scroll = regs[(0x110 / 4) + layer];
-		// +0x104 byte n: bits 0-1 map width (16/32/64/128 tiles), bits 2-3 tile
-		// format (0 = 8bpp, 2 = 4bpp as in FA's text overlay)
+		// +0x104 byte n (analysis/re/reports/display.md 2.1/2.2) [INT, strong]:
+		// bits 0-1 map size (16/32/64/128 entries square), bits 2-3 tile format
+		// (0 = 8bpp as in the ROM UI, 2 = 4bpp as in the FA console), bit 4
+		// palette bank (0 = +0x800, 1 = +0xA00). Map entries: bits 0-10 tile
+		// number, bits 11-14 the 16-colour sub-palette in 4bpp mode
 		const u8 mode = regs[0x104 / 4] >> (layer * 8);
 		const int mapw = 16 << (mode & 3);
 		const bool bpp4 = ((mode >> 2) & 3) == 2;
+		const u32 *const pal = &regs[(BIT(mode, 4) ? 0xa00 : 0x800) / 4];
 		const int sx = scroll & 0xfff, sy = (scroll >> 16) & 0xfff;
 		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 		{
@@ -1295,14 +1305,22 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 				u8 index;
 				if (bpp4)
 				{
-					// TODO: palette select from the entry's upper bits
-					const u8 b = ram_r8(tiles + (entry & 0xfff) * 32 + (ly & 7) * 4 + ((lx & 7) >> 1));
+					const u8 b = ram_r8(tiles + (entry & 0x7ff) * 32 + (ly & 7) * 4 + ((lx & 7) >> 1));
 					index = BIT(lx, 0) ? (b >> 4) : (b & 0x0f);
+					// [guess] +0x028 bit (16 * bank + sub-palette) makes colour 0 of
+					// that sub-palette transparent: FA sets it for its console, whose
+					// colour 0 is 0x0000 and must be see-through
+					if (!index && BIT(regs[0x028 / 4], BIT(mode, 4) * 16 + ((entry >> 11) & 15)))
+						continue;
+					index |= ((entry >> 11) & 15) << 4;
 				}
 				else
-					index = ram_r8(tiles + (entry & 0xfff) * 64 + (ly & 7) * 8 + (lx & 7));
-				const u16 color = regs[(0x800 / 4) + (index >> 1)] >> (BIT(index, 0) * 16);
-				if (color == 0x83e0 || color == 0x0000) // UI transparency key, or empty colour
+					index = ram_r8(tiles + (entry & 0x7ff) * 64 + (ly & 7) * 8 + (lx & 7));
+				const u16 color = pal[index >> 1] >> (BIT(index, 0) * 16);
+				// bit 15 = transparent as in the 16-bit layer [INT: the ROM UI
+				// palettes mark their key colour 0x83E0 this way]. TODO: 0x0000 is
+				// also skipped, which is [EMU] only (opaque black on layer 4)
+				if (BIT(color, 15) || color == 0x0000)
 					continue;
 				dst[x] = bgr555(color);
 			}
@@ -1332,7 +1350,11 @@ void vsmilpro_state::bcdma_update_irq()
 TIMER_CALLBACK_MEMBER(vsmilpro_state::bcdma_done_cb)
 {
 	m_bcdma_busy &= ~(1 << param);
-	m_bcdma_regs[0x1c / 4] |= 1 << param;
+	// [INT] completion status (and IRQ 12) only for transfers started with
+	// control bit 31: the driver sets it exactly when a callback is attached,
+	// and polled transfers wait on +0x0C instead
+	if (m_bcdma_irq_on_done[param])
+		m_bcdma_regs[0x1c / 4] |= 1 << param;
 	bcdma_update_irq();
 }
 
@@ -1353,18 +1375,23 @@ void vsmilpro_state::bcdma_w(offs_t offset, u32 data, u32 mem_mask)
 				continue;
 			const u32 cfg = m_bcdma_regs[(0x100 + ch * 16) / 4];
 			const u32 src = m_bcdma_regs[(0x104 + ch * 16) / 4], dst = m_bcdma_regs[(0x108 + ch * 16) / 4];
+			// control word +0x100+16ch (analysis/re/reports/dma_spi_misc.md 1.2.1) [FW]:
+			// bits 0-9 count, bits 16-17 unit {1, 2, 4} bytes (the driver
+			// invalidates count * unit bytes at the destination; code 3 is
+			// rejected by the driver, treated as 4 here), bits 18-19 a second
+			// width code (always equal), bit 31 interrupt on completion. The 3-bit
+			// +0x08 field per channel is not a width (memcpy sets 3 there and
+			// width code 2 here); its meaning is unknown
 			static const int unit_sizes[4] = { 1, 2, 4, 4 };
-			const int unit = unit_sizes[(cfg >> 16) & 3];
+			const int bytes_per = unit_sizes[(cfg >> 16) & 3];
 			const u32 count = cfg & 0x3ff;
-			// TODO: confirm unit semantics; memcpy uses count = words with width field 3
-			const int width = (m_bcdma_regs[0x08 / 4] >> (ch * 3)) & 7;
-			const int bytes_per = (width == 3) ? 4 : unit;
 			LOGMASKED(LOG_DMA, "bcdma ch%d %08x -> %08x count %d x %d (cfg %08x)\n", ch, src, dst, count, bytes_per, cfg);
 			for (u32 i = 0; i < count * bytes_per; i++)
 				ram_w8(dst + i, ram_r8(src + i));
 			// the data moves at once; completion is signalled after a short
 			// delay (~4 bytes per 75 MHz bus clock) so drivers see it busy first
 			m_bcdma_busy |= 1 << ch;
+			m_bcdma_irq_on_done[ch] = BIT(cfg, 31);
 			m_bcdma_timer[ch]->adjust(attotime::from_ticks(count * bytes_per / 4 + 16, 75'000'000), ch);
 		}
 	}
@@ -1401,6 +1428,10 @@ void vsmilpro_state::dcdma_w(offs_t offset, u32 data, u32 mem_mask)
 				const u32 next = ram_r32(desc + 16), count = ram_r32(desc + 20);
 				const s32 sstride = ram_r32(desc + 24), dstride = ram_r32(desc + 28);
 				LOGMASKED(LOG_DMA, "dcdma ch%d desc %08x: %08x -> %08x count %d (%08x %08x)\n", ch, desc, src, dst, count, ram_r32(desc), ram_r32(desc + 4));
+				// DSP side of the address map [FW, sound_dsp.md 2.4]: 0xDC020000 + 2a
+				// = program word a, 0xDC000000 + 2a = data word a. The data range is
+				// not the CPU's interrupt controller [INT, strong], so these writes
+				// go to DSP memory (m_dsp_mem: data at 0, program at 0x10000)
 				if (dst == 0xdc020000)
 					m_dsp->program_loaded(count); // DSP program memory segment
 				for (u32 i = 0; i < count; i++)
@@ -1967,6 +1998,7 @@ void vsmilpro_state::machine_start()
 	for (auto &t : m_bcdma_timer)
 		t = timer_alloc(FUNC(vsmilpro_state::bcdma_done_cb), this);
 	save_item(NAME(m_bcdma_busy));
+	save_item(NAME(m_bcdma_irq_on_done));
 	m_ch1_wrap_timer = timer_alloc(FUNC(vsmilpro_state::ch1_wrap_cb), this);
 	m_line_timer = timer_alloc(FUNC(vsmilpro_state::line_cb), this);
 	m_joy_timer = timer_alloc(FUNC(vsmilpro_state::joy_cb), this);
@@ -2011,6 +2043,7 @@ void vsmilpro_state::machine_start()
 	save_item(NAME(m_rtc));
 	save_item(NAME(m_gpio_dir));
 	save_item(NAME(m_gpio_out));
+	save_item(NAME(m_gpio_irqcfg));
 	save_item(NAME(m_timer_regs));
 	save_item(NAME(m_ch1_start));
 	save_item(NAME(m_ch1_period_ticks));
@@ -2048,13 +2081,14 @@ void vsmilpro_state::soc_reset()
 	std::fill(std::begin(m_pll), std::end(m_pll), 0);
 	for (int b = 0; b < 2; b++)
 		for (int l = 0; l < 4; l++)
-			m_gpio_dir[b][l] = m_gpio_out[b][l] = 0;
+			m_gpio_dir[b][l] = m_gpio_out[b][l] = m_gpio_irqcfg[b][l] = 0;
 	std::fill(std::begin(m_timer_regs), std::end(m_timer_regs), 0);
 	std::fill(std::begin(m_spi_regs), std::end(m_spi_regs), 0);
 	std::fill(std::begin(m_disp_regs), std::end(m_disp_regs), 0);
 	m_disp_regs[0x010 / 4] = DISP_010_RESET;
 	std::fill(std::begin(m_bcdma_regs), std::end(m_bcdma_regs), 0);
 	m_bcdma_busy = 0;
+	std::fill(std::begin(m_bcdma_irq_on_done), std::end(m_bcdma_irq_on_done), 0);
 	for (auto &t : m_bcdma_timer)
 		t->adjust(attotime::never);
 	std::fill(std::begin(m_dcdma_regs), std::end(m_dcdma_regs), 0);

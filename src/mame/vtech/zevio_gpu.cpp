@@ -7,8 +7,8 @@
 
     The command processor executes display lists from SDRAM and draws into
     the tiled 16-bit VRAM surface: 1024 pixels (2048 bytes) wide, 32x8-pixel
-    tiles of 512 bytes, origin at register +0x98. All drawing coordinates are
-    pixels relative to that origin.
+    tiles of 512 bytes. GPU rows from HIWORD(+0x94) down are RAM at +0x98;
+    rows above are a separate depth/aux area (see vram_map_update).
 
     Knowledge comes from the boot ROM and the V2GE engine in the games' FA.VFF
     (Bratz). Display lists are executed instantly when kicked.
@@ -16,12 +16,12 @@
     Registers:
     +0x00 command (1 = run list at +0x28, 3 = reset), upper half engine state
     +0x10 IRQ enable (6 bits), +0x14 IRQ status (bits 0-5, tag in 8-15)
-    +0x28 list address, +0x5C fence value, +0x98 VRAM origin
+    +0x28 list address, +0x5C capture write pointer, +0x94/+0x98 RAM mapping
 
     Display list words (top byte = opcode):
     04 return from 09 call       08,a jump          09,a call
     0A,a vertex base (indexed)   0C,a transfer/transform destination
-    0E|n,a data feed for D0      10,v fence         12 (unknown, no-op)
+    0E|n,a data feed for D0      10,a capture buf   12 (unknown, no-op)
     14 end of list (IRQ, tag)    1C/1E mode words   20RRNNNN register block
     40/44/48/4C/50 3D strip/list/line strip/line list/points (fmt in 16-23)
     6Fx transform vertices to memory
@@ -89,6 +89,7 @@ zevio_gpu_device::zevio_gpu_device(const machine_config &mconfig, const char *ta
 void zevio_gpu_device::device_start()
 {
 	m_zbuf = std::make_unique<float[]>(ZW * ZH);
+	m_aux = std::make_unique<u16[]>(1024 * AUX_H);
 	// more bands than threads so uneven rows balance out; a HIGH_FREQ queue
 	// would be capped at four threads
 	const int hw = std::max<int>(std::thread::hardware_concurrency(), 1);
@@ -114,6 +115,9 @@ void zevio_gpu_device::device_start()
 	save_item(NAME(m_clut));
 	save_item(NAME(m_vtxbase));
 	save_item(NAME(m_xfer));
+	save_item(NAME(m_vram_y0));
+	save_item(NAME(m_vram_base));
+	save_pointer(NAME(m_aux), 1024 * AUX_H);
 }
 
 void zevio_gpu_device::device_stop()
@@ -156,6 +160,9 @@ void zevio_gpu_device::device_reset()
 	m_clip1 = 0xffffff;
 	std::fill(std::begin(m_clut), std::end(m_clut), 0);
 	m_vtxbase = m_xfer = 0;
+	m_vram_y0 = 0;
+	m_vram_base = 0;
+	std::fill_n(&m_aux[0], 1024 * AUX_H, 0);
 	std::fill_n(&m_zbuf[0], ZW * ZH, std::numeric_limits<float>::max());
 	m_zdirty_y0 = ZH;
 	m_zdirty_y1 = -1;
@@ -228,16 +235,38 @@ void zevio_gpu_device::wr16(u32 addr, u16 data)
 	w = (w & ~(0xffffU << shift)) | (u32(data) << shift);
 }
 
-// GPU coordinates are absolute in the tiled surface whose origin is 0x0FFD0000:
-// FA's clip rectangles and its three display buffers agree on this. +0x98 is
-// not an origin; FA points it at the only 512x240 area that is not a display
-// buffer (with +0x90/+0x94 = 240 << 16 | 512), so it is probably the depth
-// buffer. TODO: confirm, and whether rows 0-95 (below SDRAM) are memory.
+// GPU coordinates (analysis/re/reports/gpu.md section 4.1): a row y at or
+// below HIWORD(+0x94) is RAM at +0x98 + tiled(x, y - HIWORD(+0x94)). [FW] The
+// boot ROM sets +0x94 = 240 << 16 | 512, +0x98 = 0x10800000, and draws into
+// GPU (0,240) / (512,240) while showing 0x10802000 / 0x10800000, which only
+// works with this mapping; FA sets +0x98 = 0x0FFD0000 + tiled(0, y0) (row 240,
+// or row 128 in MJPEG mode), so for FA it equals the absolute layout.
+// Rows above y0 hold FA's depth/aux area (cleared with depth values at GPU
+// (0,0)); firmware never gives them a CPU address (Gpu_vramPtr returns NULL).
+// [INT, guess] they are separate (on-chip?) memory: kept in m_aux here.
+void zevio_gpu_device::vram_map_update()
+{
+	const int y0 = std::min<int>(m_regs[0x94 / 4] >> 16, AUX_H);
+	const u32 base = m_regs[0x98 / 4];
+	if (y0 != m_vram_y0 || base != m_vram_base)
+	{
+		sync(); // queued work was recorded with the old mapping
+		m_vram_y0 = y0;
+		m_vram_base = base;
+	}
+}
 
+int zevio_gpu_device::abs_row(int y) const
+{
+	return int(s32(m_vram_base - 0x0ffd0000) >> 14) * 8 + (y - m_vram_y0);
+}
 
 void zevio_gpu_device::vram_w(int x, int y, u16 data)
 {
-	wr16(vram_addr(x, y), data); // rows below SDRAM are dropped by wr16
+	if (vram_in_aux(y))
+		aux_px(x, y) = data;
+	else
+		wr16(vram_addr(x, y), data);
 }
 
 
@@ -283,7 +312,13 @@ u32 zevio_gpu_device::fa_find_irq_handler()
 
 bool zevio_gpu_device::fa_queue_hle()
 {
-	static const bool off = getenv("ZGPU_NO_QUEUE_HLE") != nullptr;
+	// Off unless ZGPU_QUEUE_HLE is set. It completed FA's queued lists here
+	// instead of through FA's GPU interrupt handler, but it writes status 3
+	// into the list's first word, where the firmware's Gpu_isrRetire writes it
+	// to the queue entry (analysis/re/reports/gpu.md section 6). It never
+	// engaged for Bratz (kick address = entry.list + 4); Cars, Spider-Man and
+	// Wacky Races run the same or better through their own handler
+	static const bool off = getenv("ZGPU_QUEUE_HLE") == nullptr;
 	if (off || m_regs[0x14 / 4] != 0xfd08 || !(m_regs[0x10 / 4] & 0x08))
 		return false;
 	// look for the handler again at most once per emulated second
@@ -390,6 +425,10 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 	case 0x10 / 4:
 		COMBINE_DATA(&m_regs[offset]);
 		update_irq();
+		return;
+	case 0x94 / 4: case 0x98 / 4:
+		COMBINE_DATA(&m_regs[offset]);
+		vram_map_update();
 		return;
 	default:
 		COMBINE_DATA(&m_regs[offset]);
@@ -681,7 +720,7 @@ void zevio_gpu_device::transform(vertex_t &v) const
 // perspective projection to screen; returns false if behind the near plane
 bool zevio_gpu_device::project(vertex_t &v) const
 {
-	const float near_z = 1.0f / 4096.0f; // TODO: which register is the near plane (0x75 reads 17.3)
+	const float near_z = 1.0f / 4096.0f; // [EMU] fixed. FA writes 0x74 = camera +176 (near?) and 0x75 = camera +180 (far, also picks its depth-clear value) [FW]; which is used how is unknown
 	if (v.z < near_z)
 		return false;
 	const float fx = reg_f(0x78), fy = reg_f(0x79);
@@ -1035,7 +1074,11 @@ void zevio_gpu_device::prim2d(u32 header, u32 &addr)
 	case 0xc3: n = 2; break;
 	default: n = 1; break;
 	}
-	// 2D positions: surface origin (clip top-left) + 0x85 offset + signed x/y
+	// Vertex x/y (and u/v) are GPU-f16: the only firmware code that builds
+	// C0-C4 lists, FA's immediate-mode builders (Render_drawArraysFloat, e.g.
+	// 0x10A642F8), writes them through converter +0x00 [FW, gpu.md 3.6]. No
+	// tested game draws C0-C4. [EMU] the origin (clip top-left + 0x85) and u/v
+	// in texels are unchanged guesses from when these were read as s16
 	const int ox = (m_clip0 & 0xfff) + (m_w85 & 0xfff), oy = ((m_clip0 >> 12) & 0xfff) + ((m_w85 >> 12) & 0xfff);
 	std::vector<vertex_t> v(n);
 	for (int i = 0; i < n; i++)
@@ -1043,8 +1086,8 @@ void zevio_gpu_device::prim2d(u32 header, u32 &addr)
 		const u32 base = addr + i * wpv * 4;
 		const u32 xy = rd32(base + 4);
 		v[i] = vertex_t{};
-		v[i].x = ox + s16(xy & 0xffff);
-		v[i].y = oy + s16(xy >> 16);
+		v[i].x = ox + f16_to_float(xy & 0xffff);
+		v[i].y = oy + f16_to_float(xy >> 16);
 		v[i].w = 1.0f;
 		v[i].z = 0.0f;
 		int k = 2;
@@ -1052,8 +1095,8 @@ void zevio_gpu_device::prim2d(u32 header, u32 &addr)
 		if (BIT(flags, 0))
 		{
 			const u32 uv = rd32(base + k++ * 4);
-			v[i].u = uv & 0xffff;
-			v[i].v = uv >> 16;
+			v[i].u = f16_to_float(uv & 0xffff);
+			v[i].v = f16_to_float(uv >> 16);
 			if (BIT(flags, 2))
 				col = rd32(base + k++ * 4);
 		}
@@ -1142,7 +1185,11 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 		col = rd32(addr + k++ * 4);
 	addr += count * 4;
 
-	// 2D positions: surface origin (clip top-left) + 0x85 offset + signed x/y
+	// Vertex x/y (and u/v) are GPU-f16: the only firmware code that builds
+	// C0-C4 lists, FA's immediate-mode builders (Render_drawArraysFloat, e.g.
+	// 0x10A642F8), writes them through converter +0x00 [FW, gpu.md 3.6]. No
+	// tested game draws C0-C4. [EMU] the origin (clip top-left + 0x85) and u/v
+	// in texels are unchanged guesses from when these were read as s16
 	const int ox = (m_clip0 & 0xfff) + (m_w85 & 0xfff), oy = ((m_clip0 >> 12) & 0xfff) + ((m_w85 >> 12) & 0xfff);
 	const int x0 = ox + s16(xy & 0xffff), y0 = oy + s16(xy >> 16);
 	const int w = std::min<int>(wh & 0xffff, 1024), h = std::min<int>(wh >> 16, 1024);
@@ -1283,7 +1330,9 @@ void zevio_gpu_device::draw_fill(const rcmd &c, int band_y0, int band_y1)
 			const int xx = (x + i) & 1023;
 			const int run = std::min(w - i, 32 - (xx & 31));
 			const u32 off = vram_addr(xx, y + j) - m_ram_base;
-			if (off + run * 2 <= m_ram_size)
+			if (vram_in_aux(y + j))
+				std::fill_n(&aux_px(xx, y + j), run, col);
+			else if (off + run * 2 <= m_ram_size)
 			{
 #ifdef LSB_FIRST
 				std::fill_n(reinterpret_cast<u16 *>(m_ram) + (off >> 1), run, col);
@@ -1370,11 +1419,15 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 	}
 	if (c.type != CMD_ZCLEAR)
 	{
-		// areas drawn since the last frame fence
-		const std::array<int, 4> r = (c.type == CMD_FILL)
-				? std::array<int, 4>{ int(c.a0 & 0xffff), c.ymin, int(c.a0 & 0xffff) + int(c.a1 & 0xffff) - 1, c.ymax }
-				: std::array<int, 4>{ int(c.st.clip0 & 0xfff), c.ymin, int(c.st.clip1 & 0xfff), c.ymax };
-		if (m_drawn.empty() || m_drawn.back() != r)
+		// areas drawn since the last frame fence, as rows of the RAM surface
+		// at 0x0FFD0000 (what the display compares); the aux area is not shown
+		const int x0 = (c.type == CMD_FILL) ? int(c.a0 & 0xffff) : int(c.st.clip0 & 0xfff);
+		const int x1 = (c.type == CMD_FILL) ? x0 + int(c.a1 & 0xffff) - 1 : int(c.st.clip1 & 0xfff);
+		const int xo = ((m_vram_base - 0x0ffd0000) & 0x3fff) / 512 * 32;
+		const std::array<int, 4> r{ x0 + xo, abs_row(std::max(c.ymin, m_vram_y0)), x1 + xo, abs_row(c.ymax) };
+		if (c.ymax < m_vram_y0)
+			;
+		else if (m_drawn.empty() || m_drawn.back() != r)
 		{
 			if (m_drawn.size() >= 64)
 			{
@@ -1593,7 +1646,13 @@ void zevio_gpu_device::run_list(u32 addr)
 		case 0x0a: m_vtxbase = rd32(addr); addr += 4; break;
 		case 0x0c: m_xfer = rd32(addr); addr += 4; break;
 		case 0x0e: addr += 4; break;
-		case 0x10: m_regs[0x5c / 4] = rd32(addr); addr += 4; break;
+		case 0x10:
+			// capture buffer [FW]: FA reads +0x5C back as the write pointer just
+			// past the C1 triangles the GPU stored there (FA 0x10AB66B0, 0x10A5D360).
+			// TODO: nothing is captured; +0x5C = start means "empty"
+			m_regs[0x5c / 4] = rd32(addr);
+			addr += 4;
+			break;
 		case 0x00: case 0x12: case 0x89: case 0x95: case 0x96: case 0x8e: break; // 00: padding after sub-list calls
 		case 0x14:
 			m_regs[0x14 / 4] = (cmd & 0xff00) | 0x08;
@@ -1666,52 +1725,28 @@ void zevio_gpu_device::run_list(u32 addr)
 		}
 		case 0xd3: // fill
 		{
-			// Absolute coordinates, except a rectangle inside the +0x90/+0x94
-			// window (512x240 in FA), which addresses the +0x98 area: FA clears
-			// its frame with (surface, colour 0) and its +0x98 area (probably
-			// depth) with (0,0) 512x240, 0x3732
 			const u32 pos = rd32(addr), size = rd32(addr + 4), col = rd32(addr + 8);
 			addr += 12;
 			m_stat_fills++;
-			const int x = pos & 0xffff, y = pos >> 16, w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 8192);
-			const int ww = m_regs[0x94 / 4] & 0xffff, wh = m_regs[0x94 / 4] >> 16;
-			const bool windowed = (x + w <= ww) && (y + h <= wh);
-			const u32 woff = m_regs[0x98 / 4] - 0x0ffd0000;
-			if (!windowed || !(woff & 0x3fff))
+			const int y = pos >> 16, h = std::min<int>(size >> 16, 8192);
+			rcmd c{};
+			c.type = CMD_FILL;
+			c.st = cur_state();
+			c.a0 = pos;
+			c.a1 = std::min<u32>(size & 0xffff, 1024) | (u32(h) << 16);
+			c.a3 = col;
+			add_cmd(std::move(c));
+			// FA clears its depth area (aux rows at GPU (0,0)) with a fill; MAME
+			// keeps depth as floats elsewhere, so reset the rows drawn with depth
+			// since the last such clear [EMU: the clear value is ignored]
+			if (y + h <= m_vram_y0 && m_zdirty_y1 >= m_zdirty_y0)
 			{
-				// the +0x98 area starts on an 8-row boundary: absolute rows
-				rcmd c{};
-				c.type = CMD_FILL;
-				c.st = cur_state();
-				c.a0 = windowed ? ((x & 0xffff) | (u32(y + (woff >> 14) * 8) << 16)) : pos;
-				c.a1 = u32(w) | (u32(h) << 16);
-				c.a3 = col;
-				add_cmd(std::move(c));
-				if (windowed && m_zdirty_y1 >= m_zdirty_y0)
-				{
-					// FA clears depth this way: reset the rows drawn with depth since
-					rcmd z{};
-					z.type = CMD_ZCLEAR;
-					z.st = cur_state();
-					z.a0 = m_zdirty_y0;
-					z.a1 = m_zdirty_y1;
-					add_cmd(std::move(z));
-					m_zdirty_y0 = ZH;
-					m_zdirty_y1 = -1;
-				}
-				break;
-			}
-			sync(); // the +0x98 area and the depth buffer
-			const u32 base = windowed ? m_regs[0x98 / 4] : 0x0ffd0000;
-			for (int j = 0; j < h; j++)
-				for (int i = 0; i < w; i++)
-				{
-					const u32 xb = ((x + i) & 1023) * 2, yy = y + j;
-					wr16(base + (yy >> 3) * 16384 + (xb >> 6) * 512 + (yy & 7) * 64 + (xb & 63), col);
-				}
-			if (windowed)
-			{
-				std::fill_n(&m_zbuf[0], ZW * ZH, std::numeric_limits<float>::max());
+				rcmd z{};
+				z.type = CMD_ZCLEAR;
+				z.st = cur_state();
+				z.a0 = m_zdirty_y0;
+				z.a1 = m_zdirty_y1;
+				add_cmd(std::move(z));
 				m_zdirty_y0 = ZH;
 				m_zdirty_y1 = -1;
 			}

@@ -54,14 +54,20 @@ private:
 	u8 rd8(u32 addr) const { return rd32(addr & ~3) >> ((addr & 3) * 8); }
 	void wr32(u32 addr, u32 data);
 	void wr16(u32 addr, u16 data);
-	// GPU coordinates are absolute in the tiled surface whose origin is 0x0FFD0000
-	static u32 vram_addr(int x, int y)
+	// GPU rows y >= HIWORD(+0x94) are RAM at +0x98 + tiled(x, y - HIWORD(+0x94));
+	// rows above are a separate area that the CPU cannot address (see zevio_gpu.cpp)
+	static u32 tiled_offs(int x, int y)
 	{
 		const u32 xb = (x & 1023) * 2;
-		return 0x0ffd0000 + (y >> 3) * 16384 + (xb >> 6) * 512 + (y & 7) * 64 + (xb & 63);
+		return (y >> 3) * 16384 + (xb >> 6) * 512 + (y & 7) * 64 + (xb & 63);
 	}
+	bool vram_in_aux(int y) const { return y < m_vram_y0; }
+	u32 vram_addr(int x, int y) const { return m_vram_base + tiled_offs(x, y - m_vram_y0); }
+	u16 &aux_px(int x, int y) const { return m_aux[(y & (AUX_H - 1)) * 1024 + (x & 1023)]; }
 	u16 vram_r(int x, int y) const
 	{
+		if (vram_in_aux(y))
+			return aux_px(x, y);
 		const u32 off = vram_addr(x, y) - m_ram_base;
 		if (off >= m_ram_size)
 			return 0;
@@ -177,6 +183,14 @@ private:
 	u32 *m_ram;
 	u32 m_ram_base;
 	u32 m_ram_size;
+
+	// +0x94/+0x98 coordinate mapping, latched (after a sync) when written
+	static constexpr int AUX_H = 4096;
+	int m_vram_y0 = 0;
+	u32 m_vram_base = 0;
+	std::unique_ptr<u16[]> m_aux;    // GPU rows below HIWORD(+0x94), 1024 x AUX_H
+	void vram_map_update();
+	int abs_row(int y) const;        // GPU row -> row of the RAM surface at 0x0FFD0000
 
 	u32 m_regs[0x400 / 4];
 	u32 m_cvt[0x40 / 4];
