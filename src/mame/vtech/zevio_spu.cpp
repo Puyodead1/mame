@@ -42,6 +42,14 @@
 
 DEFINE_DEVICE_TYPE(ZEVIO_SPU, zevio_spu_device, "zevio_spu", "Zevio 1020 sound")
 
+// ZSPU_STATS: how voices end (key-off while sounding, looping or not / end of a one-shot sample)
+static u64 s_keyoff_cut[2], s_natural_end;
+static struct spu_stats_dump { ~spu_stats_dump() {
+	if (getenv("ZSPU_STATS"))
+		printf("SPU key-off while playing: %llu one-shot, %llu looping; one-shots reaching their end: %llu%c",
+				(unsigned long long)s_keyoff_cut[0], (unsigned long long)s_keyoff_cut[1], (unsigned long long)s_natural_end, 10);
+} } s_spu_stats_dump;
+
 namespace {
 
 const s16 ima_steps[89] =
@@ -94,6 +102,9 @@ void zevio_spu_device::device_start()
 		save_item(NAME(m_voice[v].addr), v);
 		save_item(NAME(m_voice[v].phase), v);
 		save_item(NAME(m_voice[v].sample), v);
+		save_item(NAME(m_voice[v].prev), v);
+		save_item(NAME(m_voice[v].release), v);
+		save_item(NAME(m_voice[v].release_len), v);
 		save_item(NAME(m_voice[v].packet), v);
 		save_item(NAME(m_voice[v].nibble), v);
 		save_item(NAME(m_voice[v].pred), v);
@@ -111,7 +122,8 @@ void zevio_spu_device::device_reset()
 		std::fill(std::begin(vc.regs), std::end(vc.regs), 0);
 		vc.active = false;
 		vc.addr = vc.phase = 0;
-		vc.sample = 0;
+		vc.sample = vc.prev = 0;
+		vc.release = vc.release_len = 0;
 		vc.packet = 0;
 		vc.nibble = 0;
 		vc.pred = 0;
@@ -178,6 +190,7 @@ void zevio_spu_device::key_on(int v)
 	voice_t &vc = m_voice[v];
 	vc.active = true;
 	vc.phase = 0;
+	vc.release = 0;
 	const u32 start = vc.regs[V_START];
 	if (BIT(vc.regs[V_MODE], 1))
 	{
@@ -192,6 +205,7 @@ void zevio_spu_device::key_on(int v)
 		else
 			voice_fetch(vc);
 	}
+	vc.prev = vc.sample;
 }
 
 // step one source sample; returns false when the voice stopped
@@ -227,6 +241,7 @@ bool zevio_spu_device::voice_advance(voice_t &vc)
 			if (!BIT(mode, 4))
 			{
 				vc.active = false;
+				s_natural_end++;
 				return false;
 			}
 			next = vc.regs[V_LOOP];
@@ -257,19 +272,36 @@ void zevio_spu_device::sound_stream_update(sound_stream &stream)
 			if (!vc.active || BIT(m_pause, v))
 				continue;
 			const u32 mode = vc.regs[V_MODE];
+			// ZSPU_MUTE=<mask>: silence voices by sample format (1 16-bit, 2 8-bit, 4 format 2) for tests
+			static const unsigned mute = getenv("ZSPU_MUTE") ? strtoul(getenv("ZSPU_MUTE"), nullptr, 0) : 0;
+			const bool muted = mute & (BIT(mode, 1) ? 4 : BIT(mode, 0) ? 2 : 1);
+			// divider 1 is 44100 Hz for every format: the boot jingle (16-bit) and Wacky Races'
+			// attract voice (IMA, divider 2 = 22050 Hz) match recordings of a console
 			const u32 step = 0x1000U << ((mode >> 2) & 3);
 			vc.phase += vc.regs[V_PITCH] & 0x1fff;
 			bool alive = true;
 			while (vc.phase >= step && alive)
 			{
 				vc.phase -= step;
+				vc.prev = vc.sample;
 				alive = voice_advance(vc);
 			}
-			if (!alive)
+			if (!alive || muted)
 				continue;
+			// linear interpolation between source samples: holding each one until the next
+			// (a pitch below 0x1000 repeats it) adds images of the whole sample at multiples
+			// of its rate, heard as a harsh high-pitched edge on low-pitched instruments
+			s32 out = vc.prev + s32((s64(vc.sample - vc.prev) * vc.phase) / step);
+			if (vc.release)
+			{
+				// key-off fade
+				out = s32((s64(out) * vc.release) / vc.release_len);
+				if (!--vc.release)
+					vc.active = false;
+			}
 			const u32 levels = vc.regs[V_LEVELS];
-			left += (vc.sample * s32(levels & 0xff)) >> 8;
-			right += (vc.sample * s32((levels >> 8) & 0xff)) >> 8;
+			left += (out * s32(levels & 0xff)) >> 8;
+			right += (out * s32((levels >> 8) & 0xff)) >> 8;
 		}
 		left = (left * master_l) >> 15;
 		right = (right * master_r) >> 15;
@@ -330,7 +362,23 @@ void zevio_spu_device::write(offs_t offset, u32 data, u32 mem_mask)
 	case 0x018 / 4: case 0x01c / 4:
 		for (int i = 0; i < 32; i++)
 			if (BIT(data, i))
-				m_voice[i + (g == 0x01c / 4 ? 32 : 0)].active = false;
+			{
+				voice_t &k = m_voice[i + (g == 0x01c / 4 ? 32 : 0)];
+				if (k.active)
+					s_keyoff_cut[BIT(k.regs[V_MODE], 4)]++;
+				// The sequencer (Spu_setSampleVoice: +0x18 = 0xF6FF0000) keys notes off while
+				// they still sound; stopping them dead clicks and leaves gaps, which the real
+				// console does not do, so those fade out. Streams and music (+0x18 = 0xFFFF0000)
+				// stop at once. The fade length is a guess matched by ear/spectrum to a
+				// recording of the console (EMU); ZSPU_RELEASE_MS overrides it.
+				static const u32 release_ms = getenv("ZSPU_RELEASE_MS") ? atoi(getenv("ZSPU_RELEASE_MS")) : 120;
+				if (k.active && (k.regs[0x18 / 4] >> 24) != 0xff && release_ms && !k.release)
+				{
+					k.release = k.release_len = std::max<u32>(1, release_ms * clock() / 1000);
+				}
+				else if (!k.release)
+					k.active = false;
+			}
 		break;
 	default:
 		break;

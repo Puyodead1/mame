@@ -70,7 +70,7 @@ void jpeg_output_nothing(j_common_ptr cinfo)
 {
 }
 
-// some frames omit the 0x00 stuffing after 0xFF in the entropy data
+// the MJP encoder writes the entropy data without 0x00 stuffing after 0xFF
 std::vector<u8> fix_byte_stuffing(const std::vector<u8> &in)
 {
 	size_t sos = 0;
@@ -85,30 +85,14 @@ std::vector<u8> fix_byte_stuffing(const std::vector<u8> &in)
 	std::vector<u8> out(in.begin(), in.begin() + sos);
 	for (size_t j = sos; j < in.size(); )
 	{
-		const u8 b = in[j];
-		if (b == 0xff && j + 1 < in.size())
-		{
-			const u8 n = in[j + 1];
-			// the entropy data has no markers (and no EOI): every other 0xFF
-			// is data, including ones that look like RSTn or EOI
-			if (n == 0x00)
-			{
-				out.push_back(0xff);
-				out.push_back(n);
-				j += 2;
-			}
-			else
-			{
-				out.push_back(0xff);
-				out.push_back(0x00);
-				j++;
-			}
-		}
-		else
-		{
-			out.push_back(b);
-			j++;
-		}
+		// the entropy data is never stuffed and has no markers (and no EOI):
+		// every 0xFF is data, including one followed by a data 0x00, so each
+		// gets its stuffing byte (taking FF 00 as stuffed drops the 00 and
+		// garbles the rest of the frame)
+		const u8 b = in[j++];
+		out.push_back(b);
+		if (b == 0xff)
+			out.push_back(0x00);
 	}
 	return out;
 }
@@ -149,6 +133,7 @@ void zevio_dsp_hle_device::device_start()
 	save_item(NAME(m_height));
 	save_item(NAME(m_frames));
 	save_item(NAME(m_frame));
+	save_item(NAME(m_sched));
 	save_item(NAME(m_jpeg_header_save));
 	save_item(NAME(m_jpeg_header_len));
 }
@@ -174,7 +159,7 @@ void zevio_dsp_hle_device::device_reset()
 	m_ring_start = m_ring_end = m_rd = 0;
 	std::fill(std::begin(m_out), std::end(m_out), 0);
 	m_aud[0] = m_aud[1] = m_aud_wp[0] = m_aud_wp[1] = m_aud_size = 0;
-	m_width = m_height = m_frames = m_frame = 0;
+	m_width = m_height = m_frames = m_frame = m_sched = 0;
 	m_jpeg_header.clear();
 	m_frame_timer->adjust(attotime::never);
 	m_msg_irq_cb(0);
@@ -256,12 +241,14 @@ void zevio_dsp_hle_device::mbox_w(offs_t offset, u32 data, u32 mem_mask)
 			m_msg_irq_cb(0);
 			if (m_awaiting_ack)
 			{
-				// the ARM handed us the next output set with the acknowledge
 				m_awaiting_ack = false;
+				// FA answers each frame with the Y/U/V set for the next one (its 3-buffer rotation)
 				const u32 m = m_w + MSG_BLOCK;
 				m_out[0] = rd32(m + 76);
 				m_out[1] = rd32(m + 80);
 				m_out[2] = rd32(m + 84);
+				if (m_playing && !m_paused)
+					schedule_next();
 			}
 		}
 		break;
@@ -338,7 +325,9 @@ void zevio_dsp_hle_device::command(u32 cmd)
 		wr32(c + 72, m_width);
 		wr32(c + 76, m_height);
 		wr32(c + 80, fps);
-		wr32(c + 84, 0);
+		// the audio format code from the header (0-2 IMA at 44.1/22.05/11.025 kHz, 3-5 16-bit, 6-8 8-bit):
+		// FA picks the movie voices' sample format and rate divider from it
+		wr32(c + 84, ring32(h + 0x14) >> 16);
 		wr32(c + 88, m_frames);
 		wr32(c + 64, ok ? 0x8081 : 0x0881);
 		post_reply();
@@ -347,10 +336,15 @@ void zevio_dsp_hle_device::command(u32 cmd)
 			m_playing = true;
 			m_paused = false;
 			m_awaiting_ack = false;
-			// decode at the movie's own rate: FA's driver reports "playing"
-			// between the first two frames and only polls every 10 ms
-			const attotime period = attotime::from_hz(std::max<u32>(fps, 1));
-			m_frame_timer->adjust(period, 0, period);
+			// The audio clock paces the movie, not the DSP: FA acknowledges a frame
+			// only once the SPU has played the audio ring down to 1.5 frames ahead
+			// of the DSP's write position (Mjp_engine's A/V wait), and the DSP
+			// decodes the next frame as soon as it has the acknowledge. (A fixed
+			// 15 fps schedule drifts against the SPU until the play position passes
+			// the writes; FA then sees a nearly full 17000-byte ring and waits a
+			// whole lap, about 1.4 s.)
+			m_sched = 0;
+			schedule_next();
 		}
 		break;
 	}
@@ -358,8 +352,17 @@ void zevio_dsp_hle_device::command(u32 cmd)
 		m_playing = false;
 		m_frame_timer->adjust(attotime::never);
 		break;
-	case 0x83: m_paused = true; break;
-	case 0x84: m_paused = false; break;
+	case 0x83:
+		m_paused = true;
+		break;
+	case 0x84:
+		if (m_paused)
+		{
+			m_paused = false;
+			if (m_playing)
+				schedule_next();
+		}
+		break;
 	default:
 		LOGMASKED(LOG_CMD, "unknown MJP command %02x\n", cmd);
 		break;
@@ -368,9 +371,27 @@ void zevio_dsp_hle_device::command(u32 cmd)
 
 TIMER_CALLBACK_MEMBER(zevio_dsp_hle_device::frame_cb)
 {
-	if (!m_playing || m_paused || m_awaiting_ack || m_mbox[MSG] || m_frame >= m_frames)
+	if (!m_playing || m_paused || m_frame >= m_frames)
 		return;
-	decode_frame();
+	if (m_awaiting_ack || m_mbox[MSG])
+		return;   // the acknowledge reschedules
+	if (!decode_frame())
+		return;
+	m_sched++;
+	// No separate plane request (0x92 with flags 2) is needed here: FA answers every frame message
+	// with the next Y/U/V set at +76/+80/+84 from its 3-buffer rotation (Mjp_engine, bratz_fa
+	// 0x109D0FC0), and an extra request would advance that rotation twice per frame.
+	// ZDSP_DEBUG: the emulated time of every 15th frame (should advance 1 s each at 15 fps)
+	static const bool dbg = getenv("ZDSP_DEBUG") != nullptr;
+	static const bool every = dbg && atoi(getenv("ZDSP_DEBUG")) >= 2;
+	if (dbg && (every || m_sched % 15 == 0))
+		logerror("MJP frame %u (file frame %u/%u) at %.3f s, rd %08x\n", m_sched, m_frame, m_frames, machine().time().as_double(), m_rd);
+}
+
+// the next frame goes out after the DSP's decode time
+void zevio_dsp_hle_device::schedule_next()
+{
+	m_frame_timer->adjust(attotime::from_msec(10));
 }
 
 // parse the chunks of one frame (00dc, 01wb, 02wb) from the ring and post it
@@ -382,6 +403,9 @@ bool zevio_dsp_hle_device::decode_frame()
 	{
 		const u32 fourcc = ring32(m_rd);
 		const u32 num = ring32(m_rd + 4), size = ring32(m_rd + 8);
+		static const bool cdbg = getenv("ZDSP_DEBUG") && atoi(getenv("ZDSP_DEBUG")) >= 4;
+		if (cdbg && m_sched < 12)
+			logerror("MJP chunk %c%c%c%c num %u size %u at %08x\n", fourcc & 0xff, (fourcc >> 8) & 0xff, (fourcc >> 16) & 0xff, fourcc >> 24, num, size, m_rd);
 		if (size > 0x100000)
 			break;
 		if (fourcc == 0x63643030) // "00dc"
@@ -399,7 +423,23 @@ bool zevio_dsp_hle_device::decode_frame()
 				data[i] = ring8(m_rd + 12 + j);
 			}
 			std::vector<u8> jpeg = fix_byte_stuffing(data);
-			if (num == 0 || m_jpeg_header.empty())
+			// a frame that brings its own tables (SOI, then DQT or DHT before SOS) is
+			// complete, e.g. the first frame after a cut to another clip: use it as it is
+			// and keep its tables; the others get the last tables put in front
+			bool complete = jpeg.size() >= 2 && jpeg[0] == 0xff && jpeg[1] == 0xd8;
+			if (complete)
+			{
+				complete = false;
+				for (size_t i = 2; i + 1 < jpeg.size(); i++)
+					if (jpeg[i] == 0xff && (jpeg[i + 1] == 0xdb || jpeg[i + 1] == 0xc4))
+					{
+						complete = true;
+						break;
+					}
+					else if (jpeg[i] == 0xff && jpeg[i + 1] == 0xda)
+						break;
+			}
+			if (num == 0 || m_jpeg_header.empty() || complete)
 			{
 				// keyframe: keep everything before SOS for the following frames
 				for (size_t i = 0; i + 1 < jpeg.size(); i++)
@@ -416,7 +456,23 @@ bool zevio_dsp_hle_device::decode_frame()
 				jpeg.push_back(0xff);
 				jpeg.push_back(0xd9);
 			}
+			if (const char *dump = getenv("ZDSP_DUMP"))   // ZDSP_DUMP=dir: each frame's JPEG and its raw chunk
+			{
+				if (FILE *f = fopen(util::string_format("%s/f%04u_%s.jpg", dump, num, complete ? "own" : "hdr").c_str(), "wb"))
+				{
+					fwrite(jpeg.data(), 1, jpeg.size(), f);
+					fclose(f);
+				}
+				if (FILE *f = fopen(util::string_format("%s/f%04u.raw", dump, num).c_str(), "wb"))
+				{
+					fwrite(data.data(), 1, data.size(), f);
+					fclose(f);
+				}
+			}
 			decode_jpeg(jpeg, m_out[0], m_out[1], m_out[2]);
+			static const bool l5_log = getenv("ZL5_LOG") != nullptr;
+			if (l5_log)
+				logerror("DSP frame %u decoded into %08x %08x %08x at %.4f s\n", num, m_out[0], m_out[1], m_out[2], machine().time().as_double());
 		}
 		else if (fourcc == 0x62773130 || fourcc == 0x62773230) // "01wb" / "02wb"
 		{

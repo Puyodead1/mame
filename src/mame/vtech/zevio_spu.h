@@ -31,6 +31,8 @@ private:
 		u32 addr;
 		u32 phase;
 		s32 sample;     // current decoded sample
+		s32 prev;       // the one before it (output interpolates between them)
+		u32 release, release_len;   // key-off fade: samples left / total (0 = not releasing)
 		// IMA ADPCM (Apple ima4 packets of 34 bytes)
 		u32 packet;     // address of the current packet
 		int nibble;     // 0-63 within the packet

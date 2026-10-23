@@ -42,6 +42,7 @@ private:
 	void post_message();
 	void command(u32 cmd);
 	TIMER_CALLBACK_MEMBER(frame_cb);
+	void schedule_next();
 	bool decode_frame();
 
 	// MJP stream access in the CD ring (wraps at m_ring_end)
@@ -67,6 +68,7 @@ private:
 	u32 m_out[3];         // Y, U, V
 	u32 m_aud[2], m_aud_wp[2], m_aud_size;
 	u32 m_width, m_height, m_frames, m_frame;
+	u32 m_sched;          // frames posted since the start
 	std::vector<u8> m_jpeg_header;
 	u8 m_jpeg_header_save[4096]; // m_jpeg_header for save states
 	u32 m_jpeg_header_len;
