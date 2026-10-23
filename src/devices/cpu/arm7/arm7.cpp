@@ -41,7 +41,10 @@ TODO:
 #include "debug/debugcon.h"
 #include "debugger.h"
 
+#include <algorithm>
 #include <cassert>
+#include <unordered_map>
+#include <vector>
 
 #define LOG_MMU             (1U << 1)
 #define LOG_DSP             (1U << 2)
@@ -1145,7 +1148,7 @@ bool arm7_cpu_device::translate_vaddr_to_paddr(offs_t &vaddr, const int flags)
 	// fast path: recently translated 1K page with the same access type and
 	// privilege (flushed on any CP15 write, reset and state load)
 	const uint32_t xtag = (vaddr >> 10) | ((GET_CPSR & 0xf) ? 0x80000000U : 0);
-	xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][(vaddr >> 10) & (XLAT_CACHE_SIZE - 1)];
+	xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][xlat_slot(vaddr)];
 	if (xe.tag == xtag)
 	{
 		vaddr = xe.ppage | (vaddr & 0x3ff);
@@ -1534,7 +1537,7 @@ inline bool arm7_cpu_device::translate_fast(offs_t &vaddr, const int flags)
 	if (vaddr >= 0x2000000)
 	{
 		const uint32_t xtag = (vaddr >> 10) | ((GET_CPSR & 0xf) ? 0x80000000U : 0);
-		const xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][(vaddr >> 10) & (XLAT_CACHE_SIZE - 1)];
+		const xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][xlat_slot(vaddr)];
 		if (xe.tag == xtag)
 		{
 			vaddr = xe.ppage | (vaddr & 0x3ff);
@@ -2416,8 +2419,13 @@ uint32_t arm7_cpu_device::arm7_rt_r_callback(offs_t offset)
 
 	switch( cReg )
 	{
-		case 4:
 		case 7:
+			// ARM926 "test and clean" (CRm 10) / "test, clean and invalidate" (CRm 14), op2 3, read into r15:
+			// Z set = the D-cache is clean. Caches are not modelled, so it always is.
+			if (op2 == 3 && ((opcode & 0xf) == 10 || (opcode & 0xf) == 14))
+				data = Z_MASK;
+			break;
+		case 4:
 		case 8:
 		case 9:
 		case 10:

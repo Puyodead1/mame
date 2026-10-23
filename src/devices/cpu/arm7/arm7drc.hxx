@@ -50,9 +50,60 @@ void arm7_cpu_device::drc_start()
 	m_drc_dirty = true;
 }
 
+// ARM_DRC_STATS=2: count the instructions the compiled code hands to the interpreter, by
+// decode bits 27-20 and 7-4, and print the most frequent at exit
+// ARM_DRC_OFF=<mask>: leave native paths to the interpreter (for bisecting differences):
+// 1 write-back/post-index forms, 2 halfword/signed, 4 LDR PC, 8 MOV PC, 16 MRS, 32 ALU with Rm = PC, 64 all loads/stores,
+// 128 LDM/STM
+static const unsigned s_drc_off = getenv("ARM_DRC_OFF") ? strtoul(getenv("ARM_DRC_OFF"), nullptr, 0) : 0;
+static const bool s_drc_hist_on = getenv("ARM_DRC_STATS") && atoi(getenv("ARM_DRC_STATS")) >= 2;
+static uint64_t s_drc_hist[4096];
+static uint32_t s_drc_hist_insn[4096];
+static std::unordered_map<uint32_t, uint64_t> s_drc_hist_pc;   // by PC
+static std::unordered_map<uint32_t, uint32_t> s_drc_hist_lr;   // last LR seen there
+static uint64_t s_drc_hist_region[256];                        // interpreted LDR/STR by address bits 31-24
+static std::unordered_map<uint32_t, uint32_t> s_drc_hist_addr; // last LDR/STR address seen there; bit 0: fast RAM through a cached translation
+static struct drc_hist_dump { ~drc_hist_dump() {
+	if (!s_drc_hist_on) return;
+	uint64_t total = 0;
+	std::vector<int> k;
+	for (int i = 0; i < 4096; i++) { total += s_drc_hist[i]; if (s_drc_hist[i]) k.push_back(i); }
+	std::sort(k.begin(), k.end(), [] (int a, int b) { return s_drc_hist[a] > s_drc_hist[b]; });
+	printf("DRC interpreter fallbacks %llu\n", (unsigned long long)total);
+	for (size_t i = 0; i < k.size() && i < 30; i++)
+		printf("  %03x %5.1f%%  e.g. %08x\n", k[i], 100.0 * s_drc_hist[k[i]] / total, s_drc_hist_insn[k[i]]);
+	std::vector<std::pair<uint32_t, uint64_t>> pcs(s_drc_hist_pc.begin(), s_drc_hist_pc.end());
+	std::sort(pcs.begin(), pcs.end(), [] (auto &a, auto &b) { return a.second > b.second; });
+	for (size_t i = 0; i < pcs.size() && i < 90; i++)
+		printf("  pc %08x %5.1f%%  lr %08x  addr %08x\n", pcs[i].first, 100.0 * pcs[i].second / total, s_drc_hist_lr[pcs[i].first], s_drc_hist_addr[pcs[i].first]);
+	for (int r = 0; r < 256; r++)
+		if (s_drc_hist_region[r])
+			printf("  LDR/STR region %02x...... %5.1f%%\n", r, 100.0 * s_drc_hist_region[r] / total);
+} } s_drc_hist_dump;
+
 void arm7_cpu_device::drc_interp_one(void *param)
 {
 	arm7_cpu_device &cpu = *reinterpret_cast<arm7_cpu_device *>(param);
+	if (s_drc_hist_on)
+	{
+		const uint32_t key = ((cpu.m_drc_insn >> 16) & 0xff0) | ((cpu.m_drc_insn >> 4) & 0xf);
+		s_drc_hist[key]++;
+		s_drc_hist_insn[key] = cpu.m_drc_insn;
+		s_drc_hist_pc[cpu.m_r[eR15]]++;
+		s_drc_hist_lr[cpu.m_r[eR15]] = cpu.m_r[sRegisterTable[cpu.m_r[eCPSR] & 0xf][14]];
+		// single loads/stores with an immediate offset: which 16 MB region they touch
+		const uint32_t i = cpu.m_drc_insn;
+		if ((i & 0x0e000000) == 0x04000000 && ((i >> 16) & 15) != 15)
+		{
+			uint32_t a = cpu.m_r[sRegisterTable[cpu.m_r[eCPSR] & 0xf][(i >> 16) & 15]];
+			if (i & INSN_SDT_P)
+				a = (i & INSN_SDT_U) ? a + (i & 0xfff) : a - (i & 0xfff);
+			s_drc_hist_region[a >> 24]++;
+			offs_t pa = a;
+			const bool hit = cpu.xlat_hit(pa, ARM7_TLB_ABORT_D | ((i & INSN_SDT_L) ? ARM7_TLB_READ : ARM7_TLB_WRITE)) && cpu.fastram_ptr(pa);
+			s_drc_hist_addr[cpu.m_r[eR15]] = (a & ~1U) | (hit ? 1 : 0);
+		}
+	}
 	cpu.exec_arm(cpu.m_drc_insn);
 	if (cpu.m_pending_interrupt)
 		cpu.arm7_check_irq_state();
@@ -62,6 +113,92 @@ void arm7_cpu_device::drc_interp_one(void *param)
 void arm7_cpu_device::drc_check_irq(void *param)
 {
 	reinterpret_cast<arm7_cpu_device *>(param)->arm7_check_irq_state();
+}
+
+// LDM/STM (m_drc_insn, condition already passed) on fast RAM, exactly as HandleMemBlock does it:
+// the same addresses, registers, base write-back, loaded PC and cycles. Only the plain case is
+// done here (S clear, base not PC, a non-empty list, word-aligned, every word on fast RAM through a
+// cached translation, no compiled code in a stored page, no PC in an STM list, no switch to Thumb
+// by a loaded PC); m_drc_ok = 0 then, with nothing changed, and the interpreter does it
+void arm7_cpu_device::drc_block_transfer(void *param)
+{
+	reinterpret_cast<arm7_cpu_device *>(param)->drc_block_transfer_impl();
+}
+
+void arm7_cpu_device::drc_block_transfer_impl()
+{
+	const uint32_t insn = m_drc_insn;
+	const uint32_t rb = (insn >> 16) & 15, list = insn & 0xffff;
+	const bool load = insn & INSN_BDT_L, up = insn & INSN_BDT_U, pre = insn & INSN_BDT_P;
+	m_drc_ok = 0;
+	if (!list || (insn & INSN_BDT_S) || rb == 15 || !m_fast_mem || (m_archFlags & ARCHFLAG_MODE26) || !(m_r[eCPSR] & SR_MODE32))
+		return;
+	if (!load && (list & 0x8000))
+		return;
+	const uint32_t n = std::popcount(list);
+	const uint32_t base = GetRegister(rb);
+	if (base & 3)
+		return;
+	// lowest address; registers go to ascending addresses in every mode
+	const uint32_t lo = up ? (pre ? base + 4 : base) : (pre ? base - n * 4 : base - (n - 1) * 4);
+	uint32_t *p[16];
+	const int flags = ARM7_TLB_ABORT_D | (load ? ARM7_TLB_READ : ARM7_TLB_WRITE);
+	uint32_t run = 0; // words after p[k - 1] in the same page and fast RAM region
+	for (uint32_t k = 0; k < n; k++)
+	{
+		// the smallest page is 1 KB, so within one the words are contiguous in host memory too
+		if (run)
+		{
+			p[k] = p[k - 1] + 1;
+			run--;
+			continue;
+		}
+		const offs_t va = lo + k * 4;
+		offs_t pa = va;
+		if (!xlat_hit(pa, flags))
+			return;
+		uint32_t after;
+		uint32_t *const host = fastram_words(pa, after);
+		if (!host)
+			return;
+		run = std::min<uint32_t>(after, (0x3fc - (va & 0x3ff)) / 4);
+		if (!load && m_drc_page_flags)
+		{
+			const offs_t page = (pa - m_drc_pages_base) >> 10;
+			if (page < m_drc_pages_count && m_drc_page_flags[page])
+				return;
+		}
+		p[k] = host;
+	}
+	if (load && (list & 0x8000) && (*p[n - 1] & 1) && m_archRev >= 5)
+		return; // to Thumb
+
+	uint32_t k = 0;
+	if (load)
+	{
+		for (int i = 0; i < 16; i++)
+			if (BIT(list, i))
+			{
+				const uint32_t data = *p[k++];
+				if (i == 15)
+					m_r[eR15] = data & ~3;
+				else
+					SetRegister(i, data);
+			}
+		if ((insn & INSN_BDT_W) && !BIT(list, rb))
+			SetRegister(rb, up ? base + n * 4 : base - n * 4);
+		m_icount -= n + 2 + ((list & 0x8000) ? 2 : 0);   // nS + 1N + 1I, PC 2 more
+	}
+	else
+	{
+		for (int i = 0; i < 16; i++)
+			if (BIT(list, i))
+				*p[k++] = GetRegister(i);
+		if (insn & INSN_BDT_W)
+			SetRegister(rb, up ? base + n * 4 : base - n * 4);
+		m_icount -= n + 1;                                 // (n-1)S + 2N
+	}
+	m_drc_ok = 1;
 }
 
 static uint64_t s_drc_compiles, s_drc_invalidates, s_drc_dirty_flushes, s_drc_compile_insns;
@@ -219,7 +356,8 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 
 		// after a natively compiled instruction: cycles. The interpreter checks
 		// for interrupts first, but the instructions compiled here neither
-		// access memory nor change the mode or the I/F bits, so nothing can
+		// access devices nor change the mode or the I/F bits (those that do,
+		// device loads/stores and MSR CPSR, check themselves), so nothing can
 		// become pending or unmasked: that check would always do nothing.
 		// Execution continues after the tail.
 		auto tail = [&] (int cost, offs_t nextpc)
@@ -369,7 +507,7 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 					if (by)
 						sc_const = BIT(std::rotr<uint32_t>(insn & 0xff, by << 1), 31);
 				}
-				else if (cls == 0 && !(insn & 0x10) && (insn & 15) != 15)
+				else if (cls == 0 && !(insn & 0x10) && !((insn & 15) == 15 && (s_drc_off & 32)))
 				{
 					shift_type = (insn >> 5) & 3;
 					shift_amount = (insn >> 7) & 31;
@@ -393,7 +531,10 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				}
 				else
 				{
-					load(I1, reg(insn & 15));
+					if ((insn & 15) == 15)
+						UML_MOV(block, I1, pc + 8);   // Rm = PC with an immediate shift reads PC + 8
+					else
+						load(I1, reg(insn & 15));
 					if (shift_amount)
 					{
 						switch (shift_type)
@@ -529,33 +670,141 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				continue;
 			}
 
-			// LDR/STR(B) Rd, [Rn, #+-imm] (no write-back, Rd != PC): fast RAM
-			// inline, anything else (other memory, translation miss, unaligned
-			// word, store to a code page) through the interpreter
-			if ((insn & 0x0f200000) == 0x05000000 && rdn != 15 && cond != 15 && m_fast_mem && m_fastram_count)
+			// MUL/MLA and UMULL/UMLAL/SMULL/SMLAL without S, no PC operands, with HandleMul's and
+			// HandleU/SMulLong's cycles: 1 + m (m = 1..4 from the size of Rs), +1 for a long result,
+			// +1 for accumulating (net of their +3 and the interpreter fallback's -3)
+			const bool mul32 = (insn & 0x0fd000f0) == 0x00000090 && m_archRev >= 3;
+			const bool mul64 = (insn & 0x0f9000f0) == 0x00800090 && m_archRev >= 4;
+			if ((mul32 || mul64) && cond != 15 && !(s_drc_off & 1024) && rdn != 15 && rnn != 15
+					&& (insn & 15) != 15 && ((insn >> 8) & 15) != 15)
+			{
+				const code_label skip = (cond != 14) ? condition(cond) : code_label(0);
+				const bool acc = insn & INSN_MUL_A, sgn = mul64 && (insn & 0x00400000);
+				load(I0, reg(insn & 15));          // Rm
+				load(I1, reg((insn >> 8) & 15));   // Rs
+				if (mul32)
+				{
+					UML_MULULW(block, I2, I0, I1);
+					if (acc)
+					{
+						load(I3, reg(rdn));            // Rn (bits 15-12)
+						UML_ADD(block, I2, I2, I3);
+					}
+					store(reg(rnn), I2);               // Rd (bits 19-16)
+				}
+				else
+				{
+					if (sgn)
+						UML_MULS(block, I2, I3, I0, I1);
+					else
+						UML_MULU(block, I2, I3, I0, I1);
+					if (acc)
+					{
+						load(I4, reg(rdn));            // RdLo
+						load(I5, reg(rnn));            // RdHi
+						UML_ADD(block, I2, I2, I4);
+						UML_ADDC(block, I3, I3, I5);
+					}
+					store(reg(rnn), I3);               // RdHi, then RdLo (which wins if they are the same)
+					store(reg(rdn), I2);
+				}
+				// m from Rs: MUL takes |Rs| as unsigned, SMULL |Rs| as signed (so 0x80000000 counts as small),
+				// UMULL Rs as it is
+				if (mul32 || sgn)
+				{
+					UML_SAR(block, I2, I1, 31);
+					UML_XOR(block, I1, I1, I2);
+					UML_SUB(block, I1, I1, I2);
+				}
+				const uml::condition_t ge = sgn ? uml::COND_GE : uml::COND_AE;
+				UML_MOV(block, I4, 1 + (mul64 ? 1 : 0) + (acc ? 1 : 0) + 1);
+				for (const uint32_t t : { 0x100U, 0x10000U, 0x1000000U })
+				{
+					UML_CMP(block, I1, t);
+					UML_SETc(block, ge, I2);
+					UML_ADD(block, I4, I4, I2);
+				}
+				{
+					const code_label ooc = nextlabel++;
+					load(I0, &m_icount);
+					UML_SUB(block, I0, I0, I4);
+					store(&m_icount, I0);
+					UML_CMP(block, I0, 0);
+					UML_JMPc(block, uml::COND_LE, ooc);
+					stubs.emplace_back([&, ooc, pc] ()
+					{
+						UML_LABEL(block, ooc);
+						UML_MOV(block, I0, pc + 4);
+						store(&m_r[eR15], I0);
+						UML_EXIT(block, DRC_EXECUTE_OUT_OF_CYCLES);
+					});
+				}
+				if (cond != 14)
+				{
+					const code_label done = nextlabel++;
+					UML_JMP(block, done);
+					UML_LABEL(block, skip);
+					tail(1, pc + 4); // unexecuted: +2, then -3
+					UML_LABEL(block, done);
+				}
+				continue;
+			}
+
+			// Loads and stores, Rd != PC, inline:
+			//   LDR/STR(B) Rd, [Rn, #+-imm]{!} and [Rn], #+-imm (not the T forms)
+			//   LDR/STR(B) Rd, [Rn, +-Rm, LSL #n]{!} and [Rn], +-Rm, LSL #n (Rn, Rm not PC)
+			//   LDRH/STRH/LDRSB/LDRSH the same ways, Rm unshifted (not LDRD/STRD)
+			// on fast RAM directly, elsewhere through the address space. Anything else
+			// (translation miss, unaligned word or halfword, store to a code page)
+			// goes through the interpreter, which then does the whole instruction
+			// including the base write-back.
+			const uint32_t sh = (insn >> 5) & 3, rmn = insn & 15;
+			const bool sdt_word = (cls == 0x04000000 || (cls == 0x06000000 && !(insn & 0x70) && rmn != 15 && rnn != 15))
+					&& ((insn & INSN_SDT_P) || !(insn & INSN_SDT_W));
+			const bool sdt_half = cls == 0 && (insn & 0x00000090) == 0x00000090 && sh != 0
+					&& ((insn & 0x00400000) || (!(insn & 0xf00) && rmn != 15 && rnn != 15))
+					&& ((insn & INSN_SDT_L) || sh == 1) && ((insn & INSN_SDT_P) || !(insn & INSN_SDT_W));
+			const bool sdt_regoff = sdt_word ? cls == 0x06000000 : !(insn & 0x00400000);
+			const bool sdt_wb = !(insn & INSN_SDT_P) || (insn & INSN_SDT_W);
+			const bool sdt_topc = rdn == 15 && sdt_word && (insn & INSN_SDT_L) && !(insn & INSN_SDT_B) && rnn != 15;
+			if ((sdt_word || sdt_half) && !(s_drc_off & 64) && !(sdt_wb && (s_drc_off & 1)) && !(sdt_half && (s_drc_off & 2))
+					&& !(sdt_topc && (s_drc_off & 4)) && !(sdt_regoff && (s_drc_off & 256)) && (rdn != 15 || sdt_topc) && cond != 15
+					&& !(sdt_wb && rnn == 15) && m_fast_mem && m_fastram_count)
 			{
 				const code_label skip = (cond != 14) ? condition(cond) : code_label(0);
 				const code_label slow = nextlabel++, resume = nextlabel++;
-				const bool isload = insn & INSN_SDT_L, isbyte = insn & INSN_SDT_B;
-				const uint32_t off = insn & 0xfff;
+				const bool isload = insn & INSN_SDT_L, pre = insn & INSN_SDT_P, up = insn & INSN_SDT_U;
+				// access size in bytes, and sign extension for loads
+				const int size = sdt_word ? ((insn & INSN_SDT_B) ? 1 : 4) : (sh == 2 ? 1 : 2);
+				const bool sext = sdt_half && sh >= 2;
+				const uint32_t off = sdt_regoff ? 0 : sdt_word ? (insn & 0xfff) : (((insn >> 4) & 0xf0) | (insn & 0x0f));
+				const uml::operand_size usize = size == 1 ? SIZE_BYTE : size == 2 ? SIZE_WORD : SIZE_DWORD;
 
-				// I0 = virtual address
+				// I5 = register offset (Rm, LSL #n)
+				if (sdt_regoff)
+				{
+					load(I5, reg(rmn));
+					if (sdt_word && ((insn >> 7) & 31))
+						UML_SHL(block, I5, I5, (insn >> 7) & 31);
+				}
+
+				// I0 = virtual address (the base for post-indexing)
 				if (rnn == 15)
-					UML_MOV(block, I0, (insn & INSN_SDT_U) ? pc + 8 + off : pc + 8 - off);
+					UML_MOV(block, I0, up ? pc + 8 + off : pc + 8 - off);
 				else
 				{
 					load(I0, reg(rnn));
-					if (off)
+					if ((off || sdt_regoff) && pre)
 					{
-						if (insn & INSN_SDT_U)
-							UML_ADD(block, I0, I0, off);
+						if (up)
+							UML_ADD(block, I0, I0, sdt_regoff ? uml::parameter(I5) : uml::parameter(off));
 						else
-							UML_SUB(block, I0, I0, off);
+							UML_SUB(block, I0, I0, sdt_regoff ? uml::parameter(I5) : uml::parameter(off));
 					}
 				}
-				if (!isbyte)
+				if (size > 1)
 				{
-					UML_TEST(block, I0, 3);
+					UML_TEST(block, I0, size - 1);
 					UML_JMPc(block, uml::COND_NZ, slow);
 				}
 				// I1 = physical address through the translation cache
@@ -563,7 +812,9 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				{
 					const int flags = ARM7_TLB_ABORT_D | (isload ? ARM7_TLB_READ : ARM7_TLB_WRITE);
 					UML_SHR(block, I2, I0, 10);
-					UML_AND(block, I3, I2, XLAT_CACHE_SIZE - 1);
+					UML_SHR(block, I3, I0, 24);           // I3 = xlat_slot(I0)
+					UML_XOR(block, I3, I3, I2);
+					UML_AND(block, I3, I3, XLAT_CACHE_SIZE - 1);
 					if (mode & 0xf)
 						UML_OR(block, I2, I2, 0x80000000);
 					UML_LOAD(block, I4, &m_xlat_cache[flags & 0xf][0].tag, I3, SIZE_DWORD, SCALE_x8);
@@ -576,13 +827,30 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				else
 					UML_MOV(block, I1, I0);
 
+				// base write-back (after the access; for a load into the base the loaded value wins, as in the interpreter)
+				auto writeback = [&] ()
+				{
+					if (!sdt_wb)
+						return;
+					if (pre || (!off && !sdt_regoff))
+						store(reg(rnn), I0);
+					else
+					{
+						if (up)
+							UML_ADD(block, I2, I0, sdt_regoff ? uml::parameter(I5) : uml::parameter(off));
+						else
+							UML_SUB(block, I2, I0, sdt_regoff ? uml::parameter(I5) : uml::parameter(off));
+						store(reg(rnn), I2);
+					}
+				};
+
 				// fast RAM range (I2 = offset into it); code page check for stores
 				const code_label found = nextlabel++;
 				for (unsigned r = 0; r < m_fastram_count; r++)
 				{
 					const code_label next = nextlabel++;
 					UML_SUB(block, I2, I1, m_fastram[r].start);
-					UML_CMP(block, I2, m_fastram[r].span - (isbyte ? 0 : 3));
+					UML_CMP(block, I2, m_fastram[r].span - (size - 1));
 					UML_JMPc(block, uml::COND_A, next);
 					if (!isload && m_drc_page_flags)
 					{
@@ -592,26 +860,322 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 						UML_TEST(block, I4, 0xff);
 						UML_JMPc(block, uml::COND_NZ, slow);
 					}
-					if (isload)
+					if (isload && sdt_topc)
 					{
-						UML_LOAD(block, I3, m_fastram[r].base, I2, isbyte ? SIZE_BYTE : SIZE_DWORD, SCALE_x1);
+						// to PC: an ARMv5 load with bit 0 set switches to Thumb, leave that to the interpreter
+						// (nothing has been changed yet); otherwise PC = value & ~3
+						UML_LOAD(block, I3, m_fastram[r].base, I2, usize, SCALE_x1);
+						UML_TEST(block, I3, 1);
+						UML_JMPc(block, uml::COND_NZ, slow);
+						writeback();
+						UML_AND(block, I3, I3, ~uint32_t(3));
+						store(&m_r[eR15], I3);
+					}
+					else if (isload)
+					{
+						UML_LOAD(block, I3, m_fastram[r].base, I2, usize, SCALE_x1);
+						if (sext)
+							UML_SEXT(block, I3, I3, usize);
+						writeback();
 						store(reg(rdn), I3);
 					}
 					else
 					{
 						load(I3, reg(rdn));
-						UML_STORE(block, m_fastram[r].base, I2, I3, isbyte ? SIZE_BYTE : SIZE_DWORD, SCALE_x1);
+						UML_STORE(block, m_fastram[r].base, I2, I3, usize, SCALE_x1);
+						writeback();
 					}
 					UML_JMP(block, found);
 					UML_LABEL(block, next);
 				}
-				UML_JMP(block, slow);
+				if (sdt_topc || (s_drc_off & 512))
+					UML_JMP(block, slow);
+				else
+				{
+					// other memory (devices): through the address space, as the interpreter does it
+					// (the translation hit, so nothing can abort). A device may raise an interrupt,
+					// or write code by DMA: check as the interpreter fallback does
+					const code_label check = nextlabel++;
+					if (isload)
+					{
+						UML_READ(block, I3, I1, usize, SPACE_PROGRAM);
+						if (sext)
+							UML_SEXT(block, I3, I3, usize);
+						writeback();
+						store(reg(rdn), I3);
+					}
+					else
+					{
+						load(I3, reg(rdn));
+						UML_WRITE(block, I1, I3, usize, SPACE_PROGRAM);
+						writeback();
+					}
+					UML_LOAD(block, I0, &m_pending_interrupt, 0, SIZE_BYTE, SCALE_x1);
+					UML_LOAD(block, I1, &m_drc_dirty, 0, SIZE_BYTE, SCALE_x1);
+					UML_OR(block, I0, I0, I1);
+					UML_TEST(block, I0, 0xff);
+					UML_JMPc(block, uml::COND_NZ, check);
+
+					stubs.emplace_back([&, check, pc, isload] ()
+					{
+						const code_label ooc = nextlabel++, reset = nextlabel++;
+						UML_LABEL(block, check);
+						UML_MOV(block, I0, pc + 4);
+						store(&m_r[eR15], I0);
+						UML_CALLC(block, &arm7_cpu_device::drc_check_irq, this);
+						load(I0, &m_icount);
+						UML_SUB(block, I0, I0, isload ? 3 : 2);
+						store(&m_icount, I0);
+						UML_CMP(block, I0, 0);
+						UML_JMPc(block, uml::COND_LE, ooc);
+						UML_LOAD(block, I0, &m_drc_dirty, 0, SIZE_BYTE, SCALE_x1);
+						UML_TEST(block, I0, 0xff);
+						UML_JMPc(block, uml::COND_NZ, reset);
+						dynamic_dispatch();
+						UML_LABEL(block, ooc);
+						UML_EXIT(block, DRC_EXECUTE_OUT_OF_CYCLES);
+						UML_LABEL(block, reset);
+						UML_EXIT(block, DRC_EXECUTE_RESET_CACHE);
+					});
+				}
 				UML_LABEL(block, found);
-				tail(isload ? 3 : 2, pc + 4); // loads 3, stores 2 (HandleMemSingle)
+				if (sdt_topc)
+				{
+					// LDR PC: 5 cycles (HandleMemSingle), then wherever it goes; the interpreter
+					// fallback (slow) continues through its own dynamic dispatch
+					const code_label ooc = nextlabel++;
+					load(I0, &m_icount);
+					UML_SUB(block, I0, I0, 5);
+					store(&m_icount, I0);
+					UML_CMP(block, I0, 0);
+					UML_JMPc(block, uml::COND_LE, ooc);
+					load(I1, &m_r[eR15]);
+					UML_HASHJMP(block, mode, I1, *m_drc_nocode);
+					stubs.emplace_back([&, ooc] ()
+					{
+						UML_LABEL(block, ooc);
+						UML_EXIT(block, DRC_EXECUTE_OUT_OF_CYCLES);
+					});
+				}
+				else
+					tail(isload ? 3 : 2, pc + 4); // loads 3, stores 2 (HandleMemSingle, HandleHalfWordDT)
 				UML_LABEL(block, resume);
+				if (sdt_topc && cond == 14)
+				{
+					// back from the interpreter at PC + 4 (its own dispatch handles any other target)
+					UML_MOV(block, I0, pc + 4);
+					store(&m_r[eR15], I0);
+					UML_HASHJMP(block, mode, pc + 4, *m_drc_nocode);
+					ended = true;
+				}
 
 				stubs.emplace_back([&, slow, resume, pc, insn] ()
 				{
+					UML_LABEL(block, slow);
+					fallback(pc, insn);
+					UML_JMP(block, resume);
+				});
+
+				if (cond != 14)
+				{
+					const code_label done = nextlabel++;
+					UML_JMP(block, done);
+					UML_LABEL(block, skip);
+					tail(1, pc + 4);
+					UML_LABEL(block, done);
+				}
+				continue;
+			}
+
+			// MRS Rd, SPSR (Rd != PC; CPSR in modes without one, as the register table maps it): 1 cycle
+			if ((insn & 0x0fff0fff) == 0x014f0000 && rdn != 15 && cond != 15 && !(s_drc_off & 16))
+			{
+				const code_label skip = (cond != 14) ? condition(cond) : code_label(0);
+				load(I0, reg(SPSR));
+				store(reg(rdn), I0);
+				tail(1, pc + 4);
+				if (cond != 14)
+				{
+					const code_label done = nextlabel++;
+					UML_JMP(block, done);
+					UML_LABEL(block, skip);
+					tail(1, pc + 4);
+					UML_LABEL(block, done);
+				}
+				continue;
+			}
+
+			// MSR CPSR/SPSR, fields, Rm or #imm (Rm != PC): HandlePSRTransfer's field rules, 1 cycle. A CPSR
+			// write that would change the mode or the T bit goes to the interpreter (checked before anything
+			// changes); one that can unmask interrupts checks for them, as the interpreter fallback does
+			const bool msr_reg = (insn & 0x0fb0fff0) == 0x0120f000 && (insn & 15) != 15;
+			const bool msr_imm = (insn & 0x0fb0f000) == 0x0320f000;
+			if ((msr_reg || msr_imm) && cond != 15 && !(s_drc_off & 2048) && m_archRev < 6
+					&& !(m_archFlags & (ARCHFLAG_MODE26 | ARCHFLAG_ONLY26)))
+			{
+				const bool spsr = insn & 0x00400000;
+				const bool priv = (mode & MODE_FLAG) != eARM7_MODE_USER;
+				const bool has_spsr = priv && (mode & MODE_FLAG) != eARM7_MODE_SYS;
+				uint32_t mask = 0;
+				if (spsr ? has_spsr : priv)
+					mask |= (BIT(insn, 16) ? 0x000000ffU : 0) | (BIT(insn, 17) ? 0x0000ff00U : 0) | (BIT(insn, 18) ? 0x00ff0000U : 0);
+				if ((spsr ? has_spsr : true) && BIT(insn, 19))
+					mask |= 0xf8000000U;
+				const code_label skip = (cond != 14) ? condition(cond) : code_label(0);
+				const code_label slow = nextlabel++, resume = nextlabel++, irq = nextlabel++;
+				const bool cfield = !spsr && (mask & 0xff);
+				if (mask)
+				{
+					if (msr_imm)
+						UML_MOV(block, I1, std::rotr<uint32_t>(insn & 0xff, ((insn >> 8) & 15) * 2) & mask);
+					else
+					{
+						load(I1, reg(insn & 15));
+						UML_AND(block, I1, I1, mask);
+					}
+					load(I0, spsr ? reg(SPSR) : &m_r[eCPSR]);
+					UML_AND(block, I2, I0, ~mask);
+					UML_OR(block, I2, I2, I1);
+					if (!spsr)
+						UML_OR(block, I2, I2, 0x10);            // set_cpsr: 32-bit modes only
+					if (cfield)
+					{
+						UML_XOR(block, I3, I2, I0);
+						UML_TEST(block, I3, MODE_FLAG | 0x10 | T_MASK);
+						UML_JMPc(block, uml::COND_NZ, slow);
+					}
+					store(spsr ? reg(SPSR) : &m_r[eCPSR], I2);
+					if (cfield)
+					{
+						UML_LOAD(block, I0, &m_pending_interrupt, 0, SIZE_BYTE, SCALE_x1);
+						UML_TEST(block, I0, 0xff);
+						UML_JMPc(block, uml::COND_NZ, irq);
+					}
+				}
+				tail(1, pc + 4);
+				UML_LABEL(block, resume);
+				if (cfield)
+				{
+					stubs.emplace_back([&, slow, resume, irq, pc, insn] ()
+					{
+						const code_label ooc = nextlabel++;
+						UML_LABEL(block, slow);
+						fallback(pc, insn);
+						UML_JMP(block, resume);
+						UML_LABEL(block, irq);
+						UML_MOV(block, I0, pc + 4);
+						store(&m_r[eR15], I0);
+						UML_CALLC(block, &arm7_cpu_device::drc_check_irq, this);
+						load(I0, &m_icount);
+						UML_SUB(block, I0, I0, 1);
+						store(&m_icount, I0);
+						UML_CMP(block, I0, 0);
+						UML_JMPc(block, uml::COND_LE, ooc);
+						dynamic_dispatch();
+						UML_LABEL(block, ooc);
+						UML_EXIT(block, DRC_EXECUTE_OUT_OF_CYCLES);
+					});
+				}
+				if (cond != 14)
+				{
+					const code_label done = nextlabel++;
+					UML_JMP(block, done);
+					UML_LABEL(block, skip);
+					tail(1, pc + 4);
+					UML_LABEL(block, done);
+				}
+				continue;
+			}
+
+			// MRS Rd, CPSR (Rd != PC): 1 cycle (PSR transfer)
+			if ((insn & 0x0fff0fff) == 0x010f0000 && rdn != 15 && cond != 15 && !(s_drc_off & 16))
+			{
+				const code_label skip = (cond != 14) ? condition(cond) : code_label(0);
+				load(I0, &m_r[eCPSR]);
+				store(reg(rdn), I0);
+				tail(1, pc + 4);
+				if (cond != 14)
+				{
+					const code_label done = nextlabel++;
+					UML_JMP(block, done);
+					UML_LABEL(block, skip);
+					tail(1, pc + 4);
+					UML_LABEL(block, done);
+				}
+				continue;
+			}
+
+			// MOV PC, Rm (Rm != PC, no S, no shift): return; 3 cycles as the interpreter
+			// (HandleALU: PC written)
+			if ((insn & 0x0ffffff0) == 0x01a0f000 && (insn & 15) != 15 && cond != 15 && !(s_drc_off & 8))
+			{
+				const code_label skip = (cond != 14) ? condition(cond) : code_label(0);
+				const code_label ooc = nextlabel++;
+				load(I1, reg(insn & 15));
+				UML_AND(block, I1, I1, ~uint32_t(3));
+				store(&m_r[eR15], I1);
+				load(I0, &m_icount);
+				UML_SUB(block, I0, I0, 3);
+				store(&m_icount, I0);
+				UML_CMP(block, I0, 0);
+				UML_JMPc(block, uml::COND_LE, ooc);
+				UML_HASHJMP(block, mode, I1, *m_drc_nocode);
+				stubs.emplace_back([&, ooc] ()
+				{
+					UML_LABEL(block, ooc);
+					UML_EXIT(block, DRC_EXECUTE_OUT_OF_CYCLES);
+				});
+				if (cond != 14)
+				{
+					UML_LABEL(block, skip);
+					tail(1, pc + 4);
+				}
+				else
+					ended = true;
+				continue;
+			}
+
+			// LDM / STM: drc_block_transfer does the plain case (cycles included); anything it
+			// leaves goes through the interpreter
+			if (cls == 0x08000000 && cond != 15 && !(s_drc_off & 128))
+			{
+				const bool topc = (insn & INSN_BDT_L) && (insn & 0x8000);
+				const code_label skip = (cond != 14) ? condition(cond) : code_label(0);
+				const code_label slow = nextlabel++, resume = nextlabel++, ooc = nextlabel++;
+				UML_MOV(block, I0, insn);
+				store(&m_drc_insn, I0);
+				UML_CALLC(block, &arm7_cpu_device::drc_block_transfer, this);
+				UML_LOAD(block, I0, &m_drc_ok, 0, SIZE_BYTE, SCALE_x1);
+				UML_TEST(block, I0, 0xff);
+				UML_JMPc(block, uml::COND_Z, slow);
+				load(I0, &m_icount);
+				UML_CMP(block, I0, 0);
+				UML_JMPc(block, uml::COND_LE, ooc);
+				if (topc)
+				{
+					// R15 = the loaded PC: go there (the mode is unchanged)
+					load(I1, &m_r[eR15]);
+					UML_HASHJMP(block, mode, I1, *m_drc_nocode);
+				}
+				UML_LABEL(block, resume);
+				if (topc && cond == 14)
+				{
+					// back from the interpreter at PC + 4 (its own dispatch handles any other target)
+					UML_MOV(block, I0, pc + 4);
+					store(&m_r[eR15], I0);
+					UML_HASHJMP(block, mode, pc + 4, *m_drc_nocode);
+					ended = true;
+				}
+
+				stubs.emplace_back([&, slow, resume, ooc, pc, insn, topc] ()
+				{
+					UML_LABEL(block, ooc);
+					if (!topc)
+					{
+						UML_MOV(block, I0, pc + 4);
+						store(&m_r[eR15], I0);
+					}
+					UML_EXIT(block, DRC_EXECUTE_OUT_OF_CYCLES);
 					UML_LABEL(block, slow);
 					fallback(pc, insn);
 					UML_JMP(block, resume);

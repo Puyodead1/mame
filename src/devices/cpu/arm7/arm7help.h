@@ -172,7 +172,7 @@ inline bool arm7_cpu_device::xlat_hit(offs_t &addr, const int flags) const
 	if (addr < 0x2000000)
 		return false;
 	const uint32_t xtag = (addr >> 10) | ((m_r[eCPSR] & 0xf) ? 0x80000000U : 0);
-	const xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][(addr >> 10) & (XLAT_CACHE_SIZE - 1)];
+	const xlat_cache_entry &xe = m_xlat_cache[flags & 0xf][xlat_slot(addr)];
 	if (xe.tag != xtag)
 		return false;
 	addr = xe.ppage | (addr & 0x3ff);

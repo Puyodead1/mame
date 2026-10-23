@@ -269,8 +269,12 @@ protected:
 
 	// small direct-mapped cache of successful 1K-page translations, indexed by
 	// the TLB access flags; flushed on CP15 writes, reset and state load
-	static constexpr unsigned XLAT_CACHE_SIZE = 256;
+	// (4 MB of pages: Cars' interrupt handler globals were evicted between interrupts at 256)
+	static constexpr unsigned XLAT_CACHE_SIZE = 4096;
 	struct xlat_cache_entry { uint32_t tag = ~0U; uint32_t ppage = 0; };
+	// slot of a page: bits 31-24 are folded in so the first pages of different 16 MB regions
+	// (devices at 0xA4000000, 0xA8000000, 0xDC000000 ...) do not all share slot 0
+	static unsigned xlat_slot(uint32_t vaddr) { return ((vaddr >> 10) ^ (vaddr >> 24)) & (XLAT_CACHE_SIZE - 1); }
 	xlat_cache_entry m_xlat_cache[16][XLAT_CACHE_SIZE];
 	void xlat_cache_flush();
 
@@ -313,6 +317,9 @@ protected:
 	void drc_code_written(offs_t page);
 	static void drc_interp_one(void *param);
 	static void drc_check_irq(void *param);
+	static void drc_block_transfer(void *param);
+	void drc_block_transfer_impl();
+	uint8_t m_drc_ok = 0;
 	// inline cache check before the virtual translate (cache entries only
 	// come from arm7_cpu_device::translate_vaddr_to_paddr)
 	bool translate_fast(offs_t &vaddr, const int flags);
@@ -354,6 +361,21 @@ protected:
 		for (unsigned i = 0; i < m_fastram_count; i++)
 			if (addr - m_fastram[i].start <= m_fastram[i].span)
 				return m_fastram[i].base + (addr - m_fastram[i].start);
+#endif
+		return nullptr;
+	}
+
+	// as fastram_ptr for a word, also giving how many more words follow on in the same region
+	uint32_t *fastram_words(offs_t addr, uint32_t &after) const
+	{
+#ifdef LSB_FIRST
+		for (unsigned i = 0; i < m_fastram_count; i++)
+			if (addr - m_fastram[i].start <= m_fastram[i].span)
+			{
+				const offs_t off = addr - m_fastram[i].start;
+				after = (m_fastram[i].span - off + 1) / 4 - 1;
+				return reinterpret_cast<uint32_t *>(m_fastram[i].base + off);
+			}
 #endif
 		return nullptr;
 	}
