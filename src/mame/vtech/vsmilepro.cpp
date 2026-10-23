@@ -51,6 +51,7 @@
 #include "machine/nvram.h"
 
 #include "cdrom.h"
+#include "osdfile.h"
 #include "screen.h"
 #include "softlist.h"
 #include "speaker.h"
@@ -85,6 +86,7 @@ public:
 		m_screen(*this, "screen"),
 		m_cdrom(*this, "cdrom"),
 		m_nvram(*this, "spiflash"),
+		m_cardnv(*this, "memcard"),
 		m_spu(*this, "spu"),
 		m_gpu(*this, "gpu"),
 		m_dsp(*this, "dsp"),
@@ -92,6 +94,7 @@ public:
 		m_spi_region(*this, "spi"),
 		m_io_keys(*this, "KEYS"),
 		m_io_straps(*this, "STRAPS"),
+		m_io_conf(*this, "CONF"),
 		m_io_joy_buttons(*this, "JOY%u_BUTTONS", 1U),
 		m_io_joy_stick(*this, "JOY%u_STICK", 1U)
 	{ }
@@ -112,6 +115,9 @@ private:
 	static constexpr u32 DISP_010_RESET = 0x00010000;
 	static constexpr u32 PERIPH_CLOCK = 37'500'000; // PLL out3 at boot settings
 	static constexpr u32 SFLASH_SIZE = 0x10000;
+	// AT45DB642D memory card: 8192 pages of 1056 bytes, or 1024 in power-of-2 mode
+	static constexpr u32 CARD_PAGES = 8192;
+	static constexpr u32 CARD_PAGE_MAX = 1056;
 
 	// interrupt sources
 	enum
@@ -134,6 +140,7 @@ private:
 	{
 		u8 ier, lcr, mcr, scr, dll, dlm, fcr;
 		bool thre_pending;
+		u8 lsr_err;     // overrun (bit 1), cleared by reading LSR
 		std::deque<u8> rx;
 		std::string line;
 	};
@@ -142,6 +149,7 @@ private:
 	required_device<screen_device> m_screen;
 	required_device<cdrom_image_device> m_cdrom;
 	required_device<nvram_device> m_nvram;
+	required_device<nvram_device> m_cardnv;
 	required_device<zevio_spu_device> m_spu;
 	required_device<zevio_gpu_device> m_gpu;
 	required_device<zevio_dsp_hle_device> m_dsp;
@@ -149,6 +157,7 @@ private:
 	optional_memory_region m_spi_region;
 	required_ioport m_io_keys;
 	required_ioport m_io_straps;
+	required_ioport m_io_conf;
 	required_ioport_array<2> m_io_joy_buttons;
 	required_ioport_array<2> m_io_joy_stick;
 
@@ -250,6 +259,15 @@ private:
 	void uart_update_irq(int n);
 	u8 uart_iir(int n);
 
+	// serial link for homebrew loaders: VFLASH_SERIAL=<controller port 1|2>:<tcp port> listens on
+	// 127.0.0.1:<tcp port>; the UART's TX goes to the socket and bytes from the socket arrive at the UART's
+	// baud rate into its 16-byte FIFO (overrun when the CPU does not keep up). No controller on that port.
+	int m_ser_port;
+	osd_file::ptr m_ser_file;
+	std::deque<u8> m_ser_in;
+	emu_timer *m_ser_timer;
+	TIMER_CALLBACK_MEMBER(ser_cb);
+
 	// SPI and serial flash
 	u32 m_spi_regs[0x40 / 4];
 	std::unique_ptr<u8[]> m_sflash;
@@ -260,11 +278,19 @@ private:
 	void spi_transfer(int nbytes);
 	u8 sflash_xfer(int index, u8 data, std::vector<u8> &cmd);
 	u8 dataflash_xfer(int index, u8 data, std::vector<u8> &cmd);
+	std::unique_ptr<u8[]> m_card;           // CARD_PAGES * CARD_PAGE_MAX bytes, page p at p * CARD_PAGE_MAX
+	u8 m_card_buf[2][CARD_PAGE_MAX];
+	u8 m_card_pow2;                         // 1 = 1024-byte pages (one-time setting on the real chip)
+	u32 card_page_size() const { return m_card_pow2 ? 1024 : 1056; }
+	void card_decode(const std::vector<u8> &cmd, u32 &page, u32 &byte) const;
 
 
 	// display
 	u32 m_disp_regs[0x3000 / 4];
 	u32 m_disp_shown[0xc00 / 4] = {}, m_disp_prev[0xc00 / 4] = {}; // display registers as of the previous frame
+	// layer-5 YCbCr planes: V - Y of the last set written whole, and whether the newest Y came without its V
+	u32 m_l5_yv_delta = 0;
+	bool m_l5_v_missing = false;
 	u64 m_disp_frame = ~0ULL;
 	bool m_disp_delayed = false;
 	u32 m_disp_status;
@@ -356,6 +382,16 @@ void vsmilpro_state::set_irq(int source, int state)
 	// sources latch on a rising edge until written to +0x04 (software sets
 	// 0xDC000204 bits 17/18 for them; FA counts each IRQ 17 as one message).
 	const u32 bit = 1U << source;
+	// ZINT_STATS: count rising edges per source, printed at exit
+	static u64 s_int_edges[32];
+	static struct int_stats_dump { ~int_stats_dump() {
+		if (getenv("ZINT_STATS"))
+			for (int i = 0; i < 32; i++)
+				if (s_int_edges[i])
+					printf("IRQ source %2d: %llu raised%c", i, (unsigned long long)s_int_edges[i], 10);
+	} } s_int_stats_dump;
+	if (state && !(m_int_raw & bit))
+		s_int_edges[source & 31]++;
 	if (state && !(m_int_raw & bit) && (EDGE_SOURCES & bit))
 		m_int_latched |= bit;
 	if (state)
@@ -711,7 +747,11 @@ u32 vsmilpro_state::uart_r(offs_t offset)
 		break;
 	case 3: ret = u.lcr; break;
 	case 4: ret = u.mcr; break;
-	case 5: ret = 0x60 | (u.rx.empty() ? 0 : 1); break;
+	case 5:
+		ret = 0x60 | (u.rx.empty() ? 0 : 1) | u.lsr_err;
+		if (!machine().side_effects_disabled())
+			u.lsr_err = 0;
+		break;
 	case 6: ret = 0xb0; break;
 	case 7: ret = u.scr; break;
 	}
@@ -733,7 +773,16 @@ void vsmilpro_state::uart_w(offs_t offset, u32 data, u32 mem_mask)
 		{
 			LOGMASKED(LOG_UART, "uart%d tx %02x\n", N, data);
 			const u32 divisor = (u.dlm << 8) | u.dll;
-			if (divisor >= 200)
+			if (N == m_ser_port)
+			{
+				if (m_ser_file)
+				{
+					const u8 b = data;
+					u32 actual;
+					m_ser_file->write(&b, 0, 1, actual);
+				}
+			}
+			else if (divisor >= 200)
 				joy_from_console(N, data); // 9600 baud: controller port
 			else if (N == 0)
 			{
@@ -811,6 +860,8 @@ void vsmilpro_state::joy_send(int port, const u8 *payload, int len)
 
 void vsmilpro_state::joy_from_console(int port, u8 data)
 {
+	if (port == m_ser_port)
+		return;
 	joy_t &j = m_joy[port];
 	if (j.cmd.empty() && data != 0xff)
 		return;
@@ -881,6 +932,32 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::joy_cb)
 }
 
 
+TIMER_CALLBACK_MEMBER(vsmilpro_state::ser_cb)
+{
+	uart_t &u = m_uart[m_ser_port];
+	if (m_ser_in.empty())
+	{
+		u8 buf[4096];
+		u32 actual = 0;
+		if (!m_ser_file->read(buf, 0, sizeof(buf), actual) && actual)
+			m_ser_in.insert(m_ser_in.end(), buf, buf + actual);
+	}
+	if (!m_ser_in.empty())
+	{
+		if (u.rx.size() >= 16)
+			u.lsr_err |= 2; // overrun: the byte is lost
+		else
+			u.rx.push_back(m_ser_in.front());
+		m_ser_in.pop_front();
+		uart_update_irq(m_ser_port);
+	}
+	// one 8N1 character (10 bits) at the programmed rate: f3 / (16 x divisor), f3 = 37.5 MHz
+	const u32 divisor = (u.dlm << 8) | u.dll;
+	m_ser_timer->adjust(m_ser_in.empty() ? attotime::from_msec(1)
+			: attotime::from_ticks(160 * std::max<u32>(divisor, 1), 37'500'000));
+}
+
+
 /***************************************************************************
     SPI controller (0xA1000000) with the on-board serial flash and the
     DataFlash memory card. GPIO0 bit 19 selects: high = serial flash.
@@ -917,22 +994,17 @@ void vsmilpro_state::spi_transfer(int nbytes)
 	std::vector<u8> cmd;
 	for (int i = 0; i < nbytes; i++)
 		rx[i] = sflash ? sflash_xfer(i, tx[i], cmd) : dataflash_xfer(i, tx[i], cmd);
-	for (int i = nbytes; i < 8; i++)
-		rx[i] = 0xff;
 
-	// short frames come back right-justified in +0x1C (status = low byte after
-	// a 2-byte frame); longer frames keep bytes 0-3 in +0x1C and 4-7 in +0x20
-	u32 w0 = 0, w1 = 0;
-	if (nbytes <= 4)
+	// +0x1C and +0x20 are shift registers: +0x1C shifts first (sends bit 31, takes MISO in at bit 0), then +0x20
+	// for the bytes after the fourth, so received bytes end up right-aligned in the last word used: a 2-byte
+	// frame's byte 1 is the low byte of +0x1C, a 6-byte frame's byte 5 the low byte of +0x20 (HARDWARE.md 13,
+	// consistent with every firmware use)
+	u32 w0 = m_spi_regs[0x1c / 4], w1 = m_spi_regs[0x20 / 4];
+	for (int i = 0; i < nbytes; i++)
 	{
-		for (int i = 0; i < nbytes; i++)
+		if (i < 4)
 			w0 = (w0 << 8) | rx[i];
-	}
-	else
-	{
-		for (int i = 0; i < 4; i++)
-			w0 = (w0 << 8) | rx[i];
-		for (int i = 4; i < 8; i++)
+		else
 			w1 = (w1 << 8) | rx[i];
 	}
 	m_spi_regs[0x1c / 4] = w0;
@@ -1020,11 +1092,118 @@ u8 vsmilpro_state::sflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 	}
 }
 
-// TODO: AT45DB642D memory card. For now no card is inserted.
+// AT45DB642D DataFlash memory card (Atmel datasheet 3542; the commands the firmware uses are listed in
+// HARDWARE.md section 13). One command per SPI frame: the controller drives chip select once per frame, so
+// every frame starts a new command. Opcode and address bytes clock out 0xff.
+void vsmilpro_state::card_decode(const std::vector<u8> &cmd, u32 &page, u32 &byte) const
+{
+	const u32 a = (cmd[1] << 16) | (cmd[2] << 8) | cmd[3];
+	if (m_card_pow2)
+	{
+		page = (a >> 10) & (CARD_PAGES - 1);
+		byte = a & 0x3ff;
+	}
+	else
+	{
+		page = (a >> 11) & (CARD_PAGES - 1);
+		byte = a & 0x7ff;
+	}
+}
+
 u8 vsmilpro_state::dataflash_xfer(int index, u8 data, std::vector<u8> &cmd)
 {
+	if (!BIT(m_io_conf->read(), 0))
+		return 0x00; // no card: MISO reads 0 (the firmware takes a 0 ID as "no card")
 	cmd.push_back(data);
-	return 0xff;
+	const u8 op = cmd[0];
+	const u32 psize = card_page_size();
+	u32 page = 0, byte = 0;
+	if (cmd.size() >= 4)
+		card_decode(cmd, page, byte);
+	u8 *const mem = &m_card[page * CARD_PAGE_MAX];
+	switch (op)
+	{
+	case 0x9f: // manufacturer and device id: Atmel, AT45DB642D
+	{
+		static const u8 id[] = { 0xff, 0x1f, 0x28, 0x00, 0x01, 0x00 };
+		return index < 6 ? id[index] : 0x00;
+	}
+	case 0xd7: // status: ready, density 1111 (64 Mbit), bit 0 = power-of-2 page size
+		return index >= 1 ? u8(0x80 | 0x3c | m_card_pow2) : 0xff;
+	case 0x03: case 0x0b: case 0xe8: // continuous array read (0x0b: 1 dummy byte, 0xe8: 4 dummy bytes)
+	{
+		const int first = op == 0x03 ? 4 : op == 0x0b ? 5 : 8;
+		if (index < first)
+			return 0xff;
+		u32 p = page, b = byte + (index - first);
+		p = (p + b / psize) & (CARD_PAGES - 1);
+		b %= psize;
+		return m_card[p * CARD_PAGE_MAX + b];
+	}
+	case 0xd2: // main memory page read (4 dummy bytes), wraps within the page
+		return index >= 8 ? mem[(byte + index - 8) % psize] : 0xff;
+	case 0x53: case 0x55: // main memory page to buffer 1 / 2
+		if (index == 3)
+			std::copy_n(mem, CARD_PAGE_MAX, m_card_buf[op == 0x55]);
+		return 0xff;
+	case 0xd4: case 0xd6: // buffer 1 / 2 read, 1 dummy byte
+	case 0xd1: case 0xd3: // buffer 1 / 2 read, low frequency, no dummy byte
+	{
+		const int first = (op == 0xd4 || op == 0xd6) ? 5 : 4;
+		if (index < first)
+			return 0xff;
+		const u32 off = ((cmd[2] << 8) | cmd[3]) & 0x7ff;
+		return m_card_buf[op == 0xd6 || op == 0xd3][(off + index - first) % psize];
+	}
+	case 0x84: case 0x87: // buffer 1 / 2 write
+		if (index >= 4)
+		{
+			const u32 off = ((cmd[2] << 8) | cmd[3]) & 0x7ff;
+			m_card_buf[op == 0x87][(off + index - 4) % psize] = data;
+		}
+		return 0xff;
+	case 0x83: case 0x86: // buffer to main memory page with built-in erase
+		if (index == 3)
+			std::copy_n(m_card_buf[op == 0x86], psize, mem);
+		return 0xff;
+	case 0x88: case 0x89: // buffer to main memory page without erase (programs 1 -> 0)
+		if (index == 3)
+			for (u32 i = 0; i < psize; i++)
+				mem[i] &= m_card_buf[op == 0x89][i];
+		return 0xff;
+	case 0x81: // page erase
+		if (index == 3)
+			std::fill_n(mem, CARD_PAGE_MAX, 0xff);
+		return 0xff;
+	case 0x50: // block erase: 8 pages
+		if (index == 3)
+			std::fill_n(&m_card[(page & ~7u) * CARD_PAGE_MAX], 8 * CARD_PAGE_MAX, 0xff);
+		return 0xff;
+	case 0x7c: // sector erase: sector 0a = pages 0-7, 0b = 8-255, sector n = 256 pages
+		if (index == 3)
+		{
+			u32 first = page & ~255u, count = 256;
+			if (first == 0)
+			{
+				first = page < 8 ? 0 : 8;
+				count = page < 8 ? 8 : 248;
+			}
+			std::fill_n(&m_card[first * CARD_PAGE_MAX], count * CARD_PAGE_MAX, 0xff);
+		}
+		return 0xff;
+	case 0xc7: // chip erase (C7 94 80 9A)
+		if (index == 3 && cmd[1] == 0x94 && cmd[2] == 0x80 && cmd[3] == 0x9a)
+			std::fill_n(&m_card[0], CARD_PAGES * CARD_PAGE_MAX, 0xff);
+		return 0xff;
+	case 0x3d: // 3D 2A 80 A6: switch to 1024-byte pages (one-time programmable on the chip)
+		if (index == 3 && cmd[1] == 0x2a && cmd[2] == 0x80 && cmd[3] == 0xa6)
+			m_card_pow2 = 1;
+		return 0xff;
+	default:
+		if (index == 0)
+			LOGMASKED(LOG_UNKNOWN, "%08x: memory card unknown command %02x\n", m_maincpu->pc(), op);
+		return 0xff;
+	}
 }
 
 
@@ -1123,6 +1302,21 @@ void vsmilpro_state::disp_w(offs_t offset, u32 data, u32 mem_mask)
 	}
 	COMBINE_DATA(&m_disp_regs[offset]);
 	LOGMASKED(LOG_VIDEO, "%08x: disp %04x = %08x\n", m_maincpu->pc(), offset * 4, data);
+	static const bool l5_log = getenv("ZL5_LOG") != nullptr;
+	if (l5_log && offset >= 0x164 / 4 && offset <= 0x16c / 4)
+		logerror("L5 %03x = %08x at %.4f s line %d\n", offset * 4, data, machine().time().as_double(), m_screen->vpos());
+	// [EMU workaround] Wacky Races' movie player sets the three planes of each new frame with
+	// Disp_setL5Planes, which skips zero arguments; once a second it passes no V plane, so the frame
+	// would show with the previous frame's V plane (a purple or washed-out flash). Its three plane sets
+	// all keep V at the same offset from Y, so a Y without its V uses that offset.
+	if (offset == 0x164 / 4)
+		m_l5_v_missing = true;
+	else if (offset == 0x16c / 4)
+	{
+		m_l5_v_missing = false;
+		if (data && m_disp_regs[0x164 / 4])
+			m_l5_yv_delta = data - m_disp_regs[0x164 / 4];
+	}
 	if (offset == 0x00c / 4 || offset == 0x008 / 4)
 		disp_update_screen_size();
 	if (offset == 0x00c / 4 || offset == 0x008 / 4 || offset == 0x1048 / 4 || offset == 0x020 / 4)
@@ -1181,7 +1375,8 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		const u32 a = regs[0x138 / 4], b = regs[0x13c / 4];
 		const int x0 = a & 0x7ff, y0 = (a >> 16) & 0x7ff, x1 = b & 0x7ff, y1 = (b >> 16) & 0x7ff;
 		const int w = x1 - x0 + 1;
-		const u32 yb = regs[0x164 / 4], ub = regs[0x168 / 4], vb = regs[0x16c / 4];
+		const u32 yb = regs[0x164 / 4], ub = regs[0x168 / 4];
+		const u32 vb = (m_l5_v_missing && m_l5_yv_delta && !BIT(enable, 14)) ? yb + m_l5_yv_delta : regs[0x16c / 4];
 		if (BIT(enable, 14))
 		{
 			// +0x100 bit 14: linear BGR555 instead of YCbCr (the boot ROM's
@@ -1225,7 +1420,6 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 	// lines one window wide, which is what the boot ROM's UI draws (UI_fillRect:
 	// buf + 2 * (320 * y + x)) after its UI screens clear the bit (ROM 0x10025EAC).
 	// Confirmed on hardware: tiled pixels shown after the menu came out as lines.
-	const bool video = BIT(enable, 5);
 	if (BIT(gregs[0x100 / 4], 4) && !BIT(gregs[0x010 / 4], 16))
 	{
 		const u32 start = gregs[0x160 / 4];
@@ -1264,8 +1458,6 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 				const u16 p = in_sdram(addr) ? ram_r16(addr) : 0;
 				if (BIT(p, 15))
 					continue; // transparent: confirmed on hardware with CPU-drawn pixels
-				if (video && !(p & 0x7fff))
-					continue; // black shows the video layer underneath (Wacky Race's movie window)
 				dst[x] = bgr555(p);
 			}
 		}
@@ -1751,6 +1943,11 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 				ram_w8(m_cd_ptr + i, raw[i]);
 		}
 		LOGMASKED(LOG_CD, "cd sector lba %d -> %08x (%d bytes)\n", lba, m_cd_ptr, size);
+		// ZCD_RATE: time and write pointer every 75 sectors (stream rate checks)
+		static const bool rate_log = getenv("ZCD_RATE") != nullptr;
+		static u32 delivered;
+		if (rate_log && (++delivered % 75 == 0 || atoi(getenv("ZCD_RATE")) >= 2))
+			logerror("CDRATE %.3f s lba %d ptr %08x\n", machine().time().as_double(), lba, m_cd_ptr);
 
 		// the watermark fires when the write pointer reaches it, which
 		// includes passing it in this step (ring wrap aware)
@@ -1988,6 +2185,15 @@ void vsmilpro_state::machine_start()
 	if (m_spi_region)
 		std::copy_n(m_spi_region->base(), std::min<u32>(m_spi_region->bytes(), SFLASH_SIZE), &m_sflash[0]);
 	m_nvram->set_base(&m_sflash[0], SFLASH_SIZE);
+	// memory card: a blank card in power-of-2 mode (the boot ROM converts every card it sees, HARDWARE.md 13);
+	// the page-size flag is kept in the byte after the last page so it survives in the nvram file
+	m_card = std::make_unique<u8[]>(CARD_PAGES * CARD_PAGE_MAX + 1);
+	std::fill_n(&m_card[0], CARD_PAGES * CARD_PAGE_MAX + 1, 0xff);
+	m_cardnv->set_base(&m_card[0], CARD_PAGES * CARD_PAGE_MAX + 1);
+	m_card_pow2 = 1;
+	save_pointer(NAME(m_card), CARD_PAGES * CARD_PAGE_MAX + 1);
+	save_item(NAME(m_card_buf));
+	save_item(NAME(m_card_pow2));
 
 	m_dsp_mem = std::make_unique<u16[]>(0x80000);
 	m_spu->set_ram(m_sdram.target(), SDRAM_BASE, SDRAM_SIZE);
@@ -2003,6 +2209,28 @@ void vsmilpro_state::machine_start()
 	m_line_timer = timer_alloc(FUNC(vsmilpro_state::line_cb), this);
 	m_joy_timer = timer_alloc(FUNC(vsmilpro_state::joy_cb), this);
 	m_cd_timer = timer_alloc(FUNC(vsmilpro_state::cd_sector_cb), this);
+
+	m_ser_port = -1;
+	m_ser_timer = timer_alloc(FUNC(vsmilpro_state::ser_cb), this);
+	if (const char *ser = getenv("VFLASH_SERIAL"))
+	{
+		int port = 0, tcp = 0;
+		if (sscanf(ser, "%d:%d", &port, &tcp) == 2 && (port == 1 || port == 2) && tcp > 0)
+		{
+			u64 size;
+			if (osd_file::open(util::string_format("socket.127.0.0.1:%d", tcp),
+					OPEN_FLAG_READ | OPEN_FLAG_WRITE | OPEN_FLAG_CREATE, m_ser_file, size))
+				osd_printf_error("VFLASH_SERIAL: cannot listen on 127.0.0.1:%d\n", tcp);
+			else
+			{
+				m_ser_port = port - 1;
+				osd_printf_info("VFLASH_SERIAL: controller port %d <-> 127.0.0.1:%d\n", port, tcp);
+				m_ser_timer->adjust(attotime::from_msec(1));
+			}
+		}
+		else
+			osd_printf_error("VFLASH_SERIAL must be <controller port 1|2>:<tcp port>\n");
+	}
 
 	// Speedup: the boot ROM's idle task (0x1001098C) is an endless counting
 	// loop whose counter lives at 0x101E05E4; sleep until the next interrupt
@@ -2104,6 +2332,7 @@ void vsmilpro_state::soc_reset()
 	{
 		u.ier = u.lcr = u.mcr = u.scr = u.dll = u.dlm = u.fcr = 0;
 		u.thre_pending = false;
+		u.lsr_err = 0;
 		u.rx.clear();
 		u.line.clear();
 	}
@@ -2179,6 +2408,11 @@ static INPUT_PORTS_START( vsmilpro )
 	PORT_DIPSETTING(    0x00, DEF_STR( Off ) )
 	PORT_DIPSETTING(    0x10, DEF_STR( On ) )
 
+	PORT_START("CONF")
+	PORT_CONFNAME( 0x01, 0x01, "Memory card" )
+	PORT_CONFSETTING(    0x00, "None" )
+	PORT_CONFSETTING(    0x01, "Inserted" )
+
 	// controller button word; names give the key code the boot ROM menu assigns
 	PORT_START("JOY1_BUTTONS")
 	PORT_BIT( 0x0001, IP_ACTIVE_HIGH, IPT_BUTTON9 )  PORT_PLAYER(1) PORT_NAME("P1 Button (code 1)")
@@ -2229,9 +2463,15 @@ void vsmilpro_state::vsmilpro(machine_config &config)
 	m_maincpu->add_idle_loop(0x100109a4, 0x10010994, {
 			0xe3a03000, 0xe5cd3007, 0xe3a03000, 0xe58d3000, 0xe59d3000, 0xe35300fe, 0x9a000000, 0xeafffff7,
 			0xe5dd3007, 0xe2833001, 0xe5cd3007, 0xe59d3000, 0xe2833001, 0xe58d3000, 0xeafffff4 });
+	// Wacky Races (Jumpin' Bean Island): the main loop's frame pacing spins until the timer at
+	// 0x900C000C has moved 0x30 counts on from the last frame; each pass only reads the time
+	m_maincpu->add_idle_loop(0x10b520c4, 0x10b520c4, {
+			0xeb001f92, 0xe1a03000, 0xe1a00003, 0xebff13f0, 0xe1a02000, 0xe59d3008, 0xe5933124, 0xe0633002,
+			0xe3530030, 0x9afffff5 });
 	m_maincpu->set_addrmap(AS_PROGRAM, &vsmilpro_state::vsmilpro_map);
 
 	NVRAM(config, m_nvram, nvram_device::DEFAULT_NONE);
+	NVRAM(config, m_cardnv, nvram_device::DEFAULT_ALL_1);
 
 	SCREEN(config, m_screen);
 	m_screen->set_refresh_hz(60);
@@ -2286,4 +2526,4 @@ ROM_END
 //    YEAR  NAME       PARENT    COMPAT  MACHINE   INPUT     CLASS           INIT        COMPANY  FULLNAME                 FLAGS
 COMP( 2007, vsmilpro,  0,        0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Smile Pro (Germany)", MACHINE_NO_SOUND | MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
 COMP( 2007, vsmilprof, vsmilpro, 0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Smile Pro (France)",  MACHINE_NO_SOUND | MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
-COMP( 2006, vflash,    vsmilpro, 0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Flash (USA)",         MACHINE_NO_SOUND | MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
+COMP( 2006, vflash,    vsmilpro, 0,      vsmilpro, vsmilpro, vsmilpro_state, empty_init, "VTech", "V.Flash (USA)",         MACHINE_SUPPORTS_SAVE )
