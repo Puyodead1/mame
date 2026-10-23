@@ -42,6 +42,10 @@
 #include "emu.h"
 #include "zevio_gpu.h"
 
+#include <mutex>
+#include <set>
+#include <tuple>
+
 #include <map>
 #include <thread>
 
@@ -56,7 +60,12 @@ DEFINE_DEVICE_TYPE(ZEVIO_GPU, zevio_gpu_device, "zevio_gpu", "Zevio 1020 GPU")
 
 namespace {
 
-constexpr int ZW = 1024, ZH = 2048; // depth buffer in absolute GPU coordinates
+constexpr int ZW = 1024, ZH = 4096; // depth buffer, depth-area coordinates (see zptr)
+// A 16-bit depth value h (a sprite's depth word, anything written into the depth area) stands for eye
+// distance 1 / h: the firmware computes sprite depth as f16(K / z) with K = FX_ONE, its fixed-point 1.0
+// (Sprite_setDepth, fw/fa_28.md). [EMU: assumed the same for 3D; games rule out large scales (Wacky Races
+// draws menu sprites, h >= 128, over a 3D background at d >= 1 with no clear between), not small ones]
+constexpr float ZSCALE = 1.0f;
 
 inline void bgr555_to_f(u16 c, float &r, float &g, float &b)
 {
@@ -95,6 +104,8 @@ void zevio_gpu_device::device_start()
 	const int hw = std::max<int>(std::thread::hardware_concurrency(), 1);
 	m_bands = std::clamp<int>(hw * 3, 1, MAX_BANDS);
 	m_queue = (hw > 1) ? osd_work_queue_alloc(WORK_QUEUE_FLAG_MULTI) : nullptr;
+	// lists are drawn on a render thread; ZGPU_SYNC draws them on the emulation thread instead
+	// (about 25% slower in Cars' menu; tested as a fix for corrupted menu text, which it was not)
 	m_async = !getenv("ZGPU_SYNC");
 	if (m_async)
 		m_thread = std::thread([this] { render_thread(); });
@@ -141,15 +152,22 @@ void zevio_gpu_device::device_pre_save()
 	sync();
 }
 
+void zevio_gpu_device::device_post_load()
+{
+	for (int r = 0; r < 256; r++)
+		m_rf[r] = f16_to_float(m_r[r]);
+}
+
 void zevio_gpu_device::device_reset()
 {
 	sync();
 	std::fill(std::begin(m_regs), std::end(m_regs), 0);
 	std::fill(std::begin(m_cvt), std::end(m_cvt), 0);
 	std::fill(std::begin(m_r), std::end(m_r), 0);
-	m_r[0x3c] = m_r[0x3d] = m_r[0x3e] = 0x3e00;
-	m_r[0x40] = m_r[0x44] = m_r[0x48] = 0x3e00;
+	for (int r : { 0x3c, 0x3d, 0x3e, 0x40, 0x44, 0x48 })
+		m_r[r] = 0x3e00;
 	m_r[0x70] = 0x7fff;
+	device_post_load();
 	m_w1c = 0x6e60;
 	m_w1e = 0x8030;
 	m_w84 = 0x17;
@@ -164,8 +182,6 @@ void zevio_gpu_device::device_reset()
 	m_vram_base = 0;
 	std::fill_n(&m_aux[0], 1024 * AUX_H, 0);
 	std::fill_n(&m_zbuf[0], ZW * ZH, std::numeric_limits<float>::max());
-	m_zdirty_y0 = ZH;
-	m_zdirty_y1 = -1;
 	update_irq();
 }
 
@@ -174,19 +190,26 @@ void zevio_gpu_device::device_reset()
     GPU 16-bit float: sign, 6-bit exponent (bias 31), 9-bit mantissa
 ***************************************************************************/
 
-float zevio_gpu_device::f16_to_float(u16 v)
+namespace {
+// built at static initialisation, so lookups need no guard
+struct f16_table
 {
-	static const auto table = [] ()
+	float t[0x10000];
+	f16_table()
 	{
-		auto t = std::make_unique<float[]>(0x10000);
 		for (int i = 0; i < 0x10000; i++)
 		{
 			const float f = (i & 0x7fff) ? ldexpf(1.0f + (i & 0x1ff) / 512.0f, int((i >> 9) & 0x3f) - 31) : 0.0f;
 			t[i] = (i & 0x8000) ? -f : f;
 		}
-		return t;
-	}();
-	return table[v];
+	}
+};
+const f16_table s_f16;
+}
+
+float zevio_gpu_device::f16_to_float(u16 v)
+{
+	return s_f16.t[v];
 }
 
 u16 zevio_gpu_device::float_to_f16(float f)
@@ -261,12 +284,66 @@ int zevio_gpu_device::abs_row(int y) const
 	return int(s32(m_vram_base - 0x0ffd0000) >> 14) * 8 + (y - m_vram_y0);
 }
 
+// Depth lives in the depth area (GPU rows 0-239 at (0,0), see in_zarea) at colour position - 0x81 + 0x85,
+// where the firmware puts and clears it (gpu.md 4.2/4.3), as 16-bit reciprocal depth (see ZSCALE). MAME keeps
+// the eye distance d as a float per depth pixel; anything written into the area (FA's depth clears, and masks
+// drawn there, as Bratz's menu draws to hide its side panels) sets d = ZSCALE / value there.
+// [EMU: 3D and sprite depth writes do not write the 16-bit pixel back]
+// debug: ZGPU_AUXLOG=<time> logs, for 0.05 s after that time, every command that writes into the depth area
+// Depth compare [EMU, each rule from a console comparison]:
+// - 3D pixels pass when not farther at the depth buffer's 16-bit precision (f16, 9-bit mantissa): Bratz's
+//   title draws its letters as quads on the background's plane; compared as 32-bit floats they z-fought
+//   into dots, the console shows them solid. (z_fails3d)
+// - sprites pass only when strictly nearer: Bratz's Confirm bar is drawn right after its label at the
+//   same depth (w0 0x4D33) and the console keeps the label on top. (z_fails_sprite)
+// - partly transparent texels (ARGB alpha < 15) write no depth: the corner swirls (alpha 1-9) are
+//   recoloured by a second sprite at the same depth, which the rule above would otherwise block.
+// ZGPU_ZOLD restores the plain float compare (equal passes) and alpha-blind depth writes.
+static const bool s_zold = getenv("ZGPU_ZOLD") != nullptr;
+static const bool s_zalpha = !s_zold;
+static inline bool z_fails3d(float z, float zb) { return s_zold ? z > zb : z > zb * (1.0f + 1.0f / 512.0f); }
+static inline bool z_fails_sprite(float z, float zb) { return s_zold ? z > zb : z >= zb; }
+static inline bool depth_fails(float z, float zb) { return z_fails3d(z, zb); }
+
+static double primlog_len()
+{
+	static const double len = getenv("ZGPU_PRIMLOG_LEN") ? atof(getenv("ZGPU_PRIMLOG_LEN")) : 0.05;
+	return len;
+}
+
+static bool auxlog_now(running_machine &m)
+{
+	static const double at = getenv("ZGPU_AUXLOG") ? atof(getenv("ZGPU_AUXLOG")) : -1.0;
+	const double t = m.time().as_double();
+	return at >= 0 && t >= at && t < at + primlog_len();
+}
+
+static int s_zfail; static float s_zfail_lo, s_zfail_hi, s_zfail_zlo; // ZGPU_PRIMLOG: depth-test failures of the last primitive
+
+float *zevio_gpu_device::zptr(const rstate &s, int x, int y) const
+{
+	const int zx = x - zoff_x(s), zy = y - zoff_y(s);
+	return (zx >= 0 && zx < ZW && zy >= 0 && zy < ZH) ? &m_zbuf[zy * ZW + zx] : nullptr;
+}
+
+void zevio_gpu_device::zset(int x, int y, u16 v)
+{
+	if (x < 0 || x >= ZW || y < 0 || y >= ZH)
+		return;
+	// ZGPU_EXP63_FAR (experiment): values with the maximum exponent (0x7E00..0x7FFF) mean infinitely far
+	static const bool exp63_far = getenv("ZGPU_EXP63_FAR") != nullptr;
+	const float r = (v && !(exp63_far && ((v >> 9) & 0x3f) == 0x3f)) ? f16_to_float(v) : 0.0f;
+	m_zbuf[y * ZW + x] = (r > 0.0f) ? ZSCALE / r : std::numeric_limits<float>::max();
+}
+
 void zevio_gpu_device::vram_w(int x, int y, u16 data)
 {
 	if (vram_in_aux(y))
 		aux_px(x, y) = data;
 	else
 		wr16(vram_addr(x, y), data);
+	if (in_zarea(y))
+		zset(x & 1023, y, data);
 }
 
 
@@ -388,7 +465,13 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 			run_list(m_regs[0x28 / 4]);
 			while (fa_queue_hle())
 				run_list(m_regs[0x28 / 4]);
-			submit();
+			// hand work to the render thread in batches: Cars kicks ~800 lists a frame, most of
+			// them a single state word or sprite, and waking the thread for each cost more than
+			// drawing them. Everything recorded is submitted by the next sync point at the latest
+			// (frame fence, VRAM load or read, mapping change). ZGPU_KICK_SUBMIT: every kick
+			static const bool kick_submit = getenv("ZGPU_KICK_SUBMIT") != nullptr;
+			if (!m_async || kick_submit || m_cmds.size() >= 256)
+				submit();
 			m_defer_irq = false;
 			update_irq();
 
@@ -484,12 +567,19 @@ ATTR_FORCE_INLINE bool zevio_gpu_device::texel(const rstate &s, rcache &pc, floa
 	const float fu = u * w - 0.5f, fv = v * h - 0.5f;
 	const int iu = int(std::floor(fu)), iv = int(std::floor(fv));
 	const float du = fu - iu, dv = fv - iv;
+	// Coverage comes from the nearest texel, colour from the opaque ones among the four: Bratz's
+	// character shadow is a dither of single grey texels on transparent ones (bit 15), drawn as dots on
+	// the console; dropping pixels that were less than half opaque lost it entirely. [EMU]
+	// ZGPU_FILTER_HALF restores the old rule (drawn when at least half the weight is opaque).
+	static const bool filter_half = getenv("ZGPU_FILTER_HALF") != nullptr;
+	const int nearest = (du >= 0.5f ? 1 : 0) + (dv >= 0.5f ? 2 : 0);
 	if (!BIT(mode, 8))
 	{
 		// BGR555 texels: 8-bit fixed point weights, transparent texels drop out
 		const int wu = int(du * 256.0f), wv = int(dv * 256.0f);
 		const int wt[4] = { (256 - wu) * (256 - wv), wu * (256 - wv), (256 - wu) * wv, wu * wv };
 		int sr = 0, sg = 0, sb = 0, wsum = 0;
+		bool near_opaque = false;
 		for (int k = 0; k < 4; k++)
 		{
 			const int t = texel_raw(s, pc, iu + (k & 1), iv + (k >> 1));
@@ -499,15 +589,17 @@ ATTR_FORCE_INLINE bool zevio_gpu_device::texel(const rstate &s, rcache &pc, floa
 				sg += ((t >> 5) & 0x1f) * wt[k];
 				sb += ((t >> 10) & 0x1f) * wt[k];
 				wsum += wt[k];
+				near_opaque |= k == nearest;
 			}
 		}
-		if (wsum < 32768)
-			return false; // mostly transparent here
+		if (filter_half ? wsum < 32768 : (!near_opaque || !wsum))
+			return false;
 		const float k = 1.0f / (float(wsum) * 31.0f);
 		r = sr * k; g = sg * k; b = sb * k; a = 1.0f;
 		return true;
 	}
 	float sr = 0, sg = 0, sb = 0, sa = 0, wsum = 0;
+	bool near_opaque = false;
 	for (int k = 0; k < 4; k++)
 	{
 		const int ou = k & 1, ov = k >> 1;
@@ -517,18 +609,20 @@ ATTR_FORCE_INLINE bool zevio_gpu_device::texel(const rstate &s, rcache &pc, floa
 		{
 			sr += cr * wt; sg += cg * wt; sb += cb * wt; sa += ca * wt;
 			wsum += wt;
+			near_opaque |= k == nearest;
 		}
 	}
-	if (wsum < 0.5f)
-		return false; // mostly transparent here
+	if (filter_half ? wsum < 0.5f : (!near_opaque || wsum <= 0.0f))
+		return false;
 	r = sr / wsum; g = sg / wsum; b = sb / wsum; a = sa / wsum;
 	return true;
 }
 
 // raw texel after the CLUT: -1 if transparent (palette index 0; for
-// non-ARGB4444 textures also 0x0000 and bit 15 set: Bratz panel backgrounds
-// are 0x0000, Cars uses 0x8000 billboards, 0xFC1F text boxes, 0xFFFF icons)
-ATTR_FORCE_INLINE int zevio_gpu_device::texel_raw(const rstate &s, rcache &pc, int tu, int tv) const
+// non-ARGB4444 textures also bit 15 set, and 0x0000 in direct-colour ones: Bratz
+// panel backgrounds are 0x0000, Cars uses 0x8000 billboards, 0xFC1F text boxes, 0xFFFF icons)
+template <typename F>
+ATTR_FORCE_INLINE int zevio_gpu_device::texel_fetch(const rstate &s, rcache &pc, int tu, int tv, F &&rd) const
 {
 	const u32 mode = s.w86;
 	tu &= (8 << (mode & 7)) - 1;
@@ -538,42 +632,76 @@ ATTR_FORCE_INLINE int zevio_gpu_device::texel_raw(const rstate &s, rcache &pc, i
 	switch ((mode >> 9) & 3)
 	{
 	case 0:
-		c = vram_r(x0 + tu, y0 + tv);
+		c = rd(x0 + tu, y0 + tv);
 		break;
 	case 1:
 	{
-		const u16 hw = vram_r(x0 + (tu >> 1), y0 + tv);
+		const u16 hw = rd(x0 + (tu >> 1), y0 + tv);
 		const u8 idx = BIT(tu, 0) ? (hw >> 8) : (hw & 0xff);
-		if (!idx)
-			return -1;
+		static const bool idx0_opaque8 = getenv("ZGPU_IDX0_OPAQUE") && (atoi(getenv("ZGPU_IDX0_OPAQUE")) & 1);
+		static const bool idx0_log = getenv("ZGPU_IDX0_LOG") != nullptr;
+		if (!idx && idx0_log)
+		{
+			// print each new (w84, w86, w88, w8d) combination that samples index 0 of an 8-bit texture
+			static std::mutex lock;
+			static std::set<std::tuple<u32, u32, u32, u32>> seen;
+			std::lock_guard<std::mutex> guard(lock);
+			if (seen.emplace(s.w84, s.w86, s.w88, s.w8d).second)
+				fprintf(stderr, "IDX0 w84 %06x w86 %06x w88 %06x w8d %06x clut %06x tex %06x\n", s.w84, s.w86, s.w88, s.w8d, s.clut0, s.w87);
+		}
+		// index 0 of an 8-bit texture is transparent only with colour keying, 0x88 bit 6 (see
+		// colour_key below)
+		// (ZGPU_IDX0_OPAQUE=1 makes it always opaque, =4 always transparent)
+		static const bool idx0_always = getenv("ZGPU_IDX0_OPAQUE") && (atoi(getenv("ZGPU_IDX0_OPAQUE")) & 4);
 		if (pc.key != s.clut0)
 		{
 			for (int i = 0; i < 256; i++)
 				pc.pal[i] = vram_r((s.clut0 & 0xfff) + i, (s.clut0 >> 12) & 0xfff);
 			pc.key = s.clut0;
 		}
+		// and only when its palette entry is 0x0000: Bratz draws everything with keying on, its store
+		// walls and floor use index 0 as a colour (0x3D53, 0x3E1D: the floor was full of holes showing
+		// stale pixels), while the textures it cuts out (the corner mask, decals) have black there
+		static const bool idx0_any = getenv("ZGPU_IDX0_ANY") != nullptr; // old rule: index 0 whatever its colour
+		if (!idx && !idx0_opaque8 && ((colour_key(s) && (pc.pal[0] == 0 || idx0_any)) || idx0_always))
+			return -1;
 		c = pc.pal[idx];
 		break;
 	}
 	default:
 	{
-		const u16 hw = vram_r(x0 + (tu >> 2), y0 + tv);
+		const u16 hw = rd(x0 + (tu >> 2), y0 + tv);
 		const u8 idx = (hw >> ((tu & 3) * 4)) & 0x0f;
-		if (!idx)
-			return -1;
+		static const bool idx0_opaque4 = getenv("ZGPU_IDX0_OPAQUE") && (atoi(getenv("ZGPU_IDX0_OPAQUE")) & 2);
 		if (pc.key != (s.clut3 | 0x80000000U))
 		{
 			for (int i = 0; i < 16; i++)
 				pc.pal[i] = vram_r((s.clut3 & 0xfff) + i, (s.clut3 >> 12) & 0xfff);
 			pc.key = s.clut3 | 0x80000000U;
 		}
+		// index 0 is see-through when its entry is 0x0000; Bratz's character shadow is a dither whose
+		// dots are index 0 = 0x5294 grey (its background is bit 15), and was lost entirely
+		static const bool idx0_any4 = getenv("ZGPU_IDX0_ANY") != nullptr; // old rule: index 0 whatever its colour
+		if (!idx && !idx0_opaque4 && (pc.pal[0] == 0 || idx0_any4))
+			return -1;
 		c = pc.pal[idx];
 		break;
 	}
 	}
-	if (!BIT(mode, 8) && (c == 0 || BIT(c, 15)))
+	// black (0x0000) is see-through only in direct-colour textures, and like palette index 0 only with
+	// colour keying (0x88 bit 6): Bratz's panel backgrounds need it see-through, Cars' Knowledge World
+	// photos (0x88 = 0) draw it black (they were full of holes). A palette entry of 0x0000 at a non-zero
+	// index is opaque black (Wacky Races' menu text: "Options" lost its fill and "SELECT" its outline);
+	// bit 15 is transparent in both
+	static const bool direct_key = getenv("ZGPU_DIRECT_KEY") != nullptr; // old rule: also direct 0x0000 when keying
+	if (!BIT(mode, 8) && ((direct_key && c == 0 && !((mode >> 9) & 3) && colour_key(s)) || BIT(c, 15)))
 		return -1;
 	return c;
+}
+
+ATTR_FORCE_INLINE int zevio_gpu_device::texel_raw(const rstate &s, rcache &pc, int tu, int tv) const
+{
+	return texel_fetch(s, pc, tu, tv, [this] (int x, int y) { return vram_r(x, y); });
 }
 
 ATTR_FORCE_INLINE bool zevio_gpu_device::texel_point(const rstate &s, rcache &pc, int tu, int tv, float &r, float &g, float &b, float &a) const
@@ -599,14 +727,17 @@ void zevio_gpu_device::plot(const rstate &s, int x, int y, float z, float r, flo
 {
 	if (!in_clip(s, x, y))
 		return;
-	if (depth && y < ZH)
+	float *const zp = depth ? zptr(s, x, y) : nullptr;
+	if (zp)
 	{
 		// 0x84 bit 0 = depth test, bit 1 = depth write (Cars draws its sky and
 		// ground with both clear, models with both set)
-		float &zb = m_zbuf[y * ZW + x];
-		if (BIT(s.w84, 0) && z > zb)
+		float &zb = *zp;
+		if (depth_test(s) && depth_fails(z, zb))
 			return;
-		if (BIT(s.w84, 1) && !BIT(s.w88, 1)) // translucent pass tests but does not write
+		// depth write follows 0x84 bit 1 alone, translucent (0x88 bit 1) draws included: Wacky Races'
+		// Animals panel is drawn translucent and must hide the character behind it
+		if (BIT(s.w84, 1))
 			zb = z;
 	}
 	if (BIT(s.w88, 1) || a < 1.0f)
@@ -733,53 +864,84 @@ bool zevio_gpu_device::project(vertex_t &v) const
 
 void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured, int band_y0, int band_y1)
 {
-	// screen-space edge functions over the bounding box, perspective-correct UVs
-	const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
 	if (m_count_stats)
 	{
 		m_stat_tris++;
 		m_total_tris++;
 	}
-	if (std::fabs(area) < 1e-6f)
+	// Coverage with exact integer edge functions on vertices snapped to 1/16 pixel, sampled at pixel
+	// centres. A pixel exactly on an edge belongs to the triangle on one fixed side of it (the edge's
+	// inward normal points right, or straight down), so triangles sharing an edge never both skip a
+	// pixel (cracks: Bratz's store floor kept stale pixels along its seams) nor both draw it.
+	// Interpolation uses barycentrics from the same edge values. [EMU: the hardware's sub-pixel
+	// precision and tie rule are not known]
+	auto snap = [] (float v) -> s64 { return s64(std::lround(std::clamp(v, -1.0e7f, 1.0e7f) * 16.0f)); };
+	const s64 ax = snap(a.x), ay = snap(a.y), bx = snap(b.x), by = snap(b.y), cx = snap(c.x), cy = snap(c.y);
+	const s64 area2 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+	if (area2 == 0)
 		return;
+	const float area = float(area2) / 256.0f; // in pixels (the trace prints it)
 	const int cx0 = std::max<int>(s.clip0 & 0xfff, 0), cy0 = std::max<int>((s.clip0 >> 12) & 0xfff, 0);
 	const int cx1 = std::min<int>(s.clip1 & 0xfff, 1023), cy1 = std::min<int>((s.clip1 >> 12) & 0xfff, ZH - 1);
-	const int minx = std::max(cx0, int(std::floor(std::min({ a.x, b.x, c.x }))));
-	const int maxx = std::min(cx1, int(std::ceil(std::max({ a.x, b.x, c.x }))));
-	const int miny = std::max({ cy0, band_y0, int(std::floor(std::min({ a.y, b.y, c.y }))) });
-	const int maxy = std::min({ cy1, band_y1 - 1, int(std::ceil(std::max({ a.y, b.y, c.y }))) });
+	// pixels whose centre (16x + 8) lies within the snapped bounding box
+	auto lo = [] (s64 v) { return int(std::clamp<s64>((v - 8 + 15) >> 4, -100000, 100000)); };
+	auto hi = [] (s64 v) { return int(std::clamp<s64>((v - 8) >> 4, -100000, 100000)); };
+	const int minx = std::max(cx0, lo(std::min({ ax, bx, cx })));
+	const int maxx = std::min(cx1, hi(std::max({ ax, bx, cx })));
+	const int miny = std::max({ cy0, band_y0, lo(std::min({ ay, by, cy })) });
+	const int maxy = std::min({ cy1, band_y1 - 1, hi(std::max({ ay, by, cy })) });
 	if (minx > maxx || miny > maxy)
 		return;
-	const float inv_area = 1.0f / area;
-	// 0x84: bit 0 depth test, bit 1 depth write, bit 4 colour write
-	const bool ztest = BIT(s.w84, 0), zwrite = BIT(s.w84, 1) && !BIT(s.w88, 1), blend = BIT(s.w88, 1), cwrite = BIT(s.w84, 4);
-	// barycentrics step linearly along a row
-	const float d0 = (b.y - c.y) * inv_area, d1 = (c.y - a.y) * inv_area;
-	for (int y = miny; y <= maxy; y++)
+	// edge functions, positive inside: e0 opposite a (b->c), e1 opposite b (c->a), e2 opposite c (a->b)
+	const s64 sgn = (area2 > 0) ? 1 : -1;
+	struct edge { s64 dx, dy, e; };
+	auto make = [&] (s64 px, s64 py, s64 qx, s64 qy) -> edge
 	{
-		const float py = y + 0.5f;
-		const float px0 = minx + 0.5f;
-		float w0 = ((b.x - px0) * (c.y - py) - (b.y - py) * (c.x - px0)) * inv_area - d0;
-		float w1 = ((c.x - px0) * (a.y - py) - (c.y - py) * (a.x - px0)) * inv_area - d1;
+		edge E;
+		E.dx = sgn * (py - qy) * 16; // per pixel step in x
+		E.dy = sgn * (qx - px) * 16; // per pixel step in y
+		const s64 sx = s64(minx) * 16 + 8, sy = s64(miny) * 16 + 8;
+		E.e = sgn * ((qx - px) * (sy - py) - (qy - py) * (sx - px));
+		// tie rule: an edge pixel is kept only when the inward normal points right, or straight down
+		if (!(E.dx > 0 || (E.dx == 0 && E.dy > 0)))
+			E.e -= 1;
+		return E;
+	};
+	edge e0 = make(bx, by, cx, cy), e1 = make(cx, cy, ax, ay), e2 = make(ax, ay, bx, by);
+	const float inv_area = 1.0f / float(area2 * sgn);
+	// 0x84: bit 0 depth test, bit 1 depth write, bit 4 colour write
+	const bool ztest = depth_test(s), zwrite = BIT(s.w84, 1), blend = BIT(s.w88, 1), cwrite = BIT(s.w84, 4) || BIT(s.w84, 0);
+	for (int y = miny; y <= maxy; y++, e0.e += e0.dy, e1.e += e1.dy, e2.e += e2.dy)
+	{
+		s64 r0 = e0.e, r1 = e1.e, r2 = e2.e;
 		bool inside = false;
-		for (int x = minx; x <= maxx; x++)
+		for (int x = minx; x <= maxx; x++, r0 += e0.dx, r1 += e1.dx, r2 += e2.dx)
 		{
-			w0 += d0;
-			w1 += d1;
-			const float w2 = 1.0f - w0 - w1;
-			if (w0 < 0 || w1 < 0 || w2 < 0)
+			if (r0 < 0 || r1 < 0 || r2 < 0)
 			{
 				if (inside)
 					break; // left the (convex) triangle on this row
 				continue;
 			}
 			inside = true;
+			// barycentrics (the tie bias is one 1/256 pixel unit: negligible here)
+			const float w0 = float(r0) * inv_area, w1 = float(r1) * inv_area, w2 = float(r2) * inv_area;
 			const float iw = w0 * a.w + w1 * b.w + w2 * c.w;
 			const float z = 1.0f / iw;
 			// depth test first: occluded pixels need no texels (same result as plot)
-			float &zb = m_zbuf[y * ZW + x];
-			if (ztest && z > zb)
+			static const bool noztest = getenv("ZGPU_NOZTEST") != nullptr; // test: no 3D depth test
+			float *const zp = zptr(s, x, y);
+			if (zp && ztest && !noztest && depth_fails(z, *zp))
+			{
+				if (m_count_stats)
+				{
+					s_zfail++;
+					s_zfail_lo = std::min(s_zfail_lo, *zp);
+					s_zfail_hi = std::max(s_zfail_hi, *zp);
+					s_zfail_zlo = std::min(s_zfail_zlo, z);
+				}
 				continue;
+			}
 			float r = w0 * a.r + w1 * b.r + w2 * c.r;
 			float g = w0 * a.g + w1 * b.g + w2 * c.g;
 			float bl = w0 * a.b + w1 * b.b + w2 * c.b;
@@ -796,8 +958,18 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 				bl *= tb;
 				alpha = ta;
 			}
-			if (zwrite)
-				zb = z;
+			if (zp && zwrite && (alpha >= 1.0f || !s_zalpha))
+			{
+				*zp = z;
+			}
+			// ZGPU_PIXLOG=x,y (with ZGPU_ONEBAND): print what every 3D draw computes at that pixel
+			static const auto pixlog = [] { int px = -1, py = -1; if (const char *e = getenv("ZGPU_PIXLOG")) sscanf(e, "%d,%d", &px, &py); return std::make_pair(px, py); }();
+			if (x == pixlog.first && y == pixlog.second)
+			{
+				const u16 dst = vram_r(x, y);
+				fprintf(stderr, "PIX %d,%d t %.4f clip %06x-%06x 81 %06x 85 %06x verts (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x area %.1f vtx rgb %.3f %.3f %.3f alpha %.3f z %.4f zbuf %.4g dst %04x cwrite %d\n",
+						x, y, machine().time().as_double(), s.clip0, s.clip1, s.w81, s.w85, a.x, a.y, b.x, b.y, c.x, c.y, s.w84, s.w88, s.w86, s.w87, s.w8d, area, r, g, bl, alpha, z, zp ? *zp : -1.0f, dst, cwrite);
+			}
 			if (!cwrite)
 				continue;
 			if (blend || alpha < 1.0f || m_count_stats)
@@ -811,8 +983,32 @@ void zevio_gpu_device::draw_triangle(const rstate &s, rcache &pc, const vertex_t
 void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 {
 	if (m_no3d) return;
-	if (!BIT(m_w84, 4) && !BIT(m_w84, 1))
+	// Colour is drawn when 0x84 has bit 4 or bit 0 (depth test) set; with neither, and no depth write,
+	// the primitive is skipped. [EMU, from the games: Wacky Races draws untextured quads with 0x84 = 0x04
+	// that must stay invisible; Bratz draws its Bratz World menu as textured quads with 0x84 = 0x05; the bits'
+	// real meaning is not known (the firmware sets bits 2 and 4 from two flags of each object)]
+	if (!BIT(m_w84, 4) && !BIT(m_w84, 1) && !BIT(m_w84, 0))
+	{
+		// ZGPU_SKIPLOG: each new state combination of a skipped primitive, with the time
+		static const bool skiplog = getenv("ZGPU_SKIPLOG") != nullptr;
+		if (skiplog)
+		{
+			static std::set<std::tuple<u32, u32, u32, u32, u32>> seen;
+			if (seen.emplace(m_w84, m_w88, m_w86, m_w87, m_w1c).second)
+				logerror("SKIP3D t=%.3f 84 %06x 88 %06x 86 %06x 87 %06x 1c %06x 1e %06x 8d %06x\n", machine().time().as_double(), m_w84, m_w88, m_w86, m_w87, m_w1c, m_w1e, m_w8d);
+		}
 		return; // writes neither colour nor depth (Wacky Race's menu draws such a quad)
+	}
+	if (!BIT(m_w84, 4) && !BIT(m_w84, 0))
+	{
+		static const bool skiplog = getenv("ZGPU_SKIPLOG") != nullptr;
+		if (skiplog)
+		{
+			static std::set<std::tuple<u32, u32, u32, u32, u32>> seen;
+			if (seen.emplace(m_w84, m_w88, m_w86, m_w87, m_w1c).second)
+				logerror("DEPTHONLY3D t=%.3f 84 %06x 88 %06x 86 %06x 87 %06x 1c %06x 1e %06x 8d %06x\n", machine().time().as_double(), m_w84, m_w88, m_w86, m_w87, m_w1c, m_w1e, m_w8d);
+		}
+	}
 	// clip against the near plane in eye space, then project
 	const float near_z = 1.0f / 4096.0f;
 	vertex_t in[3] = { a, b, c };
@@ -826,11 +1022,14 @@ void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 			out[n++] = p;
 		if (pin != qin)
 		{
-			const float t = (near_z - p.z) / (q.z - p.z);
+			// always from the vertex in front of the plane, so the two triangles sharing this edge get
+			// exactly the same point (no crack along it)
+			const vertex_t &f = pin ? p : q, &k = pin ? q : p;
+			const float t = (near_z - f.z) / (k.z - f.z);
 			vertex_t m;
-			m.x = p.x + (q.x - p.x) * t; m.y = p.y + (q.y - p.y) * t; m.z = near_z;
-			m.u = p.u + (q.u - p.u) * t; m.v = p.v + (q.v - p.v) * t;
-			m.r = p.r + (q.r - p.r) * t; m.g = p.g + (q.g - p.g) * t; m.b = p.b + (q.b - p.b) * t;
+			m.x = f.x + (k.x - f.x) * t; m.y = f.y + (k.y - f.y) * t; m.z = near_z;
+			m.u = f.u + (k.u - f.u) * t; m.v = f.v + (k.v - f.v) * t;
+			m.r = f.r + (k.r - f.r) * t; m.g = f.g + (k.g - f.g) * t; m.b = f.b + (k.b - f.b) * t;
 			m.nx = m.ny = m.nz = 0; m.w = 0; m.hi = p.hi;
 			out[n++] = m;
 		}
@@ -841,6 +1040,19 @@ void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 		return;
 	for (int i = 0; i < n; i++)
 		project(out[i]);
+	// back-face culling: with 0x1E bit 13 set, triangles whose screen-space area is positive (y down) are
+	// dropped. FA draws Bratz's two-sided menu card as two strips, the second with its vertices in the
+	// other order; the console shows only the lit front (the unlit back, drawn on top, turned the card
+	// opaque and bright). Wacky Races' sky dome, seen from inside, is drawn with bit 13 clear (and must
+	// stay). [EMU: bits 13 and 15 (engine flags 0x0001 / 0x0020) were set and clear together in every
+	// draw seen; bit 13 is assumed. ZGPU_NOCULL turns culling off]
+	static const bool nocull = getenv("ZGPU_NOCULL") != nullptr;
+	if (BIT(m_w1e, 13) && !nocull)
+	{
+		const float area = (out[1].x - out[0].x) * (out[2].y - out[0].y) - (out[1].y - out[0].y) * (out[2].x - out[0].x);
+		if (area > 0.0f)
+			return;
+	}
 	rcmd cmd{};
 	cmd.type = CMD_TRI3D;
 	cmd.textured = BIT(m_w1c, 6);
@@ -925,18 +1137,24 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 				reg_f(0x4c), reg_f(0x4d), reg_f(0x4e), reg_f(0x78), reg_f(0x79), m_w81);
 	}
 
-	// debug: ZGPU_PRIMLOG=<time> logs every 3D primitive drawn in the 0.05 s after it
+	// debug: ZGPU_PRIMLOG=<time> logs every 3D primitive drawn in the ZGPU_PRIMLOG_LEN (default 0.05) s after it
 	static double primlog_at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
 	const double now = machine().time().as_double();
-	const bool primlog = primlog_at >= 0 && now >= primlog_at && now < primlog_at + 0.05;
+	const bool primlog = primlog_at >= 0 && now >= primlog_at && now < primlog_at + primlog_len();
 	m_count_stats = primlog || (VERBOSE & LOG_LIST);
 	const int pix0 = m_stat_pixels, tri0 = m_stat_tris;
+	s_zfail = 0; s_zfail_lo = s_zfail_zlo = 1e30f; s_zfail_hi = 0.0f;
 
 	switch (kind)
 	{
-	case 0x40: // triangle strip
+	case 0x40: // triangle strip: every second triangle's vertices are in the opposite order
 		for (int i = 0; i + 2 < n; i++)
-			draw_3d_tri(verts[i], verts[i + 1], verts[i + 2]);
+		{
+			if (BIT(i, 0))
+				draw_3d_tri(verts[i + 1], verts[i], verts[i + 2]);
+			else
+				draw_3d_tri(verts[i], verts[i + 1], verts[i + 2]);
+		}
 		break;
 	case 0x44: // triangle list
 		for (int i = 0; i + 2 < n; i += 3)
@@ -984,10 +1202,10 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 				y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
 			}
 		}
-		logerror("PRIM %08x tris %d pix %d x %.0f..%.0f y %.0f..%.0f z %.3f..%.3f 1c %06x 1e %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x clip %06x-%06x\n",
-				header, m_stat_tris - tri0, m_stat_pixels - pix0, x0, x1, y0, y1, z0, z1, m_w1c, m_w1e, m_w84, m_w88, m_w86, m_w87, m_w8d, m_clip0, m_clip1);
-		for (int i = 0; i < std::min(n, 4); i++)
-			logerror("  VTX %d hi %04x rgb %.2f %.2f %.2f uv %.3f %.3f lit %d\n", i, verts[i].hi, verts[i].r, verts[i].g, verts[i].b, verts[i].u, verts[i].v, verts[i].lit);
+		logerror("PRIM %08x tris %d pix %d x %.0f..%.0f y %.0f..%.0f z %.3f..%.3f 1c %06x 1e %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x clip %06x-%06x 81 %06x 85 %06x zfail %d stored %.3f..%.3f own %.3f\n",
+				header, m_stat_tris - tri0, m_stat_pixels - pix0, x0, x1, y0, y1, z0, z1, m_w1c, m_w1e, m_w84, m_w88, m_w86, m_w87, m_w8d, m_clip0, m_clip1, m_w81, m_w85, s_zfail, s_zfail_lo, s_zfail_hi, s_zfail_zlo);
+		for (int i = 0; i < std::min(n, 8); i++)
+			logerror("  VTX %d eye %.3f %.3f %.3f hi %04x rgb %.2f %.2f %.2f uv %.3f %.3f lit %d\n", i, verts[i].x, verts[i].y, verts[i].z, verts[i].hi, verts[i].r, verts[i].g, verts[i].b, verts[i].u, verts[i].v, verts[i].lit);
 		if (BIT(m_w1c, 6))
 			log_texture();
 	}
@@ -1001,6 +1219,9 @@ void zevio_gpu_device::log_texture()
 	std::map<u16, int> hist;
 	const int w = 8 << (m_w86 & 7), h = 8 << ((m_w86 >> 3) & 7);
 	const int tx = m_w87 & 0xfff, ty = (m_w87 >> 12) & 0xfff;
+	// ZGPU_TEXDUMP: also write each texture (as BGR555 after the CLUT, bit 15 shown magenta) to tex_<87>_<86>.ppm
+	static const bool texdump = getenv("ZGPU_TEXDUMP") != nullptr;
+	std::vector<u8> ppm;
 	for (int v = 0; v < h; v++)
 		for (int u = 0; u < w; u++)
 		{
@@ -1012,7 +1233,23 @@ void zevio_gpu_device::log_texture()
 			default: { const u16 hw = vram_r(tx + u / 4, ty + v); c = vram_r((m_clut[3] & 0xfff) + ((hw >> ((u & 3) * 4)) & 15), (m_clut[3] >> 12) & 0xfff); break; }
 			}
 			hist[c]++;
+			if (texdump)
+			{
+				const bool t = BIT(c, 15);
+				ppm.push_back(t ? 255 : pal5bit(c & 0x1f));
+				ppm.push_back(t ? 0 : pal5bit((c >> 5) & 0x1f));
+				ppm.push_back(t ? 255 : pal5bit((c >> 10) & 0x1f));
+			}
 		}
+	if (texdump)
+	{
+		if (FILE *const f = fopen(util::string_format("tex_%06x_%06x.ppm", m_w87, m_w86).c_str(), "wb"))
+		{
+			fprintf(f, "P6\n%d %d\n255\n", w, h);
+			fwrite(ppm.data(), 1, ppm.size(), f);
+			fclose(f);
+		}
+	}
 	std::vector<std::pair<int, u16>> top;
 	for (auto &e : hist)
 		top.emplace_back(e.second, e.first);
@@ -1020,6 +1257,24 @@ void zevio_gpu_device::log_texture()
 	std::string s;
 	for (int i = 0; i < std::min<int>(6, top.size()); i++)
 		s += util::string_format(" %04x:%d", top[i].second, top[i].first);
+	int zero = 0, b15 = 0;
+	for (auto &e : hist)
+	{
+		zero += (e.first == 0) ? e.second : 0;
+		b15 += BIT(e.first, 15) ? e.second : 0;
+	}
+	s += util::string_format("  (0000:%d bit15:%d)", zero, b15);
+	if (((m_w86 >> 9) & 3) == 1)
+	{
+		int idx0 = 0;
+		for (int v = 0; v < h; v++)
+			for (int u = 0; u < w; u++)
+			{
+				const u16 hw = vram_r(tx + u / 2, ty + v);
+				idx0 += ((BIT(u, 0) ? (hw >> 8) : hw) & 0xff) == 0;
+			}
+		s += util::string_format(" idx0:%d pal0:%04x", idx0, vram_r(m_clut[0] & 0xfff, (m_clut[0] >> 12) & 0xfff));
+	}
 	logerror("  TEX %dx%d clut %06x %06x:%s\n", w, h, m_clut[0], m_clut[3], s);
 }
 
@@ -1031,6 +1286,10 @@ void zevio_gpu_device::transform_to_memory(u32 header, u32 &addr)
 	const u8 fmt = (header >> 16) & 0x3f;
 	const int n = header & 0xffff;
 	const int wpv = vertex_words(fmt);
+	static double primlog_at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
+	const double now = machine().time().as_double();
+	if (primlog_at >= 0 && now >= primlog_at && now < primlog_at + primlog_len())
+		logerror("XFORM %08x n %d fmt %02x -> %08x\n", header, n, fmt, m_xfer);
 	for (int i = 0; i < n; i++)
 	{
 		const u32 src = addr + i * wpv * 4, dst = m_xfer + i * wpv * 4;
@@ -1107,6 +1366,13 @@ void zevio_gpu_device::prim2d(u32 header, u32 &addr)
 		v[i].b = ((col >> 16) & 0xff) / 255.0f;
 	}
 	addr += count * 4;
+	{
+		static double primlog_at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
+		const double now = machine().time().as_double();
+		if (primlog_at >= 0 && now >= primlog_at && now < primlog_at + primlog_len() && n)
+			logerror("PRIM2D %08x n %d v0 %.1f,%.1f v1 %.1f,%.1f 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x clip %06x-%06x 85 %06x\n", header, n,
+					v[0].x, v[0].y, v[std::min(n - 1, 1)].x, v[std::min(n - 1, 1)].y, m_w84, m_w88, m_w86, m_w87, m_w8d, m_clip0, m_clip1, m_w85);
+	}
 
 	const bool textured = BIT(flags, 0);
 	const rstate st = cur_state();
@@ -1176,7 +1442,7 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 {
 	const u8 flags = (header >> 16) & 0xff;
 	const int count = header & 0xff;
-	const u32 xy = rd32(addr + 4), wh = rd32(addr + 8);
+	const u32 w0 = rd32(addr), xy = rd32(addr + 4), wh = rd32(addr + 8);
 	int k = 3;
 	u32 uv = 0, col = 0xffffff;
 	if (BIT(flags, 0))
@@ -1195,14 +1461,17 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 	const int w = std::min<int>(wh & 0xffff, 1024), h = std::min<int>(wh >> 16, 1024);
 	static double primlog_at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
 	const double now = machine().time().as_double();
-	if (primlog_at >= 0 && now >= primlog_at && now < primlog_at + 0.05)
+	static const int primlog_ymin = getenv("ZGPU_PRIMLOG_YMIN") ? atoi(getenv("ZGPU_PRIMLOG_YMIN")) : INT_MIN; // only sprites from this row down
+	if (primlog_at >= 0 && now >= primlog_at && now < primlog_at + primlog_len() && y0 + h > primlog_ymin)
 	{
-		logerror("SPR %08x xy %d,%d wh %dx%d uv %08x col %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x 1c %06x 1e %06x clip %06x-%06x 85 %06x raw %08x\n",
-				header, x0, y0, w, h, uv, col, m_w84, m_w88, m_w86, m_w87, m_w8d, m_w1c, m_w1e, m_clip0, m_clip1, m_w85, xy, m_w81);
+		logerror("SPR %08x w0 %08x xy %d,%d wh %dx%d uv %08x col %06x 84 %06x 88 %06x 86 %06x 87 %06x 8d %06x 1c %06x 1e %06x clip %06x-%06x 85 %06x raw %08x\n",
+				header, w0, x0, y0, w, h, uv, col, m_w84, m_w88, m_w86, m_w87, m_w8d, m_w1c, m_w1e, m_clip0, m_clip1, m_w85, xy, m_w81);
 		if (BIT(flags, 0))
 			log_texture();
 	}
 
+	if (in_zarea(y0) && auxlog_now(machine()))
+		logerror("AUX sprite %d,%d %dx%d tex %06x 84 %06x\n", x0, y0, w, h, m_w87, m_w84);
 	rcmd c{};
 	c.type = CMD_SPRITE;
 	c.st = cur_state();
@@ -1210,7 +1479,16 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 	c.a1 = u32(w) | (u32(h) << 16);
 	c.a2 = uv;
 	c.a3 = col;
+	// ZGPU_SPRCOL_RGB (experiment): the sprite colour dword as 0x00RRGGBB
+	static const bool sprcol_rgb = getenv("ZGPU_SPRCOL_RGB") != nullptr;
+	if (sprcol_rgb)
+		c.a3 = (col & 0xff00ff00) | ((col & 0xff) << 16) | ((col >> 16) & 0xff);
 	c.flags = flags;
+	// word 0, low half: reciprocal depth (see ZSCALE); 0 is infinitely far. Cars' menu draws its text at 0x4651
+	// and the orange lines over it at
+	// 0x463C (farther): the depth test keeps the lines behind the letters
+	const float rz = f16_to_float(w0 & 0xffff);
+	c.z = (rz > 0.0f) ? ZSCALE / rz : std::numeric_limits<float>::max();
 	add_cmd(std::move(c));
 }
 
@@ -1221,25 +1499,54 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 	const u32 uv = c.a2, col = c.a3;
 	const u8 flags = c.flags;
 
+	// the integer paths below fetch each destination row and texture row once (vram_row) instead of
+	// working out the tiled address of every pixel; the arithmetic is unchanged
+	const int cx0 = std::max({ int(s.clip0 & 0xfff), x0, 0 });
+	const int cy0 = std::max({ int((s.clip0 >> 12) & 0xfff), y0, 0, band_y0 });
+	const int cx1 = std::min({ int(s.clip1 & 0xfff), x0 + w - 1, 1023 });
+	const int cy1 = std::min({ int((s.clip1 >> 12) & 0xfff), y0 + h - 1, band_y1 - 1 });
+	const int mr = (col & 0xff) + 1, mg = ((col >> 8) & 0xff) + 1, mb = ((col >> 16) & 0xff) + 1;
+	const bool textured = BIT(flags, 0);
+	const int u0 = int(uv & 0xffff), v0 = int(uv >> 16);
+	const int tvmask = (8 << ((s.w86 >> 3) & 7)) - 1, ty0 = (s.w87 >> 12) & 0xfff;
+
+	// depth (0x84 bit 0 test, bit 1 write) against the 3D depth buffer, per drawn texel
+	const bool ztest = depth_test(s), zwrite = BIT(s.w84, 1);
+	const float d = c.z;
+	auto depth_ok = [&] (int x, int y, bool opaque = true) -> bool
+	{
+		float *const zp = (ztest || zwrite) ? zptr(s, x, y) : nullptr;
+		if (!zp)
+			return true;
+		float &zb = *zp;
+		if (ztest && z_fails_sprite(d, zb))
+			return false;
+		if (zwrite && (opaque || !s_zalpha))
+			zb = d;
+		return true;
+	};
+
 	// fast path: opaque (no 0x88 blend), non-ARGB4444 texels, integer colour
 	// modulation, clipped once per sprite
 	static const bool nofast = getenv("ZGPU_NOFAST") != nullptr;
 	if (!nofast && !BIT(s.w88, 1) && !BIT(s.w86, 8))
 	{
-		const int cx0 = std::max({ int(s.clip0 & 0xfff), x0, 0 });
-		const int cy0 = std::max({ int((s.clip0 >> 12) & 0xfff), y0, 0, band_y0 });
-		const int cx1 = std::min({ int(s.clip1 & 0xfff), x0 + w - 1, 1023 });
-		const int cy1 = std::min({ int((s.clip1 >> 12) & 0xfff), y0 + h - 1, band_y1 - 1 });
-		const int mr = (col & 0xff) + 1, mg = ((col >> 8) & 0xff) + 1, mb = ((col >> 16) & 0xff) + 1;
 		const bool modulate = (col & 0xffffff) != 0xffffff;
 		const u16 flat = (((col >> 19) & 0x1f) << 10) | (((col >> 11) & 0x1f) << 5) | ((col >> 3) & 0x1f);
 		for (int y = cy0; y <= cy1; y++)
+		{
+			const vrow drow = vram_row(y);
+			const bool zrow = in_zarea(y);
+			const int tv = v0 + (y - y0);
+			const vrow trow = textured ? vram_row(ty0 + (tv & tvmask)) : vrow{ nullptr, true };
+			auto rd = [&trow] (int x, int) -> u16 { return trow[x]; };
 			for (int x = cx0; x <= cx1; x++)
 			{
 				u16 t;
-				if (BIT(flags, 0))
+				if (textured)
 				{
-					const int r = texel_raw(s, pc, int(uv & 0xffff) + (x - x0), int(uv >> 16) + (y - y0));
+					const int tu = u0 + (x - x0);
+					const int r = trow.p ? texel_fetch(s, pc, tu, tv, rd) : texel_raw(s, pc, tu, tv);
 					if (r < 0)
 						continue;
 					t = r;
@@ -1248,39 +1555,63 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 				}
 				else
 					t = flat;
-				vram_w(x, y, t);
+				if (!depth_ok(x, y))
+					continue;
+				if (drow.p)
+				{
+					drow[x] = t;
+					if (zrow)
+						zset(x, y, t);
+				}
+				else
+					vram_w(x, y, t);
 			}
+		}
 		return;
 	}
 
 	// blended and ARGB4444 sprites: the same in integers (8-bit weights)
 	{
-		const int cx0 = std::max({ int(s.clip0 & 0xfff), x0, 0 });
-		const int cy0 = std::max({ int((s.clip0 >> 12) & 0xfff), y0, 0, band_y0 });
-		const int cx1 = std::min({ int(s.clip1 & 0xfff), x0 + w - 1, 1023 });
-		const int cy1 = std::min({ int((s.clip1 >> 12) & 0xfff), y0 + h - 1, band_y1 - 1 });
-		const int mr = (col & 0xff) + 1, mg = ((col >> 8) & 0xff) + 1, mb = ((col >> 16) & 0xff) + 1;
+		// c5to8[c] = c * 255 / 31, c4to8[c] = c * 255 / 15, a4[c] = c * 256 / 15, to5[v] = (v * 31 + 127) / 255
+		static const struct tables
+		{
+			u8 c5to8[32], c4to8[16], to5[256];
+			u16 a4[16];
+			tables()
+			{
+				for (int i = 0; i < 32; i++) c5to8[i] = i * 255 / 31;
+				for (int i = 0; i < 16; i++) { c4to8[i] = i * 255 / 15; a4[i] = i * 256 / 15; }
+				for (int i = 0; i < 256; i++) to5[i] = (i * 31 + 127) / 255;
+			}
+		} tb;
 		const bool blend = BIT(s.w88, 1), argb4444 = BIT(s.w86, 8);
 		const int fr = (s.w8d & 0xff) + 1, fg = ((s.w8d >> 8) & 0xff) + 1, fb = ((s.w8d >> 16) & 0xff) + 1;
 		for (int y = cy0; y <= cy1; y++)
+		{
+			const vrow drow = vram_row(y);
+			const bool zrow = in_zarea(y);
+			const int tv = v0 + (y - y0);
+			const vrow trow = textured ? vram_row(ty0 + (tv & tvmask)) : vrow{ nullptr, true };
+			auto rd = [&trow] (int x, int) -> u16 { return trow[x]; };
 			for (int x = cx0; x <= cx1; x++)
 			{
-				int r, g, b, a = 256; // 5-bit colour channels scaled by 8, alpha 0-256
-				if (BIT(flags, 0))
+				int r, g, b, a = 256; // 8-bit colour channels, alpha 0-256
+				if (textured)
 				{
-					const int t = texel_raw(s, pc, int(uv & 0xffff) + (x - x0), int(uv >> 16) + (y - y0));
+					const int tu = u0 + (x - x0);
+					const int t = trow.p ? texel_fetch(s, pc, tu, tv, rd) : texel_raw(s, pc, tu, tv);
 					if (t < 0)
 						continue;
 					if (argb4444)
 					{
-						a = ((t >> 12) & 15) * 256 / 15;
+						a = tb.a4[(t >> 12) & 15];
 						if (!a)
 							continue;
-						r = (t & 15) * 255 / 15; g = ((t >> 4) & 15) * 255 / 15; b = ((t >> 8) & 15) * 255 / 15;
+						r = tb.c4to8[t & 15]; g = tb.c4to8[(t >> 4) & 15]; b = tb.c4to8[(t >> 8) & 15];
 					}
 					else
 					{
-						r = (t & 0x1f) * 255 / 31; g = ((t >> 5) & 0x1f) * 255 / 31; b = ((t >> 10) & 0x1f) * 255 / 31;
+						r = tb.c5to8[t & 0x1f]; g = tb.c5to8[(t >> 5) & 0x1f]; b = tb.c5to8[(t >> 10) & 0x1f];
 					}
 					r = (r * mr) >> 8; g = (g * mg) >> 8; b = (b * mb) >> 8;
 				}
@@ -1288,17 +1619,28 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 				{
 					r = col & 0xff; g = (col >> 8) & 0xff; b = (col >> 16) & 0xff;
 				}
+				if (!depth_ok(x, y, a >= 256))
+					continue;
 				if (blend || a < 256)
 				{
-					const u16 d = vram_r(x, y);
-					const int dr = (d & 0x1f) * 255 / 31, dg = ((d >> 5) & 0x1f) * 255 / 31, db = ((d >> 10) & 0x1f) * 255 / 31;
+					const u16 d = drow.p ? drow[x] : vram_r(x, y);
+					const int dr = tb.c5to8[d & 0x1f], dg = tb.c5to8[(d >> 5) & 0x1f], db = tb.c5to8[(d >> 10) & 0x1f];
 					const int kr = blend ? (fr * a) >> 8 : a, kg = blend ? (fg * a) >> 8 : a, kb = blend ? (fb * a) >> 8 : a;
 					r = (r * kr + dr * (256 - kr)) >> 8;
 					g = (g * kg + dg * (256 - kg)) >> 8;
 					b = (b * kb + db * (256 - kb)) >> 8;
 				}
-				vram_w(x, y, (((b * 31 + 127) / 255) << 10) | (((g * 31 + 127) / 255) << 5) | ((r * 31 + 127) / 255));
+				const u16 out = (tb.to5[b] << 10) | (tb.to5[g] << 5) | tb.to5[r];
+				if (drow.p)
+				{
+					drow[x] = out;
+					if (zrow)
+						zset(x, y, out);
+				}
+				else
+					vram_w(x, y, out);
 			}
+		}
 		return;
 	}
 
@@ -1331,11 +1673,18 @@ void zevio_gpu_device::draw_fill(const rcmd &c, int band_y0, int band_y1)
 			const int run = std::min(w - i, 32 - (xx & 31));
 			const u32 off = vram_addr(xx, y + j) - m_ram_base;
 			if (vram_in_aux(y + j))
+			{
 				std::fill_n(&aux_px(xx, y + j), run, col);
+				for (int k = 0; k < run; k++)
+					zset(xx + k, y + j, col);
+			}
 			else if (off + run * 2 <= m_ram_size)
 			{
 #ifdef LSB_FIRST
 				std::fill_n(reinterpret_cast<u16 *>(m_ram) + (off >> 1), run, col);
+				if (in_zarea(y + j))
+					for (int k = 0; k < run; k++)
+						zset(xx + k, y + j, col);
 #else
 				for (int k = 0; k < run; k++)
 					vram_w(xx + k, y + j, col);
@@ -1346,13 +1695,6 @@ void zevio_gpu_device::draw_fill(const rcmd &c, int band_y0, int band_y1)
 	}
 }
 
-void zevio_gpu_device::draw_zclear(const rcmd &c, int band_y0, int band_y1)
-{
-	const int y0 = std::max<int>(c.a0, band_y0), y1 = std::min<int>(c.a1 + 1, band_y1);
-	if (y1 > y0)
-		std::fill_n(&m_zbuf[y0 * ZW], (y1 - y0) * ZW, std::numeric_limits<float>::max());
-}
-
 
 /***************************************************************************
     Render thread
@@ -1360,7 +1702,7 @@ void zevio_gpu_device::draw_zclear(const rcmd &c, int band_y0, int band_y1)
 
 zevio_gpu_device::rstate zevio_gpu_device::cur_state() const
 {
-	return rstate{ m_w84, m_w86, m_w87, m_w88, m_w8d, m_clip0, m_clip1, m_clut[0], m_clut[3] };
+	return rstate{ m_w84, m_w86, m_w87, m_w88, m_w8d, m_clip0, m_clip1, m_clut[0], m_clut[3], m_w81, m_w85 };
 }
 
 void zevio_gpu_device::add_cmd(rcmd &&c)
@@ -1387,18 +1729,14 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 		c.ymin = c.a0 >> 16;
 		c.ymax = c.ymin + int(c.a1 >> 16) - 1;
 		break;
-	case CMD_ZCLEAR:
-		c.ymin = c.a0;
-		c.ymax = c.a1;
-		break;
 	}
 	c.ymin = std::max({ c.ymin, int((c.st.clip0 >> 12) & 0xfff), 0 });
 	c.ymax = std::min({ c.ymax, int((c.st.clip1 >> 12) & 0xfff), ZH - 1 });
-	if (c.type == CMD_FILL || c.type == CMD_ZCLEAR)
+	if (c.type == CMD_FILL)
 	{
 		// not clipped
-		c.ymin = (c.type == CMD_FILL) ? int(c.a0 >> 16) : int(c.a0);
-		c.ymax = (c.type == CMD_FILL) ? int(c.a0 >> 16) + int(c.a1 >> 16) - 1 : int(c.a1);
+		c.ymin = int(c.a0 >> 16);
+		c.ymax = int(c.a0 >> 16) + int(c.a1 >> 16) - 1;
 	}
 	if (c.ymin > c.ymax)
 		return;
@@ -1413,11 +1751,8 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 		}
 		else if (c.type == CMD_SPRITE || c.type == CMD_FILL)
 			w = c.a1 & 0xffff;
-		else if (c.type == CMD_ZCLEAR)
-			w = 0;
 		m_work_px += u64(c.ymax - c.ymin + 1) * w;
 	}
-	if (c.type != CMD_ZCLEAR)
 	{
 		// areas drawn since the last frame fence, as rows of the RAM surface
 		// at 0x0FFD0000 (what the display compares); the aux area is not shown
@@ -1438,17 +1773,17 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 			m_drawn.push_back(r);
 		}
 	}
-	if ((c.type == CMD_TRI3D || c.type == CMD_POINT) && BIT(c.st.w84, 1))
-	{
-		m_zdirty_y0 = std::min(m_zdirty_y0, c.ymin);
-		m_zdirty_y1 = std::max(m_zdirty_y1, c.ymax);
-	}
+	// bands are cut in depth-area rows, so that draws meeting in the depth area (a buffer's draws, the
+	// depth clears and masks drawn into the area itself) stay in order on one thread
+	c.koff = in_zarea(c.ymax) ? 0 : zoff_y(c.st);
+	c.ymin -= c.koff;
+	c.ymax -= c.koff;
 	if (m_count_stats)
 	{
 		// debug statistics are counted in order on this thread
 		sync();
 		std::vector<rcmd> one{ c };
-		exec_band(one, 0, 1 << 20);
+		exec_band(one, -(1 << 20), 1 << 20);
 		return;
 	}
 	m_cmds.push_back(std::move(c));
@@ -1489,6 +1824,24 @@ void zevio_gpu_device::sync()
 // the current frame renders
 bool zevio_gpu_device::frame_fence(int x0, int y0, int x1, int y1)
 {
+	// debug: ZGPU_ZDUMP=<time> writes the depth area (512 x 240) at the first frame after that time to zdump.pgm
+	static double zdump_at = getenv("ZGPU_ZDUMP") ? atof(getenv("ZGPU_ZDUMP")) : -1.0;
+	if (zdump_at >= 0 && machine().time().as_double() >= zdump_at)
+	{
+		zdump_at = -1.0;
+		sync();
+		if (FILE *f = fopen("zdump.pgm", "wb"))
+		{
+			fprintf(f, "P5 512 240 255\n");
+			for (int y = 0; y < 240; y++)
+				for (int x = 0; x < 512; x++)
+				{
+					const float d = m_zbuf[y * ZW + x];
+					fputc(d >= 1e30f ? 255 : std::clamp(int(d * 20.0f), 0, 254), f);
+				}
+			fclose(f);
+		}
+	}
 	submit();
 	bool overlap = false;
 	for (const auto &r : m_drawn)
@@ -1534,18 +1887,41 @@ void *zevio_gpu_device::band_cb(void *param, int threadid)
 
 void zevio_gpu_device::exec_batch(const std::vector<rcmd> &cmds)
 {
-	int ymin = ZH, ymax = -1;
+	int ymin = std::numeric_limits<int>::max(), ymax = std::numeric_limits<int>::min();
 	u64 work = 0;
+	// bands are cut in depth-area rows (add_cmd). That keeps every pixel on one thread only while all
+	// commands drawing the same colour rows share one offset; a batch where commands with different
+	// offsets cover the same colour rows (a fill recorded under another pass's 0x81) runs in order
+	std::vector<std::array<int, 3>> spans; // offset, first and last colour row
+	bool mixed = false;
 	for (const auto &c : cmds)
 	{
 		ymin = std::min(ymin, c.ymin);
 		ymax = std::max(ymax, c.ymax);
 		work += u64(c.ymax - c.ymin + 1) * ((c.type == CMD_SPRITE || c.type == CMD_FILL) ? (c.a1 & 0xffff) : 64);
+		const int r0 = c.ymin + c.koff, r1 = c.ymax + c.koff;
+		auto it = std::find_if(spans.begin(), spans.end(), [&c] (const auto &s) { return s[0] == c.koff; });
+		if (it == spans.end())
+			spans.push_back({ c.koff, r0, r1 });
+		else
+		{
+			(*it)[1] = std::min((*it)[1], r0);
+			(*it)[2] = std::max((*it)[2], r1);
+		}
+	}
+	for (size_t i = 0; i < spans.size() && !mixed; i++)
+		for (size_t j = i + 1; j < spans.size() && !mixed; j++)
+			mixed = spans[i][1] <= spans[j][2] && spans[j][1] <= spans[i][2];
+	static const bool oneband = getenv("ZGPU_ONEBAND") != nullptr; // test: no band threads
+	if (cmds.empty() || mixed || oneband)
+	{
+		exec_band(cmds, -(1 << 20), 1 << 20);
+		return;
 	}
 	const int rows = ymax - ymin + 1;
 	if (!m_queue || rows < 32 || work < 20000)
 	{
-		exec_band(cmds, 0, 1 << 20);
+		exec_band(cmds, -(1 << 20), 1 << 20);
 		return;
 	}
 	const int bands = std::min(m_bands, rows / 8);
@@ -1570,29 +1946,27 @@ void zevio_gpu_device::exec_band(const std::vector<rcmd> &cmds, int y0, int y1)
 	{
 		if (c.ymax < y0 || c.ymin >= y1)
 			continue;
+		const int cy0 = y0 + c.koff, cy1 = y1 + c.koff; // the band in colour rows
 		switch (c.type)
 		{
 		case CMD_TRI3D:
-			draw_triangle(c.st, pc, c.v[0], c.v[1], c.v[2], c.textured, y0, y1);
+			draw_triangle(c.st, pc, c.v[0], c.v[1], c.v[2], c.textured, cy0, cy1);
 			break;
 		case CMD_TRI2D:
-			draw_tri2d(c.st, pc, c.v[0], c.v[1], c.v[2], c.textured, y0, y1);
+			draw_tri2d(c.st, pc, c.v[0], c.v[1], c.v[2], c.textured, cy0, cy1);
 			break;
 		case CMD_LINE:
-			draw_line(c.st, c.v[0], c.v[1], y0, y1);
+			draw_line(c.st, c.v[0], c.v[1], cy0, cy1);
 			break;
 		case CMD_POINT:
-			if (int(c.v[0].y) >= y0 && int(c.v[0].y) < y1)
+			if (int(c.v[0].y) >= cy0 && int(c.v[0].y) < cy1)
 				plot(c.st, int(c.v[0].x), int(c.v[0].y), c.v[0].z, c.v[0].r, c.v[0].g, c.v[0].b, 1.0f, c.flags & 1);
 			break;
 		case CMD_SPRITE:
-			draw_sprite(c.st, pc, c, y0, y1);
+			draw_sprite(c.st, pc, c, cy0, cy1);
 			break;
 		case CMD_FILL:
-			draw_fill(c, y0, y1);
-			break;
-		case CMD_ZCLEAR:
-			draw_zclear(c, y0, y1);
+			draw_fill(c, cy0, cy1);
 			break;
 		}
 	}
@@ -1671,7 +2045,7 @@ void zevio_gpu_device::run_list(u32 addr)
 		{
 			const u32 reg = (cmd >> 16) & 0xff, n = cmd & 0xffff;
 			for (u32 i = 0; i < n; i++)
-				m_r[(reg + i) & 0xff] = rd16(addr + i * 2);
+				set_r(reg + i, rd16(addr + i * 2));
 			addr += (n * 2 + 3) & ~3;
 			break;
 		}
@@ -1707,6 +2081,8 @@ void zevio_gpu_device::run_list(u32 addr)
 			addr += 16;
 			sync();
 			const int x = pos & 0xffff, y = pos >> 16, w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 8192);
+			if (in_zarea(y) && auxlog_now(machine()))
+				logerror("AUX load %d,%d %dx%d first %04x\n", x, y, w, h, rd16(src));
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					vram_w(x + i, y + j, rd16(src + (j * w + i) * 2));
@@ -1728,7 +2104,9 @@ void zevio_gpu_device::run_list(u32 addr)
 			const u32 pos = rd32(addr), size = rd32(addr + 4), col = rd32(addr + 8);
 			addr += 12;
 			m_stat_fills++;
-			const int y = pos >> 16, h = std::min<int>(size >> 16, 8192);
+			const int h = std::min<int>(size >> 16, 8192);
+			if (in_zarea(int(pos >> 16)) && auxlog_now(machine()))
+				logerror("AUX fill %d,%d %dx%d value %04x (aux rows above %d, RAM base %08x)\n", int(pos & 0xffff), int(pos >> 16), int(size & 0xffff), h, col & 0xffff, m_vram_y0, m_vram_base);
 			rcmd c{};
 			c.type = CMD_FILL;
 			c.st = cur_state();
@@ -1736,20 +2114,6 @@ void zevio_gpu_device::run_list(u32 addr)
 			c.a1 = std::min<u32>(size & 0xffff, 1024) | (u32(h) << 16);
 			c.a3 = col;
 			add_cmd(std::move(c));
-			// FA clears its depth area (aux rows at GPU (0,0)) with a fill; MAME
-			// keeps depth as floats elsewhere, so reset the rows drawn with depth
-			// since the last such clear [EMU: the clear value is ignored]
-			if (y + h <= m_vram_y0 && m_zdirty_y1 >= m_zdirty_y0)
-			{
-				rcmd z{};
-				z.type = CMD_ZCLEAR;
-				z.st = cur_state();
-				z.a0 = m_zdirty_y0;
-				z.a1 = m_zdirty_y1;
-				add_cmd(std::move(z));
-				m_zdirty_y0 = ZH;
-				m_zdirty_y1 = -1;
-			}
 			break;
 		}
 		case 0xd2: // VRAM to VRAM copy: destination, size, source
@@ -1758,6 +2122,8 @@ void zevio_gpu_device::run_list(u32 addr)
 			addr += 12;
 			const int dx = dst & 0xffff, dy = dst >> 16, sx = src & 0xffff, sy = src >> 16;
 			const int w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 4096);
+			if (in_zarea(dy) && auxlog_now(machine()))
+				logerror("AUX copy to %d,%d %dx%d from %d,%d\n", dx, dy, w, h, sx, sy);
 			sync();
 			std::vector<u16> tmp(w * h);
 			for (int j = 0; j < h; j++)

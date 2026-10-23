@@ -35,6 +35,7 @@ protected:
 	virtual void device_reset() override ATTR_COLD;
 	virtual void device_stop() override ATTR_COLD;
 	virtual void device_pre_save() override;
+	virtual void device_post_load() override;
 
 private:
 	struct vertex_t
@@ -78,6 +79,20 @@ private:
 #endif
 	}
 	void vram_w(int x, int y, u16 data);
+	// one VRAM row for inner loops: pixel x is p[tiled ? ((x & 1023) >> 5 << 8) + (x & 31) : x & 1023];
+	// p is null when the row is not wholly in RAM (callers then use vram_r / vram_w)
+	struct vrow { u16 *p; bool tiled; u16 &operator[](int x) const { return p[tiled ? (((x & 1023) >> 5) << 8) + (x & 31) : (x & 1023)]; } };
+	vrow vram_row(int y) const
+	{
+		if (vram_in_aux(y))
+			return { &aux_px(0, y), false };
+#ifdef LSB_FIRST
+		const u32 off = vram_addr(0, y) - m_ram_base;
+		if (off < m_ram_size && m_ram_size - off >= 31 * 512 + 64)
+			return { reinterpret_cast<u16 *>(m_ram) + (off >> 1), true };
+#endif
+		return { nullptr, true };
+	}
 
 	void run_list(u32 addr);
 	void update_irq();
@@ -96,7 +111,8 @@ private:
 	void sprite(u32 header, u32 &addr);
 	void log_texture();
 
-	float reg_f(int r) const { return f16_to_float(m_r[r & 0xff]); }
+	float reg_f(int r) const { return m_rf[r & 0xff]; }
+	void set_r(int r, u16 v) { m_r[r & 0xff] = v; m_rf[r & 0xff] = f16_to_float(v); }
 
 	/*
 	    Rendering. List parsing, transforms and FA's queue bookkeeping run on
@@ -115,23 +131,43 @@ public:
 private:
 	struct rstate
 	{
-		u32 w84, w86, w87, w88, w8d, clip0, clip1, clut0, clut3;
+		u32 w84, w86, w87, w88, w8d, clip0, clip1, clut0, clut3, w81, w85;
 	};
+	// depth: see zevio_gpu.cpp (zptr)
+	static int zoff_x(const rstate &s) { return int(s.w81 & 0xfff) - int(s.w85 & 0xfff); }
+	static int zoff_y(const rstate &s) { return int((s.w81 >> 12) & 0xfff) - int((s.w85 >> 12) & 0xfff); }
+	float *zptr(const rstate &s, int x, int y) const;
+	// the depth area: GPU rows 0-239 at (0,0), where FA keeps and clears depth, whether those rows are the
+	// separate area or RAM (rows 128-239 are RAM in the MJPEG mapping, +0x94 = 128 << 16)
+	static bool in_zarea(int y) { return y >= 0 && y < 240; }
+	// 0x88 bit 6: colour keying, palette index 0 of 8-bit textures is see-through when its entry is 0x0000
+	// (direct-colour 0x0000 stays opaque: Bratz's title glyphs). FA sets bits 0/5/6/7 together through one setter (10A5A874, separate from bit 1 =
+	// blend); Bratz sets bit 6 (0x40/0x42/0x46) on every draw whose colour 0 must vanish (menu mask,
+	// title, panels), Cars' ARGB titles (0x88 = 2) use index 0 as their opaque black fill [EMU]
+	static bool colour_key(const rstate &s) { return BIT(s.w88, 6); }
+	// 0x84 bit 0 (set with bit 1 by the firmware's global depth flag) depth-tests only together with bit 1,
+	// the per-object depth-write mask: Bratz's menu card (0x84 = 0x05) is drawn over the mask its corner
+	// decorations leave in the depth area (0x7E00, nearest) on the console, while the decorations' own
+	// second pass (0x17) is confined by it, and Cars' menu lines (0x07) stay behind the text. [EMU]
+	static bool depth_test(const rstate &s) { return BIT(s.w84, 0) && BIT(s.w84, 1); }
+	void zset(int x, int y, u16 v);
 	struct rcache // per band
 	{
 		u16 pal[256];
 		u32 key = ~0U;
 	};
-	enum : u8 { CMD_TRI3D, CMD_TRI2D, CMD_LINE, CMD_POINT, CMD_SPRITE, CMD_FILL, CMD_ZCLEAR };
+	enum : u8 { CMD_TRI3D, CMD_TRI2D, CMD_LINE, CMD_POINT, CMD_SPRITE, CMD_FILL };
 	struct rcmd
 	{
 		u8 type;
 		bool textured;
 		rstate st;
-		int ymin, ymax;        // rows touched (for band culling)
+		int ymin, ymax;        // rows touched, as depth-area rows (colour row - koff), for band culling
+		int koff;              // colour row - depth-area row (0 for draws into the depth area itself)
 		vertex_t v[3];
 		u32 a0, a1, a2, a3;    // sprite: x0/y0, w/h, uv, col | fill: base, size, col
 		u8 flags;
+		float z;               // sprite: eye distance from its reciprocal depth word
 	};
 	rstate cur_state() const;
 	void add_cmd(rcmd &&c);
@@ -144,14 +180,13 @@ private:
 	bool texel(const rstate &s, rcache &pc, float u, float v, bool normalized, float &r, float &g, float &b, float &a) const;
 	bool texel_point(const rstate &s, rcache &pc, int tu, int tv, float &r, float &g, float &b, float &a) const;
 	int texel_raw(const rstate &s, rcache &pc, int tu, int tv) const;
+	template <typename F> int texel_fetch(const rstate &s, rcache &pc, int tu, int tv, F &&rd) const;
 	void plot(const rstate &s, int x, int y, float z, float r, float g, float b, float a, bool depth);
 	void draw_triangle(const rstate &s, rcache &pc, const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured, int y0, int y1);
 	void draw_tri2d(const rstate &s, rcache &pc, const vertex_t &a, const vertex_t &b, const vertex_t &c, bool textured, int y0, int y1);
 	void draw_line(const rstate &s, const vertex_t &a, const vertex_t &b, int y0, int y1);
 	void draw_sprite(const rstate &s, rcache &pc, const rcmd &c, int y0, int y1);
 	void draw_fill(const rcmd &c, int y0, int y1);
-	void draw_zclear(const rcmd &c, int y0, int y1);
-	int m_zdirty_y0 = 0, m_zdirty_y1 = -1; // rows written with depth since the last clear
 
 	static constexpr int MAX_BANDS = 48;
 	struct band_job { zevio_gpu_device *gpu; const std::vector<rcmd> *cmds; int y0, y1; std::atomic<int> *left; };
@@ -197,12 +232,13 @@ private:
 
 	// state
 	u16 m_r[256];          // 0x20 register block values (mostly f16)
+	float m_rf[256];       // m_r as floats, so per-vertex work need not convert
 	u32 m_w1c, m_w1e, m_w84, m_w88, m_w81, m_w85, m_w86, m_w87, m_w8d;
 	u32 m_clip0, m_clip1;
 	u32 m_clut[6];         // 0x8F-0x94
 	u32 m_vtxbase, m_xfer;
 
-	std::unique_ptr<float[]> m_zbuf; // 1024 x 1024, GPU coordinates
+	std::unique_ptr<float[]> m_zbuf; // ZW x ZH, depth-area coordinates (the aux rows), eye distance
 	bool m_no3d = false;
 
 	// FA display list queue HLE (see fa_queue_hle)
