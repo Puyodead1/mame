@@ -129,6 +129,11 @@ void zevio_gpu_device::device_start()
 	save_item(NAME(m_vram_y0));
 	save_item(NAME(m_vram_base));
 	save_pointer(NAME(m_aux), 1024 * AUX_H);
+	m_done_timer = timer_alloc(FUNC(zevio_gpu_device::done_cb), this);
+	save_item(NAME(m_busy_until));
+	save_item(NAME(m_done_status));
+	save_item(NAME(m_done_time));
+	save_item(NAME(m_done_count));
 }
 
 void zevio_gpu_device::device_stop()
@@ -182,6 +187,9 @@ void zevio_gpu_device::device_reset()
 	m_vram_base = 0;
 	std::fill_n(&m_aux[0], 1024 * AUX_H, 0);
 	std::fill_n(&m_zbuf[0], ZW * ZH, std::numeric_limits<float>::max());
+	m_done_count = 0;
+	m_busy_until = attotime::zero;
+	m_done_timer->adjust(attotime::never);
 	update_irq();
 }
 
@@ -441,9 +449,53 @@ bool zevio_gpu_device::fa_queue_hle()
 
 u32 zevio_gpu_device::regs_r(offs_t offset)
 {
+	// bits 31-16: engine state, 3 while it is still drawing (Gpu_trySubmit waits for anything else)
 	if (offset == 0)
-		return m_regs[0] & 0xffff; // engine idle
+		return (m_regs[0] & 0xffff) | ((machine().time() < m_busy_until) ? 0x30000 : 0);
 	return m_regs[offset];
+}
+
+/*
+    Engine time. The engine draws at a finite rate, and FA starts the next queued
+    list only from the end-of-list interrupt, so a scene costs real time: Disney
+    Princess' castle levels update every third vblank on the console (20 fps) and
+    ran at 60 in MAME, three times too fast. Each kick's lists are recorded at once
+    (drawing itself still happens on the render thread) but their end status
+    (+0x14, and with it the interrupt) is delivered when the engine would have
+    finished, after the time for the pixels and primitives they drew.
+    [EMU] the rates are fitted to console footage, not measured: 12 Mpx/s (with the
+    rough pixel counts of add_cmd) gives Princess' castle 20 fps; Bratz's character
+    select comes out at 17.5 fps (console 15), CPU-bound there. A per-list cost was
+    tried and does not fit: FA chains queued lists into fewer kicks while the engine
+    is busy. ZGPU_PXRATE (pixels/s), ZGPU_PRIMUS (us per primitive), ZGPU_XFERRATE
+    (pixels/s loaded, stored or copied); ZGPU_NOTIMING turns it off
+*/
+double zevio_gpu_device::list_time(u64 px, u64 prims, u64 xfer) const
+{
+	static const double px_rate = getenv("ZGPU_PXRATE") ? atof(getenv("ZGPU_PXRATE")) : 12e6;
+	static const double prim_s = (getenv("ZGPU_PRIMUS") ? atof(getenv("ZGPU_PRIMUS")) : 1.0) * 1e-6;
+	static const double xfer_rate = getenv("ZGPU_XFERRATE") ? atof(getenv("ZGPU_XFERRATE")) : 20e6;
+	return double(px) / px_rate + double(prims) * prim_s + double(xfer) / xfer_rate;
+}
+
+void zevio_gpu_device::done_schedule()
+{
+	if (m_done_count)
+		m_done_timer->adjust(std::max(m_done_time[0] - machine().time(), attotime::zero));
+	else
+		m_done_timer->adjust(attotime::never);
+}
+
+TIMER_CALLBACK_MEMBER(zevio_gpu_device::done_cb)
+{
+	if (!m_done_count)
+		return;
+	m_regs[0x14 / 4] = m_done_status[0];
+	m_done_count--;
+	std::copy(&m_done_status[1], &m_done_status[1 + m_done_count], &m_done_status[0]);
+	std::copy(&m_done_time[1], &m_done_time[1 + m_done_count], &m_done_time[0]);
+	update_irq();
+	done_schedule();
 }
 
 void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
@@ -459,12 +511,46 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 	case 0x00 / 4:
 		if (data == 1)
 		{
-			const u64 px0 = m_work_px;
+			const u64 px0 = m_work_px, prims0 = m_work_prims, xfer0 = m_work_xfer;
+			const u32 status0 = m_regs[0x14 / 4];
 			m_hle_handled = false;
 			m_defer_irq = true;
 			run_list(m_regs[0x28 / 4]);
 			while (fa_queue_hle())
 				run_list(m_regs[0x28 / 4]);
+			static const bool notiming = getenv("ZGPU_NOTIMING") != nullptr;
+			if (!notiming && !m_hle_handled)
+			{
+				// the engine starts this list when it has finished the previous one
+				const attotime now = machine().time();
+				m_busy_until = std::max(now, m_busy_until) + attotime::from_double(list_time(m_work_px - px0, m_work_prims - prims0, m_work_xfer - xfer0));
+				if (m_regs[0x14 / 4] != status0)
+				{
+					if (m_done_count == DONE_MAX)
+						done_cb(0);
+					m_done_status[m_done_count] = m_regs[0x14 / 4];
+					m_done_time[m_done_count++] = m_busy_until;
+					m_regs[0x14 / 4] = status0;
+					done_schedule();
+				}
+				// ZGPU_WORKLOG: kicks, pixels, primitives and engine busy time per emulated second
+				static const bool worklog = getenv("ZGPU_WORKLOG") != nullptr;
+				static u64 wl_kicks, wl_px, wl_prims, wl_xfer; static double wl_busy, wl_sec = -1;
+				if (worklog)
+				{
+					const double t = now.as_double();
+					if (wl_sec < 0)
+						wl_sec = std::floor(t);
+					if (t >= wl_sec + 1)
+					{
+						logerror("WORK %.0f s: %llu kicks, %llu px, %llu prims, %llu xfer, engine busy %.0f%%\n", wl_sec,
+								(unsigned long long)wl_kicks, (unsigned long long)wl_px, (unsigned long long)wl_prims, (unsigned long long)wl_xfer, wl_busy * 100);
+						wl_kicks = wl_px = wl_prims = wl_xfer = 0; wl_busy = 0; wl_sec = std::floor(t);
+					}
+					wl_kicks++; wl_px += m_work_px - px0; wl_prims += m_work_prims - prims0; wl_xfer += m_work_xfer - xfer0;
+					wl_busy += list_time(m_work_px - px0, m_work_prims - prims0, m_work_xfer - xfer0);
+				}
+			}
 			// hand work to the render thread in batches: Cars kicks ~800 lists a frame, most of
 			// them a single state word or sprite, and waking the thread for each cost more than
 			// drawing them. Everything recorded is submitted by the next sync point at the latest
@@ -479,7 +565,6 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 			// the CPU (as a busy bus would)
 			constexpr double RATE = 100e6; // pixels per second; TODO: measure
 			constexpr double FREE = 20000; // up to 0.2 ms ahead is free
-			static const bool notiming = getenv("ZGPU_NOTIMING") != nullptr;
 			const double now = machine().time().as_double();
 			m_px_debt = std::max(0.0, m_px_debt - (now - m_px_time) * RATE) + double(m_work_px - px0);
 			m_px_time = now;
@@ -494,6 +579,9 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 		}
 		else if (data == 3)
 		{
+			m_done_count = 0;
+			m_busy_until = machine().time();
+			done_schedule();
 			m_regs[0x14 / 4] = 0;
 			update_irq();
 		}
@@ -1752,6 +1840,7 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 		else if (c.type == CMD_SPRITE || c.type == CMD_FILL)
 			w = c.a1 & 0xffff;
 		m_work_px += u64(c.ymax - c.ymin + 1) * w;
+		m_work_prims++;
 	}
 	{
 		// areas drawn since the last frame fence, as rows of the RAM surface
@@ -2086,6 +2175,7 @@ void zevio_gpu_device::run_list(u32 addr)
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					vram_w(x + i, y + j, rd16(src + (j * w + i) * 2));
+			m_work_xfer += u64(w) * h;
 			break;
 		}
 		case 0xd1: // store image to the 0x0C address
@@ -2097,6 +2187,7 @@ void zevio_gpu_device::run_list(u32 addr)
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					wr16(m_xfer + (j * w + i) * 2, vram_r(x + i, y + j));
+			m_work_xfer += u64(w) * h;
 			break;
 		}
 		case 0xd3: // fill
@@ -2132,6 +2223,7 @@ void zevio_gpu_device::run_list(u32 addr)
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					vram_w(dx + i, dy + j, tmp[j * w + i]);
+			m_work_xfer += u64(w) * h;
 			break;
 		}
 		default:

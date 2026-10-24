@@ -206,7 +206,21 @@ private:
 	// were drawing, so loops that redraw whenever it is done run at a real rate
 	device_execute_interface *m_stall = nullptr;
 	u64 m_work_px = 0; // pixels queued, roughly
+	u64 m_work_prims = 0; // primitives queued
+	u64 m_work_xfer = 0;  // pixels loaded, stored or copied (0xD0-0xD2)
 	double m_px_debt = 0, m_px_time = 0;
+
+	// engine time (see regs_w): a list's end status (+0x14) and interrupt arrive when the engine would have
+	// finished drawing it, and +0x00 reads busy until then
+	static constexpr int DONE_MAX = 8;
+	emu_timer *m_done_timer = nullptr;
+	attotime m_busy_until;
+	u32 m_done_status[DONE_MAX];  // +0x14 values to deliver, oldest first
+	attotime m_done_time[DONE_MAX];
+	int m_done_count = 0;
+	TIMER_CALLBACK_MEMBER(done_cb);
+	void done_schedule();
+	double list_time(u64 px, u64 prims, u64 xfer) const;
 public:
 	void set_stall_cpu(device_execute_interface *cpu) { m_stall = cpu; }
 private:
