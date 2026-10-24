@@ -547,6 +547,8 @@ u32 vsmilpro_state::pll_r(offs_t offset)
 
 void vsmilpro_state::pll_w(offs_t offset, u32 data, u32 mem_mask)
 {
+	if (getenv("ZPLL_LOG"))
+		logerror("%s: pll %02x = %08x\n", machine().describe_context(), offset * 4, data);
 	COMBINE_DATA(&m_pll[offset]);
 }
 
@@ -1396,6 +1398,25 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 				}
 		}
 		else if (w > 2 && in_sdram(yb) && in_sdram(ub) && in_sdram(vb))
+		{
+			// YCbCr -> RGB through the table at +0xC00 (written by FA and the boot ROM's photo viewer):
+			// 64 entries each for Y, Cb and Cr, indexed by the sample's top 6 bits, each word three signed
+			// 10-bit terms B<<20 | G<<10 | R summed per channel, half scale (Y 235 -> 128), clamped. FA's table
+			// is BT.601 studio range; Disney Princess' movie on the console fits it (console = 1.13 x Y - 32
+			// over its frames), not full-range JFIF, and its darkest pixels (Y 13-15) stay black.
+			s32 lut[3][64][3];
+			bool have_table = false;
+			for (int t = 0; t < 3; t++)
+				for (int i = 0; i < 64; i++)
+				{
+					const u32 wd = regs[(0xc00 + t * 0x100 + i * 4) / 4];
+					have_table |= wd != 0;
+					for (int c = 0; c < 3; c++)
+					{
+						const s32 v = (wd >> (c * 10)) & 0x3ff;
+						lut[t][i][c] = (v < 0x200) ? v : v - 0x400;
+					}
+				}
 			for (int y = std::max(y0, cliprect.top()); y <= std::min(y1, cliprect.bottom()); y++)
 			{
 				u32 *dst = &bitmap.pix(y);
@@ -1403,15 +1424,27 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 				for (int x = std::max(x0, cliprect.left()); x <= std::min(x1, cliprect.right()); x++)
 				{
 					const int lx = x - x0;
-					const float yy = ram_r8(yb + ly * w + lx);
-					const float cb = ram_r8(ub + (ly / 2) * (w / 2) + lx / 2) - 128.0f;
-					const float cr = ram_r8(vb + (ly / 2) * (w / 2) + lx / 2) - 128.0f;
-					const int r = std::clamp(int(yy + 1.402f * cr), 0, 255);
-					const int g = std::clamp(int(yy - 0.344136f * cb - 0.714136f * cr), 0, 255);
-					const int bl = std::clamp(int(yy + 1.772f * cb), 0, 255);
-					dst[x] = rgb_t(r, g, bl);
+					const u8 yy = ram_r8(yb + ly * w + lx);
+					const u8 cb = ram_r8(ub + (ly / 2) * (w / 2) + lx / 2);
+					const u8 cr = ram_r8(vb + (ly / 2) * (w / 2) + lx / 2);
+					if (have_table)
+					{
+						const s32 *ty = lut[0][yy >> 2], *tb = lut[1][cb >> 2], *tr = lut[2][cr >> 2];
+						dst[x] = rgb_t(std::clamp((ty[0] + tb[0] + tr[0]) * 2, 0, 255),
+								std::clamp((ty[1] + tb[1] + tr[1]) * 2, 0, 255),
+								std::clamp((ty[2] + tb[2] + tr[2]) * 2, 0, 255));
+					}
+					else
+					{
+						// no table written: full-range JFIF
+						const float fcb = cb - 128.0f, fcr = cr - 128.0f;
+						dst[x] = rgb_t(std::clamp(int(yy + 1.402f * fcr), 0, 255),
+								std::clamp(int(yy - 0.344136f * fcb - 0.714136f * fcr), 0, 255),
+								std::clamp(int(yy + 1.772f * fcb), 0, 255));
+					}
 				}
 			}
+		}
 	}
 
 	// main 16-bit layer at the display start address, over the video layer
@@ -1625,7 +1658,19 @@ void vsmilpro_state::dcdma_w(offs_t offset, u32 data, u32 mem_mask)
 				// not the CPU's interrupt controller [INT, strong], so these writes
 				// go to DSP memory (m_dsp_mem: data at 0, program at 0x10000)
 				if (dst == 0xdc020000)
+				{
 					m_dsp->program_loaded(count); // DSP program memory segment
+					if (getenv("ZDSP_PROGDUMP")) // the program as loaded: dsp_prog_<words>.bin
+						if (FILE *f = fopen(util::string_format("dsp_prog_%x.bin", count).c_str(), "wb"))
+						{
+							for (u32 i = 0; i < count; i++)
+							{
+								const u16 v = ram_r16(src + i * sstride);
+								fwrite(&v, 2, 1, f);
+							}
+							fclose(f);
+						}
+				}
 				for (u32 i = 0; i < count; i++)
 				{
 					const u32 d = dst + i * dstride;
@@ -1758,10 +1803,13 @@ void vsmilpro_state::cd_servo_write(int nbits, u64 value, bool sens)
 		// sees, which FA relies on to pause right after the requested sectors
 		if ((value >> 26) == (0xa0 >> 2))
 			m_cd_mute = BIT(value, 25);
-		// $9x function specification: D22 (DSPB) selects double speed
+		// $9x function specification: D22 (DSPB) is set only for the ROM's speed code 4, which
+		// FA requests after the TOC and logs as "To 4X command" (HARDWARE.md 12). 4x is also what
+		// FA's movie start needs: it waits for 290 sectors before configuring the DSP and the game
+		// gives up after 2 s (Disney Princess's intro; 2x takes 1.95 s plus the seek)
 		if ((cmd & 0xf0) == 0x90)
 		{
-			const int speed = BIT(value, 26) ? 2 : 1;
+			const int speed = BIT(value, 26) ? 4 : 1;
 			m_cd_timer->adjust(m_cd_timer->remaining(), 0, attotime::from_hz(75 * speed));
 		}
 		// traverse count for a long sled move (count in bits 27-12). The init

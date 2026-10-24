@@ -50,8 +50,11 @@ DEFINE_DEVICE_TYPE(ZEVIO_DSP_HLE, zevio_dsp_hle_device, "zevio_dsp_hle", "Zevio 
 
 namespace {
 
+// builds of the MJP program in the games' FA libraries, all with the same protocol
+// (Princess's differs from the boot ROM's mostly in relocated branch targets)
 constexpr u32 MJP_PROGRAM_WORDS = 0x1ed0;
-constexpr u32 MJP_PROGRAM_WORDS_B = 0x1ea0; // Wacky Race: same protocol
+constexpr u32 MJP_PROGRAM_WORDS_B = 0x1ea0; // Wacky Race
+constexpr u32 MJP_PROGRAM_WORDS_C = 0x1eb0; // Disney Princess
 constexpr u32 CMD_BLOCK = 0x1c000;
 constexpr u32 MSG_BLOCK = 0x1c080;
 
@@ -288,7 +291,7 @@ void zevio_dsp_hle_device::post_message()
 void zevio_dsp_hle_device::command(u32 cmd)
 {
 	const u32 c = m_w + CMD_BLOCK;
-	if (m_prog_words != MJP_PROGRAM_WORDS && m_prog_words != MJP_PROGRAM_WORDS_B)
+	if (m_prog_words != MJP_PROGRAM_WORDS && m_prog_words != MJP_PROGRAM_WORDS_B && m_prog_words != MJP_PROGRAM_WORDS_C)
 	{
 		LOGMASKED(LOG_CMD, "DSP command %02x for unsupported program (%x words)\n", cmd, m_prog_words);
 		return;
@@ -297,7 +300,8 @@ void zevio_dsp_hle_device::command(u32 cmd)
 	switch (cmd)
 	{
 	case 0x80:
-		wr32(c + 72, 0);
+		// the program answers with its input buffer (DSP data word 0x7000), as both builds do (main, 0x101B)
+		wr32(c + 72, 0x7000);
 		wr32(c + 64, 0x80);
 		post_reply();
 		break;
