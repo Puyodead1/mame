@@ -73,6 +73,23 @@ public:
 		fast_mem_update();
 	}
 
+	// memory timing (off unless set): an ARM926-style D-cache (read-allocate, round-robin) and I-cache in front of
+	// fast RAM, a write buffer through which stores to fast RAM drain, and a cost per device access by address
+	// region. With it a single load or store costs 1 cycle plus whatever the memory system adds (the ARM9 pipeline),
+	// not the ARM7's 3 and 2. Instruction fetch is modelled in recompiled code only.
+	struct mem_timing
+	{
+		unsigned dcache_sets = 64, icache_sets = 128; // 4 ways, 32-byte lines (powers of two)
+		int dmiss = 30, imiss = 25;                   // extra cycles for a line fill
+		int wb_entries = 4, wb_drain = 6;             // write buffer depth, cycles to drain one store
+		uint8_t io_read[256] = {}, io_write[256] = {}; // cycles per device access, by address bits 31-24 (0 = 1)
+	};
+	void set_mem_timing(const mem_timing &t);
+
+	// CP15 c0: the part's own ID and cache type registers (firmware sizes its cache loops from the latter)
+	void set_copro_id(uint32_t id) { m_copro_id = id; }
+	void set_cache_type(uint32_t ctr) { m_cache_type = ctr; }
+
 	// 26-bit data space (CP15 DATA32 clear on the parts with the 26-bit modes): a data address with bits 31:26 set takes
 	// the address exception (vector 0x14, SVC mode).  Disabling it gives the old cpu/arm behaviour of silently masking
 	// the address to 26 bits instead.
@@ -208,6 +225,7 @@ protected:
 //#endif
 
 	uint32_t m_copro_id;
+	uint32_t m_cache_type = 0x0f0d2112; // CP15 c0 op2 1 (the generic ARM9's value is the Nintendo DS's)
 
 	// For debugger
 	uint32_t m_pc;
@@ -364,6 +382,27 @@ protected:
 #endif
 		return nullptr;
 	}
+
+	// memory timing state (see set_mem_timing)
+	bool m_mt = false;
+	mem_timing m_mtc;
+	std::vector<uint32_t> m_dtag, m_itag;  // per set 4 ways: line address + 1, 0 = empty
+	std::vector<uint8_t> m_drr, m_irr;     // round-robin victim per set
+	int32_t m_wb_fill = 0;                 // cycles of draining left in the write buffer ...
+	int32_t m_wb_icount = 0;               // ... as of this m_icount
+	int32_t m_io_extra_r[256], m_io_extra_w[256]; // device access cost - 1
+	uint32_t m_mt_pa = 0;                  // address for the recompiler's miss calls
+	uint32_t m_mt_spill[3];
+	void mt_dfill(offs_t pa);
+	void mt_ifill(offs_t pa);
+	void mt_flush_d() { std::fill(m_dtag.begin(), m_dtag.end(), 0); }
+	void mt_flush_i() { std::fill(m_itag.begin(), m_itag.end(), 0); }
+	void mt_inval_line(std::vector<uint32_t> &tags, unsigned sets, offs_t pa);
+	inline void mt_load(offs_t pa);
+	inline void mt_store();
+	inline void mt_io(offs_t pa, bool write);
+	static void mt_dfill_cb(void *param);
+	static void mt_ifill_cb(void *param);
 
 	// as fastram_ptr for a word, also giving how many more words follow on in the same region
 	uint32_t *fastram_words(offs_t addr, uint32_t &after) const

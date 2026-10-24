@@ -142,6 +142,7 @@ void arm7_cpu_device::drc_block_transfer_impl()
 	// lowest address; registers go to ascending addresses in every mode
 	const uint32_t lo = up ? (pre ? base + 4 : base) : (pre ? base - n * 4 : base - (n - 1) * 4);
 	uint32_t *p[16];
+	offs_t pas[16]; // physical addresses, for memory timing
 	const int flags = ARM7_TLB_ABORT_D | (load ? ARM7_TLB_READ : ARM7_TLB_WRITE);
 	uint32_t run = 0; // words after p[k - 1] in the same page and fast RAM region
 	for (uint32_t k = 0; k < n; k++)
@@ -150,6 +151,7 @@ void arm7_cpu_device::drc_block_transfer_impl()
 		if (run)
 		{
 			p[k] = p[k - 1] + 1;
+			pas[k] = pas[k - 1] + 4;
 			run--;
 			continue;
 		}
@@ -169,6 +171,7 @@ void arm7_cpu_device::drc_block_transfer_impl()
 				return;
 		}
 		p[k] = host;
+		pas[k] = pa;
 	}
 	if (load && (list & 0x8000) && (*p[n - 1] & 1) && m_archRev >= 5)
 		return; // to Thumb
@@ -187,7 +190,15 @@ void arm7_cpu_device::drc_block_transfer_impl()
 			}
 		if ((insn & INSN_BDT_W) && !BIT(list, rb))
 			SetRegister(rb, up ? base + n * 4 : base - n * 4);
-		m_icount -= n + 2 + ((list & 0x8000) ? 2 : 0);   // nS + 1N + 1I, PC 2 more
+		if (m_mt)
+		{
+			// ARM926: one cycle per register (at least 2), the D-cache for each line touched
+			for (uint32_t w = 0; w < n; w++)
+				mt_load(pas[w]);
+			m_icount -= std::max<uint32_t>(n, 2) + ((list & 0x8000) ? 2 : 0);
+		}
+		else
+			m_icount -= n + 2 + ((list & 0x8000) ? 2 : 0);   // nS + 1N + 1I, PC 2 more
 	}
 	else
 	{
@@ -196,7 +207,14 @@ void arm7_cpu_device::drc_block_transfer_impl()
 				*p[k++] = GetRegister(i);
 		if (insn & INSN_BDT_W)
 			SetRegister(rb, up ? base + n * 4 : base - n * 4);
-		m_icount -= n + 1;                                 // (n-1)S + 2N
+		if (m_mt)
+		{
+			m_icount -= std::max<uint32_t>(n, 2);
+			for (uint32_t w = 0; w < n; w++)
+				mt_store();
+		}
+		else
+			m_icount -= n + 1;                                 // (n-1)S + 2N
 	}
 	m_drc_ok = 1;
 }
@@ -334,7 +352,7 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 
 	try
 	{
-		drcuml_block &block(m_drcuml->begin_block(DRC_MAX_INSNS * 96 + 64));
+		drcuml_block &block(m_drcuml->begin_block(DRC_MAX_INSNS * (m_mt ? 224 : 96) + 64));
 		code_label nextlabel = 1;
 		std::vector<std::function<void ()>> stubs; // out-of-line code, emitted after the block
 
@@ -376,6 +394,62 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				store(&m_r[eR15], I0);
 				UML_EXIT(block, DRC_EXECUTE_OUT_OF_CYCLES);
 			});
+		};
+
+		// memory timing (set_mem_timing). D-cache tags for the load at physical address I1, with I2-I4 free;
+		// a miss fills the line and charges it in C, keeping I0, I1 and I5
+		auto mt_dcheck = [&] ()
+		{
+			const code_label hit = nextlabel++, miss = nextlabel++;
+			UML_SHR(block, I3, I1, 5);
+			UML_AND(block, I4, I3, m_mtc.dcache_sets - 1);
+			UML_SHL(block, I4, I4, 2);
+			UML_ADD(block, I3, I3, 1);
+			for (int w = 0; w < 4; w++)
+			{
+				UML_LOAD(block, I2, m_dtag.data() + w, I4, SIZE_DWORD, SCALE_x4);
+				UML_CMP(block, I2, I3);
+				UML_JMPc(block, uml::COND_E, hit);
+			}
+			UML_JMP(block, miss);
+			stubs.emplace_back([&, hit, miss] ()
+			{
+				UML_LABEL(block, miss);
+				store(&m_mt_pa, I1);
+				store(&m_mt_spill[0], I0);
+				store(&m_mt_spill[1], I1);
+				store(&m_mt_spill[2], I5);
+				UML_CALLC(block, &arm7_cpu_device::mt_dfill_cb, this);
+				load(I0, &m_mt_spill[0]);
+				load(I1, &m_mt_spill[1]);
+				load(I5, &m_mt_spill[2]);
+				UML_JMP(block, hit);
+			});
+			UML_LABEL(block, hit);
+		};
+		// a store into the write buffer (as mt_store), I2-I4 free: drained by the cycles since the last store,
+		// stalls while it is full
+		auto mt_wbuf = [&] ()
+		{
+			const int32_t cap = m_mtc.wb_entries * m_mtc.wb_drain;
+			const code_label room = nextlabel++;
+			load(I2, &m_wb_icount);
+			load(I3, &m_icount);
+			UML_SUB(block, I2, I2, I3);
+			load(I4, &m_wb_fill);
+			UML_SUB(block, I4, I4, I2);
+			UML_CMP(block, I4, 0);
+			UML_MOVc(block, uml::COND_L, I4, 0);
+			UML_ADD(block, I4, I4, m_mtc.wb_drain);
+			UML_CMP(block, I4, cap);
+			UML_JMPc(block, uml::COND_LE, room);
+			UML_SUB(block, I2, I4, cap);
+			UML_SUB(block, I3, I3, I2);
+			store(&m_icount, I3);
+			UML_MOV(block, I4, cap);
+			UML_LABEL(block, room);
+			store(&m_wb_fill, I4);
+			store(&m_wb_icount, I3);
 		};
 
 		// condition check: jumps to the returned label when it fails
@@ -486,6 +560,24 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				const offs_t page = (phys - m_drc_pages_base) >> 10;
 				if (page < m_drc_pages_count)
 					m_drc_page_flags[page] |= ((phys ^ pc) & ~offs_t(0x3ff)) ? 2 : 1;
+			}
+
+			if (m_mt && host && (n == 0 || !(phys & 31)))
+			{
+				// memory timing: the I-cache for this line (set_mem_timing)
+				const uint32_t line = (phys >> 5) + 1;
+				const unsigned set = (phys >> 5) & (m_mtc.icache_sets - 1);
+				const code_label ihit = nextlabel++;
+				for (int w = 0; w < 4; w++)
+				{
+					UML_LOAD(block, I0, m_itag.data() + set * 4 + w, 0, SIZE_DWORD, SCALE_x4);
+					UML_CMP(block, I0, line);
+					UML_JMPc(block, uml::COND_E, ihit);
+				}
+				UML_MOV(block, I0, phys);
+				store(&m_mt_pa, I0);
+				UML_CALLC(block, &arm7_cpu_device::mt_ifill_cb, this);
+				UML_LABEL(block, ihit);
 			}
 
 			const uint32_t cond = insn >> 28;
@@ -864,6 +956,11 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 					{
 						// to PC: an ARMv5 load with bit 0 set switches to Thumb, leave that to the interpreter
 						// (nothing has been changed yet); otherwise PC = value & ~3
+						if (m_mt)
+						{
+							mt_dcheck();
+							UML_SUB(block, I2, I1, m_fastram[r].start);
+						}
 						UML_LOAD(block, I3, m_fastram[r].base, I2, usize, SCALE_x1);
 						UML_TEST(block, I3, 1);
 						UML_JMPc(block, uml::COND_NZ, slow);
@@ -873,6 +970,11 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 					}
 					else if (isload)
 					{
+						if (m_mt)
+						{
+							mt_dcheck();
+							UML_SUB(block, I2, I1, m_fastram[r].start);
+						}
 						UML_LOAD(block, I3, m_fastram[r].base, I2, usize, SCALE_x1);
 						if (sext)
 							UML_SEXT(block, I3, I3, usize);
@@ -881,6 +983,11 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 					}
 					else
 					{
+						if (m_mt)
+						{
+							mt_wbuf();
+							UML_SUB(block, I2, I1, m_fastram[r].start);
+						}
 						load(I3, reg(rdn));
 						UML_STORE(block, m_fastram[r].base, I2, I3, usize, SCALE_x1);
 						writeback();
@@ -910,6 +1017,15 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 						UML_WRITE(block, I1, I3, usize, SPACE_PROGRAM);
 						writeback();
 					}
+					if (m_mt)
+					{
+						// the device access cost by region (set_mem_timing), on top of the instruction's cycle
+						UML_SHR(block, I2, I1, 24);
+						UML_LOAD(block, I4, isload ? m_io_extra_r : m_io_extra_w, I2, SIZE_DWORD, SCALE_x4);
+						load(I3, &m_icount);
+						UML_SUB(block, I3, I3, I4);
+						store(&m_icount, I3);
+					}
 					UML_LOAD(block, I0, &m_pending_interrupt, 0, SIZE_BYTE, SCALE_x1);
 					UML_LOAD(block, I1, &m_drc_dirty, 0, SIZE_BYTE, SCALE_x1);
 					UML_OR(block, I0, I0, I1);
@@ -924,7 +1040,7 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 						store(&m_r[eR15], I0);
 						UML_CALLC(block, &arm7_cpu_device::drc_check_irq, this);
 						load(I0, &m_icount);
-						UML_SUB(block, I0, I0, isload ? 3 : 2);
+						UML_SUB(block, I0, I0, m_mt ? 1 : isload ? 3 : 2);
 						store(&m_icount, I0);
 						UML_CMP(block, I0, 0);
 						UML_JMPc(block, uml::COND_LE, ooc);
@@ -958,7 +1074,7 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 					});
 				}
 				else
-					tail(isload ? 3 : 2, pc + 4); // loads 3, stores 2 (HandleMemSingle, HandleHalfWordDT)
+					tail(m_mt ? 1 : isload ? 3 : 2, pc + 4); // loads 3, stores 2 (HandleMemSingle, HandleHalfWordDT); 1 with memory timing
 				UML_LABEL(block, resume);
 				if (sdt_topc && cond == 14)
 				{

@@ -1201,6 +1201,58 @@ void arm7_cpu_device::fast_mem_update()
 	m_fast_mem = m_fastram_count && !(m_archFlags & ARCHFLAG_MODE26);
 }
 
+void arm7_cpu_device::set_mem_timing(const mem_timing &t)
+{
+	m_mt = true;
+	m_mtc = t;
+	m_dtag.assign(t.dcache_sets * 4, 0);
+	m_itag.assign(t.icache_sets * 4, 0);
+	m_drr.assign(t.dcache_sets, 0);
+	m_irr.assign(t.icache_sets, 0);
+	for (int r = 0; r < 256; r++)
+	{
+		m_io_extra_r[r] = std::max(t.io_read[r], uint8_t(1)) - 1;
+		m_io_extra_w[r] = std::max(t.io_write[r], uint8_t(1)) - 1;
+	}
+}
+
+// line fill: round-robin victim (CP15 control bit 14 as FA sets it), the miss cost
+void arm7_cpu_device::mt_dfill(offs_t pa)
+{
+	const unsigned set = (pa >> 5) & (m_mtc.dcache_sets - 1);
+	m_dtag[set * 4 + m_drr[set]] = (pa >> 5) + 1;
+	m_drr[set] = (m_drr[set] + 1) & 3;
+	m_icount -= m_mtc.dmiss;
+}
+
+void arm7_cpu_device::mt_ifill(offs_t pa)
+{
+	const unsigned set = (pa >> 5) & (m_mtc.icache_sets - 1);
+	m_itag[set * 4 + m_irr[set]] = (pa >> 5) + 1;
+	m_irr[set] = (m_irr[set] + 1) & 3;
+	m_icount -= m_mtc.imiss;
+}
+
+void arm7_cpu_device::mt_inval_line(std::vector<uint32_t> &tags, unsigned sets, offs_t pa)
+{
+	uint32_t *const s = &tags[((pa >> 5) & (sets - 1)) * 4];
+	for (int w = 0; w < 4; w++)
+		if (s[w] == (pa >> 5) + 1)
+			s[w] = 0;
+}
+
+void arm7_cpu_device::mt_dfill_cb(void *param)
+{
+	arm7_cpu_device &cpu = *reinterpret_cast<arm7_cpu_device *>(param);
+	cpu.mt_dfill(cpu.m_mt_pa);
+}
+
+void arm7_cpu_device::mt_ifill_cb(void *param)
+{
+	arm7_cpu_device &cpu = *reinterpret_cast<arm7_cpu_device *>(param);
+	cpu.mt_ifill(cpu.m_mt_pa);
+}
+
 void arm7_cpu_device::xlat_cache_flush()
 {
 	m_drc_dirty = true; // compiled blocks are keyed by virtual address
@@ -1907,6 +1959,9 @@ ATTR_FORCE_INLINE inline void arm7_cpu_device::exec_arm(uint32_t insn)
 
 void arm7_cpu_device::execute_run()
 {
+	// the write buffer drained while the other devices ran
+	m_wb_fill = 0;
+	m_wb_icount = m_icount;
 	if (m_drc)
 		drc_execute_run();
 	else
@@ -2441,7 +2496,7 @@ uint32_t arm7_cpu_device::arm7_rt_r_callback(offs_t offset)
 				data = m_copro_id;
 				break;
 			case 1: // cache type
-				data = 0x0f0d2112;  // HACK: value expected by ARMWrestler (probably Nintendo DS ARM9's value)
+				data = m_cache_type;  // default 0x0f0d2112: value expected by ARMWrestler (probably Nintendo DS ARM9's value)
 				//data = (6 << 25) | (1 << 24) | (0x172 << 12) | (0x172 << 0); // ARM920T (S3C24xx)
 				break;
 			case 2: // TCM type
@@ -2616,6 +2671,18 @@ void arm7_cpu_device::arm7_rt_w_callback(offs_t offset, uint32_t data)
 			break;
 		case 7:             // Cache Operations
 //            LOGMASKED(LOG_COPRO_WRITES, "arm7_rt_w_callback Cache Ops = %08x (%d) (%d)\n", data, op2, op3);
+			// with memory timing: drop the tags the operation invalidates (op3 = CRm, op2 = opcode 2; line
+			// operations by MVA, which is the physical address under the flat maps the users run)
+			if (m_mt)
+			{
+				switch (op3)
+				{
+				case 5: if (op2 == 0) mt_flush_i(); else if (op2 == 1) mt_inval_line(m_itag, m_mtc.icache_sets, data); break;
+				case 6: if (op2 == 0) mt_flush_d(); else if (op2 == 1) mt_inval_line(m_dtag, m_mtc.dcache_sets, data); break;
+				case 7: if (op2 == 0) { mt_flush_i(); mt_flush_d(); } break;
+				case 14: if (op2 == 1) mt_inval_line(m_dtag, m_mtc.dcache_sets, data); break;
+				}
+			}
 			break;
 		case 8:             // TLB Operations
 			LOGMASKED(LOG_COPRO_WRITES, "%s: arm7_rt_w_callback TLB Ops = %08x (%d) (%d), PC = %08x\n", machine().describe_context(), data, op2, op3, m_r[eR15]);
@@ -3076,7 +3143,8 @@ void arm7_cpu_device::arm7_cpu_write32(offs_t addr, uint32_t data)
 	}
 
 	addr &= ~3;
-	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); *reinterpret_cast<uint32_t *>(p) = data; return; }
+	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); if (m_mt) mt_store(); *reinterpret_cast<uint32_t *>(p) = data; return; }
+	if (m_mt) mt_io(addr, true);
 	m_program->write_dword(addr, data);
 }
 
@@ -3097,7 +3165,8 @@ void arm7_cpu_device::arm7_cpu_write16(offs_t addr, uint16_t data)
 	}
 
 	addr &= ~1;
-	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); *reinterpret_cast<uint16_t *>(p) = data; return; }
+	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); if (m_mt) mt_store(); *reinterpret_cast<uint16_t *>(p) = data; return; }
+	if (m_mt) mt_io(addr, true);
 	m_program->write_word(addr, data);
 }
 
@@ -3116,7 +3185,8 @@ void arm7_cpu_device::arm7_cpu_write8(offs_t addr, uint8_t data)
 		}
 	}
 
-	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); *p = data; return; }
+	if (uint8_t *const p = fastram_ptr(addr)) { if (m_drc) drc_code_write(addr); if (m_mt) mt_store(); *p = data; return; }
+	if (m_mt) mt_io(addr, true);
 	m_program->write_byte(addr, data);
 }
 
@@ -3138,7 +3208,11 @@ uint32_t arm7_cpu_device::arm7_cpu_read32(offs_t addr)
 	}
 
 	if (uint8_t *const p = fastram_ptr(addr & ~3))
+	{
+		if (m_mt) mt_load(addr);
 		return std::rotr(*reinterpret_cast<const uint32_t *>(p), 8 * (addr & 3));
+	}
+	if (m_mt) mt_io(addr, false);
 	if (addr & 3)
 	{
 		result = std::rotr(m_program->read_dword(addr & ~3), 8 * (addr & 3));
@@ -3169,9 +3243,15 @@ uint32_t arm7_cpu_device::arm7_cpu_read16(offs_t addr)
 	}
 
 	if (uint8_t *const p = fastram_ptr(addr & ~1))
+	{
+		if (m_mt) mt_load(addr);
 		result = *reinterpret_cast<const uint16_t *>(p);
+	}
 	else
+	{
+		if (m_mt) mt_io(addr, false);
 		result = m_program->read_word(addr & ~1);
+	}
 
 	if (addr & 1)
 	{
@@ -3198,7 +3278,11 @@ uint8_t arm7_cpu_device::arm7_cpu_read8(offs_t addr)
 
 	// Handle through normal 8 bit handler (for 32 bit cpu)
 	if (uint8_t *const p = fastram_ptr(addr))
+	{
+		if (m_mt) mt_load(addr);
 		return *p;
+	}
+	if (m_mt) mt_io(addr, false);
 	return m_program->read_byte(addr);
 }
 

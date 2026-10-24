@@ -587,6 +587,9 @@ void arm7_cpu_device::HandleMemSingle(uint32_t insn)
 		// Store takes only 2 N Cycles, so add + 1
 		ARM7_ICOUNT += 1;
 	}
+	// memory timing: 1 cycle, the memory system charges the rest (set_mem_timing)
+	if (m_mt)
+		ARM7_ICOUNT += (insn & INSN_SDT_L) ? 2 : 1;
 
 	if (m_pendingAbtD)
 	{
@@ -856,6 +859,9 @@ void arm7_cpu_device::HandleHalfWordDT(uint32_t insn)
 			ARM7_ICOUNT += 1;
 		}
 	}
+	// memory timing: 1 cycle, the memory system charges the rest (set_mem_timing)
+	if (m_mt)
+		ARM7_ICOUNT += (insn & INSN_SDT_L) ? 2 : 1;
 
 	if (m_pendingAbtD)
 	{

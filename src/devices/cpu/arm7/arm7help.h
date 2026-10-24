@@ -179,12 +179,47 @@ inline bool arm7_cpu_device::xlat_hit(offs_t &addr, const int flags) const
 	return true;
 }
 
+// memory timing (set_mem_timing): a load from fast RAM checks the D-cache tags (a miss fills the line and costs
+// dmiss), a store enters the write buffer (stalling while it is full), a device access costs its region's cycles
+inline void arm7_cpu_device::mt_load(offs_t pa)
+{
+	const uint32_t line = (pa >> 5) + 1;
+	const uint32_t *const s = &m_dtag[((pa >> 5) & (m_mtc.dcache_sets - 1)) * 4];
+	if (s[0] != line && s[1] != line && s[2] != line && s[3] != line)
+		mt_dfill(pa);
+}
+
+inline void arm7_cpu_device::mt_store()
+{
+	int32_t fill = m_wb_fill - (m_wb_icount - m_icount);
+	if (fill < 0)
+		fill = 0;
+	fill += m_mtc.wb_drain;
+	const int32_t cap = m_mtc.wb_entries * m_mtc.wb_drain;
+	if (fill > cap)
+	{
+		m_icount -= fill - cap;
+		fill = cap;
+	}
+	m_wb_fill = fill;
+	m_wb_icount = m_icount;
+}
+
+inline void arm7_cpu_device::mt_io(offs_t pa, bool write)
+{
+	m_icount -= write ? m_io_extra_w[pa >> 24] : m_io_extra_r[pa >> 24];
+}
+
 inline uint32_t arm7_cpu_device::fast_read32(offs_t addr)
 {
 	offs_t pa = addr;
 	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
 		if (const uint8_t *const p = fastram_ptr(pa & ~3))
+		{
+			if (m_mt)
+				mt_load(pa);
 			return std::rotr(*reinterpret_cast<const uint32_t *>(p), 8 * (addr & 3));
+		}
 	return arm7_cpu_read32(addr);
 }
 
@@ -194,6 +229,8 @@ inline uint32_t arm7_cpu_device::fast_read16(offs_t addr)
 	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
 		if (const uint8_t *const p = fastram_ptr(pa & ~1))
 		{
+			if (m_mt)
+				mt_load(pa);
 			uint32_t result = *reinterpret_cast<const uint16_t *>(p);
 			if (addr & 1)
 				result = ((result >> 8) & 0xff) | ((result & 0xff) << 24);
@@ -207,7 +244,11 @@ inline uint8_t arm7_cpu_device::fast_read8(offs_t addr)
 	offs_t pa = addr;
 	if (m_fast_mem && xlat_hit(pa, ARM7_TLB_ABORT_D | ARM7_TLB_READ))
 		if (const uint8_t *const p = fastram_ptr(pa))
+		{
+			if (m_mt)
+				mt_load(pa);
 			return *p;
+		}
 	return arm7_cpu_read8(addr);
 }
 
@@ -219,6 +260,8 @@ inline void arm7_cpu_device::fast_write32(offs_t addr, uint32_t data)
 		{
 			if (m_drc)
 				drc_code_write(pa);
+			if (m_mt)
+				mt_store();
 			*reinterpret_cast<uint32_t *>(p) = data;
 			return;
 		}
@@ -233,6 +276,8 @@ inline void arm7_cpu_device::fast_write16(offs_t addr, uint16_t data)
 		{
 			if (m_drc)
 				drc_code_write(pa);
+			if (m_mt)
+				mt_store();
 			*reinterpret_cast<uint16_t *>(p) = data;
 			return;
 		}
@@ -247,6 +292,8 @@ inline void arm7_cpu_device::fast_write8(offs_t addr, uint8_t data)
 		{
 			if (m_drc)
 				drc_code_write(pa);
+			if (m_mt)
+				mt_store();
 			*p = data;
 			return;
 		}
