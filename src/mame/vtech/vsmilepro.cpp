@@ -2292,6 +2292,33 @@ void vsmilpro_state::machine_start()
 		m_maincpu->add_fastram(0x10000000, 0x101e05e3, sdram);
 	}
 
+	// CPU memory timing measured on a console (sdk/tests/timing, analysis/re/hw_verified.md HW #18): ARM926EJ-S with
+	// an 8 KB D-cache and a 16 KB I-cache (4-way, 32-byte lines, CP15 cache type 0x1D112152); a load that misses
+	// costs 31 cycles in all, cold code 4.13 per instruction (a line fill every 8), every store about 6.3 as the
+	// write-through cache drains it to SDRAM, and device registers 12-20 cycles per access. Without this the
+	// emulated CPU did about twice the console's work per frame (Bratz's character select and store).
+	// VFLASH_NO_MEMTIMING turns it off.
+	if (!getenv("VFLASH_NO_MEMTIMING"))
+	{
+		arm7_cpu_device::mem_timing t;
+		t.dmiss = 30;    // 1.49 per hit, 31.0 per miss (loop overhead 0.5)
+		t.imiss = 25;    // 4.13 per instruction = 1 + 25 / 8
+		t.wb_drain = 6;  // stores 6.29 per op back to back
+		t.wb_entries = 4;
+		auto io = [&t] (int region, int rd, int wr) { t.io_read[region] = rd; t.io_write[region] = wr; };
+		io(0x10, 1, 6);  // SDRAM outside the fast RAM ranges (the idle counter word; all of it with the debugger)
+		for (int r = 0x8f; r <= 0x90; r++)
+			io(r, 20, 20); // SDRAM controller, APB: GPIO, UARTs, RTC, sysctl 20.49, PLL, timers 20.50
+		io(0xa0, 20, 20); io(0xa1, 20, 20); // factory bus, SPI
+		io(0xa4, 12, 14); // number converters: read 12.49, write 14.50
+		io(0xa8, 12, 14); // GPU: read 12.49
+		io(0xb0, 14, 16); // SPU: read 14.51
+		io(0xb8, 14, 16); // display: read 14.64, write 16.68
+		io(0xbc, 14, 16); io(0xc0, 14, 16); io(0xc4, 14, 16); // DMA, descriptor DMA, CD (as the AHB devices)
+		io(0xdc, 14, 16); // interrupt controller / DSP window: read 14.50
+		m_maincpu->set_mem_timing(t);
+	}
+
 	m_maincpu->space(AS_PROGRAM).install_write_tap(0x101e05e4, 0x101e05e7, "idle_tap",
 			[this] (offs_t offset, u32 &data, u32 mem_mask)
 			{
@@ -2506,6 +2533,9 @@ void vsmilpro_state::vsmilpro(machine_config &config)
 	ARM9(config, m_maincpu, 150'000'000); // ARM926EJ-S
 	// the ARM926 has caches, so the ARM7 prefetch buffer model is not needed
 	m_maincpu->set_direct_fetch(true);
+	// CP15 c0 as read on a console (HW #18): ARM926EJ-S r0p4; 8 KB D-cache, 16 KB I-cache, 4-way, 32-byte lines
+	m_maincpu->set_copro_id(0x41069264);
+	m_maincpu->set_cache_type(0x1d112152);
 	m_maincpu->set_drc(!getenv("VFLASH_NO_DRC"));
 	// the boot ROM kernel's idle task (copied to 0x10010994) counts forever
 	m_maincpu->add_idle_loop(0x100109a4, 0x10010994, {
