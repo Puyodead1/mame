@@ -247,6 +247,15 @@ void zevio_dsp_hle_device::mbox_w(offs_t offset, u32 data, u32 mem_mask)
 				m_awaiting_ack = false;
 				// FA answers each frame with the Y/U/V set for the next one (its 3-buffer rotation)
 				const u32 m = m_w + MSG_BLOCK;
+				// ZDSP_REPLYLOG: FA's whole reply block (M+64..M+127) for every frame
+				static const bool replylog = getenv("ZDSP_REPLYLOG") != nullptr;
+				if (replylog)
+				{
+					std::string s;
+					for (int i = 0; i < 16; i++)
+						s += util::string_format(" %08x", rd32(m + 64 + i * 4));
+					logerror("MJP reply frame %u:%s\n", m_frame, s);
+				}
 				m_out[0] = rd32(m + 76);
 				m_out[1] = rd32(m + 80);
 				m_out[2] = rd32(m + 84);

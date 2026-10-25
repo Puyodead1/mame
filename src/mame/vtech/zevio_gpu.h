@@ -209,6 +209,9 @@ private:
 	u64 m_work_px = 0; // pixels queued, roughly
 	u64 m_work_prims = 0; // primitives queued
 	u64 m_work_xfer = 0;  // pixels loaded, stored or copied (0xD0-0xD2)
+	u64 m_work_verts = 0; // vertices transformed (3D primitives and stores to memory)
+	u64 m_work_readback = 0; // pixels stored from VRAM to RAM (0xD1)
+	u64 m_work_px_fill = 0, m_work_px_blend = 0, m_work_px_depth = 0; // pixel classes (ZGPU_WORKLOG)
 	double m_px_debt = 0, m_px_time = 0;
 
 	// engine time (see regs_w): a list's end status (+0x14) and interrupt arrive when the engine would have
@@ -221,7 +224,7 @@ private:
 	int m_done_count = 0;
 	TIMER_CALLBACK_MEMBER(done_cb);
 	void done_schedule();
-	double list_time(u64 px, u64 prims, u64 xfer) const;
+	double list_time(u64 px, u64 prims, u64 xfer, u64 verts) const;
 public:
 	void set_stall_cpu(device_execute_interface *cpu) { m_stall = cpu; }
 private:

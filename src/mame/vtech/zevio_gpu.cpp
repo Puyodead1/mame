@@ -474,18 +474,27 @@ u32 zevio_gpu_device::regs_r(offs_t offset)
     (+0x14, and with it the interrupt) is delivered when the engine would have
     finished, after the time for the pixels and primitives they drew.
     [EMU] the rates are fitted to console footage, not measured: 12 Mpx/s (with the
-    rough pixel counts of add_cmd) gives Princess' castle 20 fps; Bratz's character
-    select comes out at 17.5 fps (console 15), CPU-bound there. A per-list cost was
-    tried and does not fit: FA chains queued lists into fewer kicks while the engine
-    is busy. ZGPU_PXRATE (pixels/s), ZGPU_PRIMUS (us per primitive), ZGPU_XFERRATE
-    (pixels/s loaded, stored or copied); ZGPU_NOTIMING turns it off
+    rough pixel counts of add_cmd), 5 us per primitive drawn, 20 Mpx/s for image
+    loads and copies and 0.5 Mpx/s for stores to RAM (D1, ZGPU_READRATE) give
+    Princess' castle 19.6 fps (console 20), Wacky
+    Races' race 19.4 (20), Bratz's character select 15.3 (15; it draws ~3.4k
+    primitives a frame against Princess' 1.2k, and at 1 us it ran at 19) and its
+    store 7.8 (7.5; a 128x128 render-to-texture through RAM every frame, D1 then
+    D0, which FA waits for; slowing uploads too delayed every game's loading).
+    Tried and not fitting: a per-list cost (FA chains
+    queued lists into fewer kicks while the engine is busy), per-vertex and
+    per-blended-pixel costs (they slow Princess before Bratz), cheaper fills.
+    ZGPU_PXRATE (pixels/s), ZGPU_PRIMUS (us per primitive), ZGPU_XFERRATE (pixels/s
+    loaded, stored or copied), experiments ZGPU_VERTUS, ZGPU_BLENDUS, ZGPU_KICKUS,
+    ZGPU_FILLRATE; ZGPU_NOTIMING turns it off. ZGPU_WORKLOG logs the work per second
 */
-double zevio_gpu_device::list_time(u64 px, u64 prims, u64 xfer) const
+double zevio_gpu_device::list_time(u64 px, u64 prims, u64 xfer, u64 verts) const
 {
 	static const double px_rate = getenv("ZGPU_PXRATE") ? atof(getenv("ZGPU_PXRATE")) : 12e6;
-	static const double prim_s = (getenv("ZGPU_PRIMUS") ? atof(getenv("ZGPU_PRIMUS")) : 1.0) * 1e-6;
+	static const double prim_s = (getenv("ZGPU_PRIMUS") ? atof(getenv("ZGPU_PRIMUS")) : 5.0) * 1e-6;
 	static const double xfer_rate = getenv("ZGPU_XFERRATE") ? atof(getenv("ZGPU_XFERRATE")) : 20e6;
-	return double(px) / px_rate + double(prims) * prim_s + double(xfer) / xfer_rate;
+	static const double vert_s = (getenv("ZGPU_VERTUS") ? atof(getenv("ZGPU_VERTUS")) : 0.0) * 1e-6;
+	return double(px) / px_rate + double(prims) * prim_s + double(xfer) / xfer_rate + double(verts) * vert_s;
 }
 
 void zevio_gpu_device::done_schedule()
@@ -521,7 +530,7 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 	case 0x00 / 4:
 		if (data == 1)
 		{
-			const u64 px0 = m_work_px, prims0 = m_work_prims, xfer0 = m_work_xfer;
+			const u64 px0 = m_work_px, prims0 = m_work_prims, xfer0 = m_work_xfer, verts0 = m_work_verts, blend0 = m_work_px_blend, fill0 = m_work_px_fill, rb0 = m_work_readback;
 			const u32 status0 = m_regs[0x14 / 4];
 			m_hle_handled = false;
 			m_defer_irq = true;
@@ -533,7 +542,17 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 			{
 				// the engine starts this list when it has finished the previous one
 				const attotime now = machine().time();
-				m_busy_until = std::max(now, m_busy_until) + attotime::from_double(list_time(m_work_px - px0, m_work_prims - prims0, m_work_xfer - xfer0));
+				// experiments: ZGPU_BLENDUS extra us per blended pixel, ZGPU_KICKUS fixed us per kick
+				static const double blend_s = (getenv("ZGPU_BLENDUS") ? atof(getenv("ZGPU_BLENDUS")) : 0.0) * 1e-6;
+				static const double kick_s = (getenv("ZGPU_KICKUS") ? atof(getenv("ZGPU_KICKUS")) : 0.0) * 1e-6;
+				// ZGPU_FILLRATE: fills at their own rate instead of the drawing rate
+				static const double fill_rate = getenv("ZGPU_FILLRATE") ? atof(getenv("ZGPU_FILLRATE")) : 0.0;
+				static const double px_rate0 = getenv("ZGPU_PXRATE") ? atof(getenv("ZGPU_PXRATE")) : 12e6;
+				const double fill_adj = fill_rate > 0 ? double(m_work_px_fill - fill0) * (1.0 / fill_rate - 1.0 / px_rate0) : 0.0;
+				// readbacks (D1, VRAM to RAM) at their own rate: ZGPU_READRATE pixels/s
+				static const double read_rate = getenv("ZGPU_READRATE") ? atof(getenv("ZGPU_READRATE")) : 0.5e6;
+				const double extra = double(m_work_px_blend - blend0) * blend_s + kick_s + fill_adj + double(m_work_readback - rb0) / read_rate;
+				m_busy_until = std::max(now, m_busy_until) + attotime::from_double(list_time(m_work_px - px0, m_work_prims - prims0, m_work_xfer - xfer0, m_work_verts - verts0) + extra);
 				if (m_regs[0x14 / 4] != status0)
 				{
 					if (m_done_count == DONE_MAX)
@@ -545,7 +564,7 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 				}
 				// ZGPU_WORKLOG: kicks, pixels, primitives and engine busy time per emulated second
 				static const bool worklog = getenv("ZGPU_WORKLOG") != nullptr;
-				static u64 wl_kicks, wl_px, wl_prims, wl_xfer; static double wl_busy, wl_sec = -1;
+				static u64 wl_kicks, wl_px, wl_prims, wl_xfer, wl_verts; static double wl_busy, wl_sec = -1;
 				if (worklog)
 				{
 					const double t = now.as_double();
@@ -553,12 +572,15 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 						wl_sec = std::floor(t);
 					if (t >= wl_sec + 1)
 					{
-						logerror("WORK %.0f s: %llu kicks, %llu px, %llu prims, %llu xfer, engine busy %.0f%%\n", wl_sec,
-								(unsigned long long)wl_kicks, (unsigned long long)wl_px, (unsigned long long)wl_prims, (unsigned long long)wl_xfer, wl_busy * 100);
-						wl_kicks = wl_px = wl_prims = wl_xfer = 0; wl_busy = 0; wl_sec = std::floor(t);
+						static u64 f0, b0, d0;
+						logerror("WORK %.0f s: %llu kicks, %llu px, %llu prims, %llu xfer, %llu verts, engine busy %.0f%%, px fill %llu blend %llu depth %llu\n", wl_sec,
+								(unsigned long long)wl_kicks, (unsigned long long)wl_px, (unsigned long long)wl_prims, (unsigned long long)wl_xfer, (unsigned long long)wl_verts, wl_busy * 100,
+								(unsigned long long)(m_work_px_fill - f0), (unsigned long long)(m_work_px_blend - b0), (unsigned long long)(m_work_px_depth - d0));
+						f0 = m_work_px_fill; b0 = m_work_px_blend; d0 = m_work_px_depth;
+						wl_kicks = wl_px = wl_prims = wl_xfer = wl_verts = 0; wl_busy = 0; wl_sec = std::floor(t);
 					}
-					wl_kicks++; wl_px += m_work_px - px0; wl_prims += m_work_prims - prims0; wl_xfer += m_work_xfer - xfer0;
-					wl_busy += list_time(m_work_px - px0, m_work_prims - prims0, m_work_xfer - xfer0);
+					wl_kicks++; wl_px += m_work_px - px0; wl_prims += m_work_prims - prims0; wl_xfer += m_work_xfer - xfer0; wl_verts += m_work_verts - verts0;
+					wl_busy += list_time(m_work_px - px0, m_work_prims - prims0, m_work_xfer - xfer0, m_work_verts - verts0);
 				}
 			}
 			// hand work to the render thread in batches: Cars kicks ~800 lists a frame, most of
@@ -1218,6 +1240,7 @@ void zevio_gpu_device::prim3d(u32 header, u32 &addr)
 	}
 	for (auto &v : verts)
 		transform(v);
+	m_work_verts += n;
 	static const bool zlog = getenv("ZGPU_ZLOG") != nullptr;
 	if (zlog && n)
 	{
@@ -1393,6 +1416,7 @@ void zevio_gpu_device::transform_to_memory(u32 header, u32 &addr)
 	const u8 fmt = (header >> 16) & 0x3f;
 	const int n = header & 0xffff;
 	const int wpv = vertex_words(fmt);
+	m_work_verts += n;
 	static double primlog_at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
 	const double now = machine().time().as_double();
 	if (primlog_at >= 0 && now >= primlog_at && now < primlog_at + primlog_len())
@@ -1877,8 +1901,16 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 		}
 		else if (c.type == CMD_SPRITE || c.type == CMD_FILL)
 			w = c.a1 & 0xffff;
-		m_work_px += u64(c.ymax - c.ymin + 1) * w;
+		const u64 px = u64(c.ymax - c.ymin + 1) * w;
+		m_work_px += px;
 		m_work_prims++;
+		// pixel classes for fitting the engine's rates (ZGPU_WORKLOG)
+		if (c.type == CMD_FILL)
+			m_work_px_fill += px;
+		else if (BIT(c.st.w88, 1) || BIT(c.st.w86, 8))
+			m_work_px_blend += px;
+		if (c.type != CMD_FILL && (depth_test(c.st) || BIT(c.st.w84, 1)))
+			m_work_px_depth += px;
 	}
 	{
 		// areas drawn since the last frame fence, as rows of the RAM surface
@@ -2229,7 +2261,7 @@ void zevio_gpu_device::run_list(u32 addr)
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					wr16(m_xfer + (j * w + i) * 2, vram_r(x + i, y + j));
-			m_work_xfer += u64(w) * h;
+			m_work_readback += u64(w) * h;
 			break;
 		}
 		case 0xd3: // fill
@@ -2238,6 +2270,8 @@ void zevio_gpu_device::run_list(u32 addr)
 			addr += 12;
 			m_stat_fills++;
 			const int h = std::min<int>(size >> 16, 8192);
+			if (xferlog_now(machine()))
+				logerror("XFER fill %d,%d %dx%d col %08x 88 %06x 8d %06x clip %06x-%06x\n", int(pos & 0xffff), int(pos >> 16), int(size & 0xffff), h, col, m_w88, m_w8d, m_clip0, m_clip1);
 			if (in_zarea(int(pos >> 16)) && auxlog_now(machine()))
 				logerror("AUX fill %d,%d %dx%d value %04x (aux rows above %d, RAM base %08x)\n", int(pos & 0xffff), int(pos >> 16), int(size & 0xffff), h, col & 0xffff, m_vram_y0, m_vram_base);
 			rcmd c{};
