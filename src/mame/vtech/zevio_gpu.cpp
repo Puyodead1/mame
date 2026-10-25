@@ -98,6 +98,7 @@ zevio_gpu_device::zevio_gpu_device(const machine_config &mconfig, const char *ta
 void zevio_gpu_device::device_start()
 {
 	m_zbuf = std::make_unique<float[]>(ZW * ZH);
+	m_abuf = std::make_unique<u8[]>(1024 * 4096);
 	m_aux = std::make_unique<u16[]>(1024 * AUX_H);
 	// more bands than threads so uneven rows balance out; a HIGH_FREQ queue
 	// would be capped at four threads
@@ -309,6 +310,7 @@ int zevio_gpu_device::abs_row(int y) const
 // ZGPU_ZOLD restores the plain float compare (equal passes) and alpha-blind depth writes.
 static const bool s_zold = getenv("ZGPU_ZOLD") != nullptr;
 static const bool s_zalpha = !s_zold;
+static const bool s_dsta = getenv("ZGPU_DSTA") != nullptr;
 static inline bool z_fails3d(float z, float zb) { return s_zold ? z > zb : z > zb * (1.0f + 1.0f / 512.0f); }
 static inline bool z_fails_sprite(float z, float zb) { return s_zold ? z > zb : z >= zb; }
 static inline bool depth_fails(float z, float zb) { return z_fails3d(z, zb); }
@@ -936,10 +938,19 @@ void zevio_gpu_device::transform(vertex_t &v) const
 	v.b *= std::min(lb, 1.0f);
 }
 
+// Near plane in eye space. [EMU] fixed: FA writes 0x74 = camera +176 (near?)
+// and 0x75 = camera +180 (far, also picks its depth-clear value) [FW]; which is
+// used how is unknown. ZGPU_NEAR74 (experiment, after flashem): use 0x74.
+float zevio_gpu_device::near_plane() const
+{
+	static const bool near74 = getenv("ZGPU_NEAR74") != nullptr;
+	return near74 ? std::max(reg_f(0x74), 1.0f / 4096.0f) : 1.0f / 4096.0f;
+}
+
 // perspective projection to screen; returns false if behind the near plane
 bool zevio_gpu_device::project(vertex_t &v) const
 {
-	const float near_z = 1.0f / 4096.0f; // [EMU] fixed. FA writes 0x74 = camera +176 (near?) and 0x75 = camera +180 (far, also picks its depth-clear value) [FW]; which is used how is unknown
+	const float near_z = near_plane();
 	if (v.z < near_z)
 		return false;
 	const float fx = reg_f(0x78), fy = reg_f(0x79);
@@ -1098,7 +1109,7 @@ void zevio_gpu_device::draw_3d_tri(vertex_t a, vertex_t b, vertex_t c)
 		}
 	}
 	// clip against the near plane in eye space, then project
-	const float near_z = 1.0f / 4096.0f;
+	const float near_z = near_plane();
 	vertex_t in[3] = { a, b, c };
 	vertex_t out[4];
 	int n = 0;
@@ -1653,6 +1664,8 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 				}
 				else
 					vram_w(x, y, t);
+				if (s_dsta)
+					abuf(x, y) = 0;
 			}
 		}
 		return;
@@ -1674,6 +1687,9 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 		} tb;
 		const bool blend = BIT(s.w88, 1), argb4444 = BIT(s.w86, 8);
 		const int fr = (s.w8d & 0xff) + 1, fg = ((s.w8d >> 8) & 0xff) + 1, fb = ((s.w8d >> 16) & 0xff) + 1;
+		// ZGPU_DSTA (experiment, after flashem): under 0x88 = 0x42 a sprite with a 16-colour-bit
+		// texture takes its alpha from what an ARGB4444 sprite left there (Bratz's corner "glint")
+		const bool from_dst = s_dsta && textured && !argb4444 && (s.w88 & 0x43) == 0x42;
 		for (int y = cy0; y <= cy1; y++)
 		{
 			const vrow drow = vram_row(y);
@@ -1700,6 +1716,13 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 					else
 					{
 						r = tb.c5to8[t & 0x1f]; g = tb.c5to8[(t >> 5) & 0x1f]; b = tb.c5to8[(t >> 10) & 0x1f];
+						if (from_dst)
+						{
+							a = abuf(x, y);
+							if (!a)
+								continue;
+							a += a >> 7; // 0-255 -> 0-256
+						}
 					}
 					r = (r * mr) >> 8; g = (g * mg) >> 8; b = (b * mb) >> 8;
 				}
@@ -1727,6 +1750,8 @@ void zevio_gpu_device::draw_sprite(const rstate &s, rcache &pc, const rcmd &c, i
 				}
 				else
 					vram_w(x, y, out);
+				if (s_dsta)
+					abuf(x, y) = argb4444 ? std::min(a, 255) : 0;
 			}
 		}
 		return;
@@ -1760,6 +1785,8 @@ void zevio_gpu_device::draw_fill(const rcmd &c, int band_y0, int band_y1)
 			const int xx = (x + i) & 1023;
 			const int run = std::min(w - i, 32 - (xx & 31));
 			const u32 off = vram_addr(xx, y + j) - m_ram_base;
+			if (s_dsta)
+				std::fill_n(&abuf(xx, y + j), run, 0);
 			if (vram_in_aux(y + j))
 			{
 				std::fill_n(&aux_px(xx, y + j), run, col);
@@ -1790,7 +1817,10 @@ void zevio_gpu_device::draw_fill(const rcmd &c, int band_y0, int band_y1)
 
 zevio_gpu_device::rstate zevio_gpu_device::cur_state() const
 {
-	return rstate{ m_w84, m_w86, m_w87, m_w88, m_w8d, m_clip0, m_clip1, m_clut[0], m_clut[3], m_w81, m_w85 };
+	// 0x86 bits 16-15 are the texture's slot; FA (10A5B42C) loads the slot's
+	// CLUT position with 0x8F + slot (8 bpp) / 0x92 + slot (4 bpp)
+	const int slot = std::min<int>((m_w86 >> 15) & 3, 2);
+	return rstate{ m_w84, m_w86, m_w87, m_w88, m_w8d, m_clip0, m_clip1, m_clut[slot], m_clut[3 + slot], m_w81, m_w85 };
 }
 
 void zevio_gpu_device::add_cmd(rcmd &&c)
@@ -2207,14 +2237,19 @@ void zevio_gpu_device::run_list(u32 addr)
 			add_cmd(std::move(c));
 			break;
 		}
-		case 0xd2: // VRAM to VRAM copy: destination, size, source
+		case 0xd2: // VRAM to VRAM copy: source, size, destination
 		{
-			const u32 dst = rd32(addr), size = rd32(addr + 4), src = rd32(addr + 8);
+			// FA's GpuImg_copyRect (Bratz 10AB99EC) emits D2000003, sy<<16|sx, h<<16|w,
+			// dy<<16|dx (D6000003 instead under a flag: not handled); no known game calls it
+			const u32 src = rd32(addr), size = rd32(addr + 4), dst = rd32(addr + 8);
 			addr += 12;
 			const int dx = dst & 0xffff, dy = dst >> 16, sx = src & 0xffff, sy = src >> 16;
 			const int w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 4096);
 			if (in_zarea(dy) && auxlog_now(machine()))
 				logerror("AUX copy to %d,%d %dx%d from %d,%d\n", dx, dy, w, h, sx, sy);
+			static const bool d2log = getenv("ZGPU_D2LOG") != nullptr;
+			if (d2log)
+				logerror("D2 t=%.3f words %08x %08x %08x (list at %08x)\n", machine().time().as_double(), dst, size, src, addr - 16);
 			sync();
 			std::vector<u16> tmp(w * h);
 			for (int j = 0; j < h; j++)

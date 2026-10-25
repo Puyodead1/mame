@@ -101,6 +101,7 @@ private:
 	int vertex_words(u8 fmt) const;
 	vertex_t fetch_vertex(u32 addr, u8 fmt) const;
 	void transform(vertex_t &v) const;
+	float near_plane() const;
 	bool project(vertex_t &v) const;
 	void prim3d(u32 header, u32 &addr);
 	void transform_to_memory(u32 header, u32 &addr);
@@ -253,6 +254,8 @@ private:
 	u32 m_vtxbase, m_xfer;
 
 	std::unique_ptr<float[]> m_zbuf; // ZW x ZH, depth-area coordinates (the aux rows), eye distance
+	std::unique_ptr<u8[]> m_abuf;    // ZGPU_DSTA experiment: 1024 x 4096 destination alpha of the last sprite pixel
+	u8 &abuf(int x, int y) const { return m_abuf[(y & 4095) * 1024 + (x & 1023)]; }
 	bool m_no3d = false;
 
 	// FA display list queue HLE (see fa_queue_hle)
