@@ -307,6 +307,13 @@ void zevio_dsp_hle_device::command(u32 cmd)
 		break;
 	case 0x81:
 	{
+		if (getenv("ZDSP_DEBUG"))
+		{
+			std::string s;
+			for (int i = 0; i < 16; i++)
+				s += util::string_format(" %08x", rd32(c + i * 4));
+			logerror("MJP 0x81 block at %08x:%s\n", c, s);
+		}
 		m_ring_start = rd32(c + 8);
 		m_ring_end = rd32(c + 12);
 		m_out[0] = rd32(c + 24);

@@ -51,6 +51,7 @@
 #include "machine/nvram.h"
 
 #include "cdrom.h"
+#include "multibyte.h"
 #include "osdfile.h"
 #include "screen.h"
 #include "softlist.h"
@@ -72,6 +73,7 @@
 #define VERBOSE (LOG_UNKNOWN)
 #include "logmacro.h"
 
+#include <bit>
 #include <deque>
 
 
@@ -203,6 +205,9 @@ private:
 	static constexpr u32 EDGE_SOURCES = (1U << 17) | (1U << 18);
 	u32 m_int_enable[2];
 	u32 m_int_regs[0x400 / 4];
+	u8 m_int_limit[2];  // +0x02C: only sources with a smaller +0x300 priority pass
+	u8 m_int_prev[2];   // +0x028: the limit before the last +0x024 acknowledge
+	int int_current(int group) const;
 	void set_irq(int source, int state);
 	void update_cpu_irqs();
 	u32 intc_r(offs_t offset);
@@ -332,14 +337,18 @@ private:
 	u8 m_cd_cal;         // last $3AA8xx calibration value
 	u32 m_cd_rx;        // servo read result
 	u32 m_cd_ptr;       // decoder write pointer
+	u32 m_cd_ptr2;      // second write pointer (dual buffer mode)
 	s32 m_cd_len;
 	bool m_cd_running;
+	bool m_cd_found;    // a sector was taken since the run bit went up
 	emu_timer *m_cd_timer;
 	bool cd_sens(u8 select);
 	void cd_jump_tracks(s32 tracks);
 	void cd_servo_write(int nbits, u64 value, bool sens);
 	void cd_latch_subq();
-	void cd_queue_push(u32 data_addr, s32 frame);
+	bool cd_read_raw(s32 lba, u8 *raw, bool parity);
+	bool cd_queue_push(u32 data_addr, const u8 *raw);
+	void cd_ram_write(u32 addr, const u8 *src, u32 size, bool ring);
 	TIMER_CALLBACK_MEMBER(cd_sector_cb);
 	void line_timer_arm(int line);
 	void prof_dump()
@@ -402,11 +411,33 @@ void vsmilpro_state::set_irq(int source, int state)
 	update_cpu_irqs();
 }
 
+// The pending, enabled source with the most urgent (smallest) priority below
+// the group's limit; ties go to the lower source number. -1 if none.
+// FA's handler (10A0BC20) reads +0x024, keeps +0x028, re-enables CPU IRQs
+// while its handlers run and writes the kept value back to +0x02C at exit:
+// the acknowledge raises the limit to the source's priority, so only more
+// urgent sources nest, and the exit restores it.
+int vsmilpro_state::int_current(int group) const
+{
+	int cur = -1, limit = m_int_limit[group];
+	for (u32 p = m_int_pending & m_int_enable[group]; p; p &= p - 1)
+	{
+		const int i = std::countr_zero(p);
+		if (int(m_int_regs[0x300 / 4 + i] & 7) < limit)
+		{
+			cur = i;
+			limit = m_int_regs[0x300 / 4 + i] & 7;
+		}
+	}
+	return cur;
+}
+
 void vsmilpro_state::update_cpu_irqs()
 {
 	// only touch the lines when they change: each set_input_line synchronizes
-	const int irq = (m_int_pending & m_int_enable[0]) ? ASSERT_LINE : CLEAR_LINE;
-	const int fiq = (m_int_pending & m_int_enable[1]) ? ASSERT_LINE : CLEAR_LINE;
+	static const bool noprio = getenv("ZINT_NOPRIO") != nullptr;
+	const int irq = (noprio ? (m_int_pending & m_int_enable[0]) != 0 : int_current(0) >= 0) ? ASSERT_LINE : CLEAR_LINE;
+	const int fiq = (noprio ? (m_int_pending & m_int_enable[1]) != 0 : int_current(1) >= 0) ? ASSERT_LINE : CLEAR_LINE;
 	if (irq != m_irq_line)
 		m_maincpu->set_input_line(arm7_cpu_device::ARM7_IRQ_LINE, m_irq_line = irq);
 	if (fiq != m_fiq_line)
@@ -422,21 +453,27 @@ u32 vsmilpro_state::intc_r(offs_t offset)
 	case 0x108 / 4: return m_int_enable[1];
 	case 0x024 / 4: case 0x124 / 4:
 	{
-		// TODO: probably returns the highest-priority pending source
-		const u32 p = m_int_pending & m_int_enable[BIT(offset, 6)];
-		for (int i = 0; i < 32; i++)
-			if (BIT(p, i))
+		// acknowledge: the most urgent source, and the limit rises to its priority
+		const int g = BIT(offset, 6);
+		const int i = int_current(g);
+		if (i < 0)
+			return 0;
+		if (!machine().side_effects_disabled())
+		{
+			if (m_prof_on)
 			{
-				if (m_prof_on && !machine().side_effects_disabled())
-				{
-					if (!m_prof_start)
-						m_prof_start = machine().time().as_double();
-					m_prof_irq[i]++;
-				}
-				return i;
+				if (!m_prof_start)
+					m_prof_start = machine().time().as_double();
+				m_prof_irq[i]++;
 			}
-		return 0;
+			m_int_prev[g] = m_int_limit[g];
+			m_int_limit[g] = m_int_regs[0x300 / 4 + i] & 7;
+			update_cpu_irqs();
+		}
+		return i;
 	}
+	case 0x028 / 4: case 0x128 / 4: return m_int_prev[BIT(offset, 6)];
+	case 0x02c / 4: case 0x12c / 4: return m_int_limit[BIT(offset, 6)];
 
 	default:
 		return m_int_regs[offset];
@@ -457,6 +494,7 @@ void vsmilpro_state::intc_w(offs_t offset, u32 data, u32 mem_mask)
 	case 0x00c / 4: m_int_enable[0] &= ~data; break;
 	case 0x108 / 4: m_int_enable[1] |= data; break;
 	case 0x10c / 4: m_int_enable[1] &= ~data; break;
+	case 0x02c / 4: case 0x12c / 4: m_int_limit[BIT(offset, 6)] = m_int_regs[offset] & 15; break;
 	default:
 		LOGMASKED(LOG_INTC, "%08x: intc %03x = %08x\n", m_maincpu->pc(), offset * 4, data);
 		break;
@@ -1304,6 +1342,11 @@ void vsmilpro_state::disp_w(offs_t offset, u32 data, u32 mem_mask)
 	}
 	COMBINE_DATA(&m_disp_regs[offset]);
 	LOGMASKED(LOG_VIDEO, "%08x: disp %04x = %08x\n", m_maincpu->pc(), offset * 4, data);
+	// ZDISP_LOG=t0,t1: every display register write in that emulated time window
+	static const char *const dlog = getenv("ZDISP_LOG");
+	static const double dlog0 = dlog ? atof(dlog) : 0, dlog1 = (dlog && strchr(dlog, ',')) ? atof(strchr(dlog, ',') + 1) : 1e9;
+	if (dlog && machine().time().as_double() >= dlog0 && machine().time().as_double() < dlog1)
+		logerror("DISPW %.4f %08x: %04x = %08x line %d\n", machine().time().as_double(), m_maincpu->pc(), offset * 4, data, m_screen->vpos());
 	static const bool l5_log = getenv("ZL5_LOG") != nullptr;
 	if (l5_log && offset >= 0x164 / 4 && offset <= 0x16c / 4)
 		logerror("L5 %03x = %08x at %.4f s line %d\n", offset * 4, data, machine().time().as_double(), m_screen->vpos());
@@ -1611,6 +1654,9 @@ void vsmilpro_state::bcdma_w(offs_t offset, u32 data, u32 mem_mask)
 			const int bytes_per = unit_sizes[(cfg >> 16) & 3];
 			const u32 count = cfg & 0x3ff;
 			LOGMASKED(LOG_DMA, "bcdma ch%d %08x -> %08x count %d x %d (cfg %08x)\n", ch, src, dst, count, bytes_per, cfg);
+			static const bool reclog = getenv("ZCD_RECLOG") != nullptr;
+			if (reclog)
+				logerror("BCDMA %.4f ch%d %08x -> %08x %d bytes\n", machine().time().as_double(), ch, src, dst, count * bytes_per);
 			for (u32 i = 0; i < count * bytes_per; i++)
 				ram_w8(dst + i, ram_r8(src + i));
 			// the data moves at once; completion is signalled after a short
@@ -1683,6 +1729,20 @@ void vsmilpro_state::dcdma_w(offs_t offset, u32 data, u32 mem_mask)
 				desc = next;
 			}
 			m_dcdma_regs[0x18 / 4] &= ~(1 << ch);
+			// ZDSP_MEMDUMP: DSP data and program memory after every transfer (dsp_d.bin, dsp_p.bin;
+			// 64K little-endian words each), to run the loaded program in an offline ZSP400 interpreter
+			if (getenv("ZDSP_MEMDUMP"))
+				for (int seg = 0; seg < 2; seg++)
+					if (FILE *f = fopen(seg ? "dsp_p.bin" : "dsp_d.bin", "wb"))
+					{
+						for (u32 i = 0; i < 0x10000; i++)
+						{
+							const u16 v = m_dsp_mem[seg * 0x10000 + i];
+							const u8 b[2] = { u8(v), u8(v >> 8) };
+							fwrite(b, 1, 2, f);
+						}
+						fclose(f);
+					}
 		}
 	}
 }
@@ -1907,23 +1967,88 @@ void vsmilpro_state::cd_latch_subq()
 	m_cd_regs[0x5c / 4] = (q[6] << 24) | (q[7] << 16) | (q[8] << 8) | q[9];
 }
 
-void vsmilpro_state::cd_queue_push(u32 data_addr, s32 frame)
+// The whole 2352-byte sector as it comes off the disc. Images that only keep
+// the 2048 user bytes get the sync, header, EDC and P/Q parity rebuilt, since
+// FA's software ECC checks every sector against them.
+bool vsmilpro_state::cd_read_raw(s32 lba, u8 *raw, bool parity)
+{
+	std::fill_n(raw, 2352, 0);
+	if (lba < 0)
+		return false;
+	const u32 track = m_cdrom->get_track(lba);
+	if (m_cdrom->get_toc().tracks[track].datasize >= 2352)
+	{
+		if (!m_cdrom->read_data(lba, raw, cdrom_file::CD_TRACK_RAW_DONTCARE))
+			return false;
+		// CHDs keep CD-DA big-endian; the disc (and the decoder) has it little-endian
+		if (m_cdrom->get_track_type(track) == cdrom_file::CD_TRACK_AUDIO)
+			for (int i = 0; i < 2352; i += 2)
+				std::swap(raw[i], raw[i + 1]);
+		return true;
+	}
+	if (!m_cdrom->read_data(lba, raw + 16, cdrom_file::CD_TRACK_MODE1))
+		return false;
+	static const u8 sync[12] = { 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
+	std::copy(std::begin(sync), std::end(sync), raw);
+	const u32 msf = frames_to_bcd_msf(lba + 150);
+	raw[12] = msf >> 16;
+	raw[13] = msf >> 8;
+	raw[14] = msf;
+	raw[15] = 1;
+	if (!parity)
+		return true;
+	u32 edc = 0; // CRC-32, polynomial 0x8001801B, LSB first
+	for (int i = 0; i < 0x810; i++)
+	{
+		edc ^= raw[i];
+		for (int b = 0; b < 8; b++)
+			edc = (edc >> 1) ^ ((edc & 1) ? 0xd8018001 : 0);
+	}
+	put_u32le(&raw[0x810], edc);
+	cdrom_file::ecc_generate(raw);
+	return true;
+}
+
+// Writes decoder data to RAM; in ring mode (+0x40 bit 6) the bytes past the
+// ring end continue at its start, so a sector can straddle the wrap
+void vsmilpro_state::cd_ram_write(u32 addr, const u8 *src, u32 size, bool ring)
+{
+	const u32 start = m_cd_regs[0x28 / 4], end = m_cd_regs[0x2c / 4] + 4;
+	for (u32 i = 0; i < size; i++)
+	{
+		if (ring && addr >= end && end > start)
+			addr = start + (addr - end);
+		ram_w8(addr++, src[i]);
+	}
+}
+
+// Fills the next of the 4 slot records (1 KB each at +0x3C). Besides the data
+// address and the header, FA's software ECC (Cd_eccCorrectPQ) takes raw bytes
+// 0x810-0x92F (EDC, zeros, P and Q parity) from +0x18 and one erasure (C2) bit
+// per raw byte from +0x138. Returns false, and sets +0x70 bit 5, when all four
+// slots are full: the sector is not taken and Cd_msgTransferEnd retries.
+bool vsmilpro_state::cd_queue_push(u32 data_addr, const u8 *raw)
 {
 	u32 st = m_cd_regs[0x70 / 4];
 	const int head = st & 3, count = (st >> 2) & 7;
 	if (count >= 4)
-		return;
+	{
+		m_cd_regs[0x70 / 4] |= 0x20;
+		return false;
+	}
 	const int slot = (head + count) & 3;
 	const u32 rec = m_cd_regs[0x3c / 4] + slot * 1024;
-	const u32 msf = frames_to_bcd_msf(frame);
 	ram_w32(rec + 0, 1);
 	ram_w32(rec + 4, data_addr);
-	ram_w8(rec + 20, msf >> 16);
-	ram_w8(rec + 21, msf >> 8);
-	ram_w8(rec + 22, msf);
-	ram_w8(rec + 23, 1); // mode 1
+	for (int i = 0; i < 4; i++)
+		ram_w8(rec + 0x14 + i, raw[12 + i]);
+	for (int i = 0; i < 0x120; i++)
+		ram_w8(rec + 0x18 + i, raw[0x810 + i]);
+	for (int i = 0; i < 2352 / 8; i++)
+		ram_w8(rec + 0x138 + i, 0);
 	m_cd_regs[0x70 / 4] = (st & ~0x1c) | ((count + 1) << 2);
 	m_cd_regs[0x64 / 4] |= 0x1000;
+	return true;
 }
 
 TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
@@ -1940,7 +2065,7 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 	// +0x60 bits 31-24 arm a timeout (IRQ 0x8000) for a running decoder that
 	// sees no data (counted in EFM frames, 98 per sector); FA uses it to end
 	// a muted pause, which makes it take the last buffered sector and restart
-	const bool deliver = (ctrl & 4) && m_cd_running && !m_cd_mute && (capture || m_cd_head == m_cd_expect);
+	bool deliver = (ctrl & 4) && m_cd_running && !m_cd_mute && (capture || m_cd_head == m_cd_expect);
 	if ((ctrl & 4) && m_cd_running && (m_cd_regs[0x60 / 4] >> 24))
 	{
 		if (!m_cd_mute)
@@ -1952,43 +2077,73 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 				m_cd_regs[0x64 / 4] |= 0x8000;
 		}
 	}
+	const s32 lba = m_cd_head - 150;
+	if (lba >= 0 && m_cdrom->get_track_type(m_cdrom->get_track(lba)) != cdrom_file::CD_TRACK_AUDIO)
+		m_cd_regs[0x4c / 4] = 0x80000000 | frames_to_bcd_msf(m_cd_head); // last header seen
+	// With +0x40 bit 8 every sector taken probably also fills a slot record: FA
+	// sets it for its formats 3 (2048 bytes, software ECC on every record) and
+	// 4 (the records are flushed), not for 5 (2048, no records) or the raw
+	// formats. With all four slots unread the sector is dropped.
+	// Opt-in (ZCD_REC=1) until it works: with it, Incredibles' loading stalls
+	// (2026-10-25). Its ring read of LBA 29-48 copies the requested sector
+	// out, but the driver never reports the request complete, so the next one
+	// never comes. Without records FA treats written data as verified
+	// (Cd_syncWritePtr) and records only exist for header capture.
+	static const bool norec = !getenv("ZCD_REC") || getenv("ZCD_NOREC");
+	static const bool reclog = getenv("ZCD_RECLOG") != nullptr;
+	const bool record = deliver && (capture || ((ctrl & 0x100) && !norec));
+	u8 raw[2352];
+	if (deliver)
+		cd_read_raw(lba, raw, record); // EDC and parity only matter to the records
+	if (record && !cd_queue_push(m_cd_ptr, raw))
+	{
+		if (reclog)
+			logerror("CDREC overrun at lba %d\n", lba);
+		deliver = false;
+	}
+	else if (deliver && reclog && (ctrl & 0x100))
+		logerror("CDREC lba %d ctrl %03x ecc %s mode %d slots %02x\n", lba, ctrl & 0x1ff, cdrom_file::ecc_verify(raw) ? "ok" : "BAD", raw[15], m_cd_regs[0x70 / 4] & 0x3f);
 	if (deliver)
 	{
 		// deliver the sector under the head
 		if (!capture)
 			m_cd_expect++;
-		const s32 lba = m_cd_head - 150;
+		if (!m_cd_found)
+		{
+			m_cd_found = true;
+			m_cd_regs[0x64 / 4] |= 0x04; // target found
+		}
 		u32 size;
 		if (capture)
 		{
 			size = 4;
-			const u32 msf = frames_to_bcd_msf(m_cd_head);
-			ram_w8(m_cd_ptr + 0, msf >> 16);
-			ram_w8(m_cd_ptr + 1, msf >> 8);
-			ram_w8(m_cd_ptr + 2, msf);
-			ram_w8(m_cd_ptr + 3, 1);
-			cd_queue_push(m_cd_ptr, m_cd_head);
+			cd_ram_write(m_cd_ptr, raw + 12, 4, false);
+		}
+		else if ((ctrl & 0x20) && mode == 0)
+		{
+			// dual buffer (CD-DA): left samples to +0x24 (ring +0x28-0x2C),
+			// right samples to +0x30 (ring +0x34-0x38); the ROM's audio CD
+			// player plays the two rings on two sound voices
+			size = 1176;
+			const bool ring = ctrl & 0x40;
+			for (int i = 0; i < 2352; i += 4)
+			{
+				cd_ram_write(m_cd_ptr + i / 2, raw + i, 2, ring);
+				u32 a = m_cd_ptr2 + i / 2;
+				const u32 start = m_cd_regs[0x34 / 4], end = m_cd_regs[0x38 / 4] + 4;
+				if (ring && a >= end && end > start)
+					a = start + (a - end);
+				ram_w8(a, raw[i + 2]);
+				ram_w8(a + 1, raw[i + 3]);
+			}
+			m_cd_ptr2 += size;
+			if (ring && m_cd_ptr2 > m_cd_regs[0x38 / 4])
+				m_cd_ptr2 = m_cd_regs[0x34 / 4] + (m_cd_ptr2 - m_cd_regs[0x38 / 4] - 4);
 		}
 		else
 		{
-			u8 raw[2352];
-			std::fill(std::begin(raw), std::end(raw), 0);
-			if (mode == 0x18)
-			{
-				size = 2048;
-				if (lba >= 0)
-					m_cdrom->read_data(lba, raw, cdrom_file::CD_TRACK_MODE1);
-			}
-			else
-			{
-				size = (mode == 0x10) ? 2336 : 2352;
-				if (lba >= 0)
-					m_cdrom->read_data(lba, raw, cdrom_file::CD_TRACK_RAW_DONTCARE);
-				if (size == 2336)
-					memmove(raw, raw + 16, 2336);
-			}
-			for (u32 i = 0; i < size; i++)
-				ram_w8(m_cd_ptr + i, raw[i]);
+			size = (mode == 0x18) ? 2048 : (mode == 0x10) ? 2336 : 2352;
+			cd_ram_write(m_cd_ptr, raw + 2352 - size - ((size == 2048) ? 288 : 0), size, ctrl & 0x40);
 		}
 		LOGMASKED(LOG_CD, "cd sector lba %d -> %08x (%d bytes)\n", lba, m_cd_ptr, size);
 		// ZCD_RATE: time and write pointer every 75 sectors (stream rate checks)
@@ -2015,7 +2170,10 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 			m_cd_len -= size;
 			if (m_cd_len <= 0)
 			{
+				// the decoder stops by itself: the run bit drops too, so
+				// setting it again starts a new transfer
 				m_cd_running = false;
+				m_cd_regs[0x40 / 4] &= ~4;
 				m_cd_regs[0x64 / 4] |= 0x10;
 			}
 		}
@@ -2024,6 +2182,7 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 			if (m_cd_regs[0x84 / 4] & 1)
 			{
 				m_cd_running = false;
+				m_cd_regs[0x40 / 4] &= ~4;
 				m_cd_regs[0x64 / 4] |= 0x10;
 			}
 			else
@@ -2045,6 +2204,7 @@ u32 vsmilpro_state::cd_r(offs_t offset)
 	{
 	case 0x10 / 4: return m_cd_rx; // servo RX data
 	case 0x24 / 4: return m_cd_ptr;
+	case 0x30 / 4: return m_cd_ptr2;
 	default:
 		return m_cd_regs[offset];
 	}
@@ -2052,10 +2212,16 @@ u32 vsmilpro_state::cd_r(offs_t offset)
 
 void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 {
+	static const bool reclog = getenv("ZCD_RECLOG") != nullptr;
+	if (reclog && offset != 0x00 / 4 && offset != 0x08 / 4 && offset != 0x0c / 4 && offset != 0x14 / 4)
+		logerror("CDW %.4f %08x: +%02x = %08x (64 %05x 68 %05x 70 %02x)\n", machine().time().as_double(), m_maincpu->pc(), offset * 4, data,
+				m_cd_regs[0x64 / 4], m_cd_regs[0x68 / 4], m_cd_regs[0x70 / 4]);
 	switch (offset)
 	{
 	case 0x64 / 4:
 		m_cd_regs[offset] &= ~data;
+		if (m_cd_regs[0x70 / 4] & 0x1c)
+			m_cd_regs[offset] |= 0x1000; // level while records remain
 		cd_update_irq();
 		return;
 	case 0x14 / 4:
@@ -2085,6 +2251,10 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 		COMBINE_DATA(&m_cd_regs[offset]);
 		m_cd_ptr = m_cd_regs[offset];
 		return;
+	case 0x30 / 4:
+		COMBINE_DATA(&m_cd_regs[offset]);
+		m_cd_ptr2 = m_cd_regs[offset];
+		return;
 	case 0x40 / 4:
 	{
 		const u32 old = m_cd_regs[offset];
@@ -2102,8 +2272,10 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 					m_cd_head = m_cd_expect;
 			}
 			m_cd_ptr = m_cd_regs[0x24 / 4];
+			m_cd_ptr2 = m_cd_regs[0x30 / 4];
 			m_cd_len = m_cd_regs[0x20 / 4] & 0xffffff;
 			m_cd_running = true;
+			m_cd_found = false;
 			LOGMASKED(LOG_CD, "cd run from frame %d to %08x len %06x\n", m_cd_head, m_cd_ptr, m_cd_len);
 		}
 		else if (!(m_cd_regs[offset] & 4) && m_cd_running)
@@ -2133,6 +2305,7 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 			if (m_cd_regs[offset] & 1)
 			{
 				m_cd_running = false;
+				m_cd_regs[0x40 / 4] &= ~4;
 				m_cd_regs[0x64 / 4] |= 0x10;
 			}
 			else
@@ -2150,9 +2323,18 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 			count--;
 		}
 		if (data & 2)
+		{
 			count = 0;
+			st &= ~0x20; // overrun flag goes with the flush
+		}
 		m_cd_regs[0x70 / 4] = (st & ~0x1f) | (count << 2) | head;
-		m_cd_regs[0x64 / 4] &= ~0x1000;
+		// "record queued" is a level: it stays up while unread records remain.
+		// FA masks it while its software ECC runs and relies on it to pick up
+		// records that arrived meanwhile (Incredibles stalled loading without)
+		if (count)
+			m_cd_regs[0x64 / 4] |= 0x1000;
+		else
+			m_cd_regs[0x64 / 4] &= ~0x1000;
 		cd_update_irq();
 		return;
 	}
@@ -2282,7 +2464,6 @@ void vsmilpro_state::machine_start()
 
 	// Speedup: the boot ROM's idle task (0x1001098C) is an endless counting
 	// loop whose counter lives at 0x101E05E4; sleep until the next interrupt
-	// TODO: equivalent for FA's idle task
 	// direct SDRAM access for the CPU core, except the boot ROM idle counter
 	// (watched by the tap below); off with the debugger so watchpoints work
 	if (!(machine().debug_flags & DEBUG_FLAG_ENABLED))
@@ -2339,6 +2520,8 @@ void vsmilpro_state::machine_start()
 	save_item(NAME(m_int_latched));
 	save_item(NAME(m_int_enable));
 	save_item(NAME(m_int_regs));
+	save_item(NAME(m_int_limit));
+	save_item(NAME(m_int_prev));
 	save_item(NAME(m_sysctl));
 	save_item(NAME(m_resume));
 	m_resume = false;
@@ -2364,8 +2547,10 @@ void vsmilpro_state::machine_start()
 	save_item(NAME(m_cd_dir));
 	save_item(NAME(m_cd_jump_n));
 	save_item(NAME(m_cd_ptr));
+	save_item(NAME(m_cd_ptr2));
 	save_item(NAME(m_cd_len));
 	save_item(NAME(m_cd_running));
+	save_item(NAME(m_cd_found));
 	save_pointer(NAME(m_dsp_mem), 0x80000);
 }
 
@@ -2380,6 +2565,8 @@ void vsmilpro_state::soc_reset()
 	m_int_raw = m_int_pending = m_int_latched = 0;
 	m_int_enable[0] = m_int_enable[1] = 0;
 	std::fill(std::begin(m_int_regs), std::end(m_int_regs), 0);
+	m_int_limit[0] = m_int_limit[1] = 8; // reset value unknown; Intc_init writes 8
+	m_int_prev[0] = m_int_prev[1] = 8;
 	std::fill(std::begin(m_sysctl), std::end(m_sysctl), 0);
 	std::fill(std::begin(m_pll), std::end(m_pll), 0);
 	for (int b = 0; b < 2; b++)
@@ -2417,9 +2604,10 @@ void vsmilpro_state::soc_reset()
 	// CD decoder (the servo and pickup are external)
 	m_cd_expect = 0;
 	m_cd_tmo = 0;
-	m_cd_ptr = 0;
+	m_cd_ptr = m_cd_ptr2 = 0;
 	m_cd_len = 0;
 	m_cd_running = false;
+	m_cd_found = false;
 	update_cpu_irqs();
 }
 
@@ -2541,6 +2729,12 @@ void vsmilpro_state::vsmilpro(machine_config &config)
 	m_maincpu->add_idle_loop(0x100109a4, 0x10010994, {
 			0xe3a03000, 0xe5cd3007, 0xe3a03000, 0xe58d3000, 0xe59d3000, 0xe35300fe, 0x9a000000, 0xeafffff7,
 			0xe5dd3007, 0xe2833001, 0xe5cd3007, 0xe59d3000, 0xe2833001, 0xe58d3000, 0xeafffff4 });
+	// FA's idle task (Task_idle, 0x109C8BBC in Bratz; the same five words in
+	// every game kernel seen) counts to 0xFE forever; it is entered at the
+	// MOV and at the ADD (the BLS target)
+	static const std::vector<u32> fa_idle = { 0xe3a03000, 0xe2833001, 0xe35300fe, 0x9afffffc, 0xeafffffa };
+	m_maincpu->add_idle_pattern(0, fa_idle);
+	m_maincpu->add_idle_pattern(4, fa_idle);
 	// Wacky Races (Jumpin' Bean Island): the main loop's frame pacing spins until the timer at
 	// 0x900C000C has moved 0x30 counts on from the last frame; each pass only reads the time
 	m_maincpu->add_idle_loop(0x10b520c4, 0x10b520c4, {
