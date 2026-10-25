@@ -21,6 +21,7 @@ public:
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void device_post_load() override;
 	virtual void sound_stream_update(sound_stream &stream) override;
 
 private:
@@ -48,8 +49,11 @@ private:
 	void ima_start_packet(voice_t &vc, u32 addr);
 	void ima_decode_nibble(voice_t &vc);
 	void update_irq();
+	void arm_timer();
+	TIMER_CALLBACK_MEMBER(timer_tick);
 
 	devcb_write_line m_irq_cb;
+	emu_timer *m_timer;
 	sound_stream *m_stream;
 	const u32 *m_ram;
 	u32 m_ram_base;

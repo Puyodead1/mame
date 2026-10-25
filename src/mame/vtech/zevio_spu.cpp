@@ -19,7 +19,8 @@
     = signed 16-bit PCM.
 
     Global (0xB0001000+):
-    +0x004 IRQ: bits 0-5 status (write 1 to clear), bits 8-13 enables
+    +0x004 IRQ: bits 0-5 status (write 1 to clear), bits 8-13 enables,
+           bits 31-16 source 1 timer period
     +0x008/+0x00C pause masks (voices 0-31 / 32-63)
     +0x010/+0x014 key on, +0x018/+0x01C key off (write-1 masks)
     +0x020 IRQ address: source 0 fires when a voice reaches this address
@@ -29,7 +30,7 @@
     TODO:
     - envelope fields, key-off release, levels bytes 2-3 (effect sends?)
     - reverb (never enabled by known software)
-    - interrupt sources 1-5
+    - interrupt sources 2-5; the source 1 timer's unit
 
 ***************************************************************************/
 
@@ -94,6 +95,7 @@ zevio_spu_device::zevio_spu_device(const machine_config &mconfig, const char *ta
 void zevio_spu_device::device_start()
 {
 	m_stream = stream_alloc(0, 2, clock());
+	m_timer = timer_alloc(FUNC(zevio_spu_device::timer_tick), this);
 
 	for (int v = 0; v < 64; v++)
 	{
@@ -132,6 +134,36 @@ void zevio_spu_device::device_reset()
 	std::fill(std::begin(m_global), std::end(m_global), 0);
 	m_pause = 0;
 	m_irq_status = 0;
+	m_timer->adjust(attotime::never);
+	update_irq();
+}
+
+void zevio_spu_device::device_post_load()
+{
+	arm_timer();
+}
+
+// Interrupt source 1 as a periodic timer: +0x004 bit 9 (its enable) runs it
+// and bits 31-16 are the period. The ROM's Audio_setCtrl is the only retail
+// writer (0x00010200, acknowledged with 2); homebrew built on vtech-lib refills
+// its audio buffers from it. That it is a timer at all, and its unit (one
+// 11025 Hz sample, after flashem), are not measured on a console. Any write
+// to +0x004 restarts the count.
+void zevio_spu_device::arm_timer()
+{
+	const u32 r = m_global[0x004 / 4];
+	if (BIT(r, 9) && (r >> 16))
+	{
+		const attotime period = attotime::from_hz(11025) * (r >> 16);
+		m_timer->adjust(period, 0, period);
+	}
+	else
+		m_timer->adjust(attotime::never);
+}
+
+TIMER_CALLBACK_MEMBER(zevio_spu_device::timer_tick)
+{
+	m_irq_status |= 2;
 	update_irq();
 }
 
@@ -322,7 +354,7 @@ u32 zevio_spu_device::read(offs_t offset)
 		switch (offset & 15)
 		{
 		case V_CURADDR: return vc.addr;
-		case V_STATUS: return vc.active ? 0x10000 : 0;
+		case V_STATUS: return (vc.regs[V_STATUS] & ~0x10000) | (vc.active ? 0x10000 : 0);
 		default: return vc.regs[offset & 15];
 		}
 	}
@@ -330,7 +362,7 @@ u32 zevio_spu_device::read(offs_t offset)
 	switch (g)
 	{
 	case 0x004 / 4: return (m_global[g] & ~0x3f) | m_irq_status;
-	case 0x248 / 4: return m_global[0x188 / 4]; // master volume ramps instantly
+	case 0x248 / 4: return m_global[0x188 / 4] & 0x7fff7fff; // master volume ramps instantly
 	default: return m_global[g];
 	}
 }
@@ -350,6 +382,7 @@ void zevio_spu_device::write(offs_t offset, u32 data, u32 mem_mask)
 	case 0x004 / 4:
 		m_irq_status &= ~(data & 0x3f);
 		COMBINE_DATA(&m_global[g]);
+		arm_timer();
 		update_irq();
 		return;
 	case 0x008 / 4: m_pause = (m_pause & 0xffffffff00000000ULL) | data; break;
