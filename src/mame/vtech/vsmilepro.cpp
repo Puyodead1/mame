@@ -2062,9 +2062,16 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 	// the decoder only takes the sector whose header matches the next
 	// expected address; FA pauses by seeking back and letting the drive
 	// re-read sectors the decoder already has
-	// +0x60 bits 31-24 arm a timeout (IRQ 0x8000) for a running decoder that
-	// sees no data (counted in EFM frames, 98 per sector); FA uses it to end
-	// a muted pause, which makes it take the last buffered sector and restart
+	// +0x60 bits 31-24 arm a timeout (IRQ 0x8000, "GFS lost": FA's ISR treats
+	// it as a servo lock loss) for a running decoder that sees no data,
+	// counted here in EFM frames (98 per sector) while the drive is muted. FA
+	// relies on it to leave a muted pause, which makes it take the last
+	// buffered sector and restart.
+	// [EMU] The units are probably bits 19-0 APB clocks (FA sets 0xB8600, 10 ms
+	// at 75 MHz, so 100-200 units are 1-2 s, as flashem has it). Timed that way
+	// FA's pauses never end here: Wacky Race's first FA read and the boot ROM
+	// stall. Our drive doesn't come back round to a sector it passed during a
+	// pause, so this fast timeout stands in for that.
 	bool deliver = (ctrl & 4) && m_cd_running && !m_cd_mute && (capture || m_cd_head == m_cd_expect);
 	if ((ctrl & 4) && m_cd_running && (m_cd_regs[0x60 / 4] >> 24))
 	{
@@ -2214,8 +2221,8 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 {
 	static const bool reclog = getenv("ZCD_RECLOG") != nullptr;
 	if (reclog && offset != 0x00 / 4 && offset != 0x08 / 4 && offset != 0x0c / 4 && offset != 0x14 / 4)
-		logerror("CDW %.4f %08x: +%02x = %08x (64 %05x 68 %05x 70 %02x)\n", machine().time().as_double(), m_maincpu->pc(), offset * 4, data,
-				m_cd_regs[0x64 / 4], m_cd_regs[0x68 / 4], m_cd_regs[0x70 / 4]);
+		logerror("CDW %.4f %08x: +%02x = %08x (64 %05x 68 %05x 70 %02x) run %d head %d expect %d mute %d\n", machine().time().as_double(), m_maincpu->pc(), offset * 4, data,
+				m_cd_regs[0x64 / 4], m_cd_regs[0x68 / 4], m_cd_regs[0x70 / 4], m_cd_running, m_cd_head, m_cd_expect, m_cd_mute);
 	switch (offset)
 	{
 	case 0x64 / 4:

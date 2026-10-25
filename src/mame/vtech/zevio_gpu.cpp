@@ -328,6 +328,14 @@ static bool auxlog_now(running_machine &m)
 	return at >= 0 && t >= at && t < at + primlog_len();
 }
 
+// ZGPU_PRIMLOG also logs image loads/stores (D0/D1) in its window
+static bool xferlog_now(running_machine &m)
+{
+	static const double at = getenv("ZGPU_PRIMLOG") ? atof(getenv("ZGPU_PRIMLOG")) : -1.0;
+	const double t = m.time().as_double();
+	return at >= 0 && t >= at && t < at + primlog_len();
+}
+
 static int s_zfail; static float s_zfail_lo, s_zfail_hi, s_zfail_zlo; // ZGPU_PRIMLOG: depth-test failures of the last primitive
 
 float *zevio_gpu_device::zptr(const rstate &s, int x, int y) const
@@ -2202,6 +2210,8 @@ void zevio_gpu_device::run_list(u32 addr)
 			const int x = pos & 0xffff, y = pos >> 16, w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 8192);
 			if (in_zarea(y) && auxlog_now(machine()))
 				logerror("AUX load %d,%d %dx%d first %04x\n", x, y, w, h, rd16(src));
+			if (xferlog_now(machine()))
+				logerror("XFER load %d,%d %dx%d from %08x\n", x, y, w, h, src);
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					vram_w(x + i, y + j, rd16(src + (j * w + i) * 2));
@@ -2214,6 +2224,8 @@ void zevio_gpu_device::run_list(u32 addr)
 			addr += 8;
 			sync();
 			const int x = pos & 0xffff, y = pos >> 16, w = std::min<int>(size & 0xffff, 1024), h = std::min<int>(size >> 16, 8192);
+			if (xferlog_now(machine()))
+				logerror("XFER store %d,%d %dx%d to %08x\n", x, y, w, h, m_xfer);
 			for (int j = 0; j < h; j++)
 				for (int i = 0; i < w; i++)
 					wr16(m_xfer + (j * w + i) * 2, vram_r(x + i, y + j));
