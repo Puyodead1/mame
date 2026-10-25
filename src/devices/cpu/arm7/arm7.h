@@ -63,6 +63,9 @@ public:
 	// idle loop: a recompiled block starting at pc ends the timeslice when the
 	// code from sig_start matches sig (an idle task spinning until interrupted)
 	void add_idle_loop(offs_t pc, offs_t sig_start, std::vector<uint32_t> sig) { m_idle_loops.push_back({ pc, sig_start, std::move(sig) }); }
+	// the same at any address: a block starting `entry` bytes into code matching sig
+	void add_idle_pattern(offs_t entry, std::vector<uint32_t> sig) { m_idle_loops.push_back({ ANY_PC, entry, std::move(sig) }); }
+	static constexpr offs_t ANY_PC = ~offs_t(0);
 
 	// fast RAM: physical ranges of plain little-endian RAM accessed through a
 	// host pointer instead of the address space (no taps or watchpoints there)

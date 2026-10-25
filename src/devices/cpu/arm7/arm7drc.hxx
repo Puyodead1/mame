@@ -504,12 +504,13 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 
 		for (const auto &il : m_idle_loops)
 		{
-			if (il.pc != startpc)
+			if (il.pc != startpc && il.pc != ANY_PC)
 				continue;
+			const offs_t sig_start = (il.pc == ANY_PC) ? startpc - il.sig_start : il.sig_start;
 			bool match = true;
 			for (size_t i = 0; i < il.sig.size() && match; i++)
 			{
-				offs_t a = il.sig_start + i * 4;
+				offs_t a = sig_start + i * 4;
 				if ((m_control & COPRO_CTRL_MMU_EN) && !translate_fast(a, ARM7_TLB_ABORT_P | ARM7_TLB_READ))
 					match = false;
 				else
