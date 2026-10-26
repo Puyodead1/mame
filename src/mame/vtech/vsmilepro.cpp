@@ -1830,6 +1830,10 @@ void vsmilpro_state::cd_servo_write(int nbits, u64 value, bool sens)
 	if (nbits <= 0 || nbits > 40)
 		return;
 	const u8 cmd = u8(value >> (nbits - 8));
+	static const bool reclog = getenv("ZCD_RECLOG") != nullptr;
+	if (reclog)
+		logerror("SERVO %.4f %08x lr %08x: %d bits %010llx head %d expect %d\n", machine().time().as_double(), m_maincpu->pc(),
+				m_maincpu->state_int(arm7_cpu_device::ARM7_R14), nbits, (unsigned long long)value, m_cd_head, m_cd_expect);
 	switch (nbits)
 	{
 	case 8:
@@ -2079,12 +2083,13 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 	// FA's pauses never end here: Wacky Race's first FA read and the boot ROM
 	// stall. Our drive doesn't come back round to a sector it passed during a
 	// pause, so this fast timeout stands in for that.
-	bool deliver = (ctrl & 4) && m_cd_running && !m_cd_mute && (capture || m_cd_head == m_cd_expect);
 	static const bool tmo_real = getenv("ZCD_TMO_REAL") != nullptr; // experiment: 1-2 s timeout (APB units)
+	static const bool mute_audio_only = getenv("ZCD_MUTE_AUDIO") != nullptr; // experiment: $A MUTE does not cut data
+	bool deliver = (ctrl & 4) && m_cd_running && (mute_audio_only || !m_cd_mute) && (capture || m_cd_head == m_cd_expect);
 	if ((ctrl & 4) && m_cd_running && (m_cd_regs[0x60 / 4] >> 24))
 	{
 		const u32 step = tmo_real ? u32(m_cd_timer->period().as_attoseconds() / ATTOSECONDS_PER_MICROSECOND) : 98;
-		if (!m_cd_mute)
+		if (mute_audio_only ? deliver : !m_cd_mute)
 			m_cd_tmo = cd_timeout_units();
 		else if (m_cd_tmo)
 		{
