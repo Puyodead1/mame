@@ -331,6 +331,13 @@ private:
 	s32 m_cd_expect;    // next frame the decoder accepts (header match)
 	bool m_cd_mute;     // $A audio control MUTE: no data reaches the decoder
 	u32 m_cd_tmo;       // sector timeout countdown armed by +0x60 bits 31-24
+	// in EFM frames (count as given), or with ZCD_TMO_REAL in us: units of bits 19-0 APB (75 MHz) clocks
+	u32 cd_timeout_units() const
+	{
+		static const bool tmo_real = getenv("ZCD_TMO_REAL") != nullptr;
+		const u32 n = m_cd_regs[0x60 / 4] >> 24;
+		return tmo_real ? u32(u64(n) * (m_cd_regs[0x60 / 4] & 0xfffff) / 75) : n;
+	}
 	s32 m_cd_dir;       // direction of the last sled command
 	s32 m_cd_jump_n;    // 2N track jump count from the last $7x command
 	bool m_cd_sled_armed;
@@ -2073,13 +2080,15 @@ TIMER_CALLBACK_MEMBER(vsmilpro_state::cd_sector_cb)
 	// stall. Our drive doesn't come back round to a sector it passed during a
 	// pause, so this fast timeout stands in for that.
 	bool deliver = (ctrl & 4) && m_cd_running && !m_cd_mute && (capture || m_cd_head == m_cd_expect);
+	static const bool tmo_real = getenv("ZCD_TMO_REAL") != nullptr; // experiment: 1-2 s timeout (APB units)
 	if ((ctrl & 4) && m_cd_running && (m_cd_regs[0x60 / 4] >> 24))
 	{
+		const u32 step = tmo_real ? u32(m_cd_timer->period().as_attoseconds() / ATTOSECONDS_PER_MICROSECOND) : 98;
 		if (!m_cd_mute)
-			m_cd_tmo = m_cd_regs[0x60 / 4] >> 24;
+			m_cd_tmo = cd_timeout_units();
 		else if (m_cd_tmo)
 		{
-			m_cd_tmo = (m_cd_tmo > 98) ? (m_cd_tmo - 98) : 0;
+			m_cd_tmo = (m_cd_tmo > step) ? (m_cd_tmo - step) : 0;
 			if (!m_cd_tmo)
 				m_cd_regs[0x64 / 4] |= 0x8000;
 		}
@@ -2300,7 +2309,7 @@ void vsmilpro_state::cd_w(offs_t offset, u32 data, u32 mem_mask)
 		const u32 old = m_cd_regs[offset];
 		COMBINE_DATA(&m_cd_regs[offset]);
 		if ((m_cd_regs[offset] >> 24) && !(old >> 24))
-			m_cd_tmo = m_cd_regs[offset] >> 24;
+			m_cd_tmo = cd_timeout_units();
 		LOGMASKED(LOG_CD, "%08x: cd 60 = %08x\n", m_maincpu->pc(), m_cd_regs[offset]);
 		return;
 	}

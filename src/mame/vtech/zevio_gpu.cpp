@@ -1617,6 +1617,10 @@ void zevio_gpu_device::sprite(u32 header, u32 &addr)
 	static const bool sprcol_rgb = getenv("ZGPU_SPRCOL_RGB") != nullptr;
 	if (sprcol_rgb)
 		c.a3 = (col & 0xff00ff00) | ((col & 0xff) << 16) | ((col >> 16) & 0xff);
+	// ZGPU_SPRCOL_GB (experiment): the green and blue bytes swapped (0x00GGBBRR)
+	static const bool sprcol_gb = getenv("ZGPU_SPRCOL_GB") != nullptr;
+	if (sprcol_gb)
+		c.a3 = (col & 0xff0000ff) | ((col & 0xff00) << 8) | ((col >> 8) & 0xff00);
 	c.flags = flags;
 	// word 0, low half: reciprocal depth (see ZSCALE); 0 is infinitely far. Cars' menu draws its text at 0x4651
 	// and the orange lines over it at
