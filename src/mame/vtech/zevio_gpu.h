@@ -211,6 +211,7 @@ private:
 	u64 m_work_xfer = 0;  // pixels loaded, stored or copied (0xD0-0xD2)
 	u64 m_work_verts = 0; // vertices transformed (3D primitives and stores to memory)
 	u64 m_work_readback = 0; // pixels stored from VRAM to RAM (0xD1)
+	u64 m_work_tris = 0;     // triangles drawn (part of m_work_prims)
 	u64 m_work_px_fill = 0, m_work_px_blend = 0, m_work_px_depth = 0; // pixel classes (ZGPU_WORKLOG)
 	double m_px_debt = 0, m_px_time = 0;
 

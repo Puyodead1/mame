@@ -530,7 +530,7 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 	case 0x00 / 4:
 		if (data == 1)
 		{
-			const u64 px0 = m_work_px, prims0 = m_work_prims, xfer0 = m_work_xfer, verts0 = m_work_verts, blend0 = m_work_px_blend, fill0 = m_work_px_fill, rb0 = m_work_readback;
+			const u64 px0 = m_work_px, prims0 = m_work_prims, xfer0 = m_work_xfer, verts0 = m_work_verts, blend0 = m_work_px_blend, fill0 = m_work_px_fill, rb0 = m_work_readback, tris0 = m_work_tris;
 			const u32 status0 = m_regs[0x14 / 4];
 			m_hle_handled = false;
 			m_defer_irq = true;
@@ -551,7 +551,10 @@ void zevio_gpu_device::regs_w(offs_t offset, u32 data, u32 mem_mask)
 				const double fill_adj = fill_rate > 0 ? double(m_work_px_fill - fill0) * (1.0 / fill_rate - 1.0 / px_rate0) : 0.0;
 				// readbacks (D1, VRAM to RAM) at their own rate: ZGPU_READRATE pixels/s
 				static const double read_rate = getenv("ZGPU_READRATE") ? atof(getenv("ZGPU_READRATE")) : 0.5e6;
-				const double extra = double(m_work_px_blend - blend0) * blend_s + kick_s + fill_adj + double(m_work_readback - rb0) / read_rate;
+				// triangle setup on top of the per-primitive cost: ZGPU_TRIUS us per triangle
+				static const double tri_s = (getenv("ZGPU_TRIUS") ? atof(getenv("ZGPU_TRIUS")) : 0.0) * 1e-6;
+				const double extra = double(m_work_px_blend - blend0) * blend_s + kick_s + fill_adj + double(m_work_readback - rb0) / read_rate
+						+ double(m_work_tris - tris0) * tri_s;
 				m_busy_until = std::max(now, m_busy_until) + attotime::from_double(list_time(m_work_px - px0, m_work_prims - prims0, m_work_xfer - xfer0, m_work_verts - verts0) + extra);
 				if (m_regs[0x14 / 4] != status0)
 				{
@@ -1904,6 +1907,8 @@ void zevio_gpu_device::add_cmd(rcmd &&c)
 		const u64 px = u64(c.ymax - c.ymin + 1) * w;
 		m_work_px += px;
 		m_work_prims++;
+		if (c.type == CMD_TRI3D || c.type == CMD_TRI2D)
+			m_work_tris++;
 		// pixel classes for fitting the engine's rates (ZGPU_WORKLOG)
 		if (c.type == CMD_FILL)
 			m_work_px_fill += px;
