@@ -1375,9 +1375,15 @@ void vsmilpro_state::disp_w(offs_t offset, u32 data, u32 mem_mask)
 		line_timer_arm(m_screen->vpos());
 }
 
+static const struct bgr555_table
+{
+	rgb_t c[0x8000];
+	bgr555_table() { for (int p = 0; p < 0x8000; p++) c[p] = rgb_t(pal5bit(p & 0x1f), pal5bit((p >> 5) & 0x1f), pal5bit((p >> 10) & 0x1f)); }
+} s_bgr555;
+
 static inline rgb_t bgr555(u16 p)
 {
-	return rgb_t(pal5bit(p & 0x1f), pal5bit((p >> 5) & 0x1f), pal5bit((p >> 10) & 0x1f));
+	return s_bgr555.c[p & 0x7fff];
 }
 
 /*
@@ -1414,10 +1420,15 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 	const u32 enable = regs[0x100 / 4];
 	bitmap.fill(bgr555(regs[0x10c / 4]), cliprect);
 
-	auto in_window = [] (const u32 *r, int reg, int x, int y)
+	// the columns of row y inside a layer's window (x0,y0 / x1,y1 at reg, reg + 4) and the clip: false if none
+	auto window_span = [&cliprect] (const u32 *r, int reg, int y, int &xa, int &xb)
 	{
 		const u32 a = r[reg / 4], b = r[reg / 4 + 1];
-		return x >= int(a & 0x7ff) && x <= int(b & 0x7ff) && y >= int((a >> 16) & 0x7ff) && y <= int((b >> 16) & 0x7ff);
+		if (y < int((a >> 16) & 0x7ff) || y > int((b >> 16) & 0x7ff))
+			return false;
+		xa = std::max(cliprect.left(), int(a & 0x7ff));
+		xb = std::min(cliprect.right(), int(b & 0x7ff));
+		return xa <= xb;
 	};
 
 	// layer 5: planar YCbCr 4:2:0 at +0x164/+0x168/+0x16C, window +0x138/+0x13C,
@@ -1509,14 +1520,15 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		const u32 a = gregs[0x130 / 4], b = gregs[0x134 / 4];
 		const int x0 = a & 0x7ff, y0 = (a >> 16) & 0x7ff, x1 = b & 0x7ff;
 		const int w = x1 - x0 + 1;
+		int xa, xb;
 		if (w > 0)
 			for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 			{
+				if (!window_span(gregs, 0x130, y, xa, xb))
+					continue;
 				u32 *dst = &bitmap.pix(y);
-				for (int x = cliprect.left(); x <= cliprect.right(); x++)
+				for (int x = xa; x <= xb; x++)
 				{
-					if (!in_window(gregs, 0x130, x, y))
-						continue;
 					const u32 addr = start + ((y - y0) * w + (x - x0)) * 2;
 					const u16 p = in_sdram(addr) ? ram_r16(addr) : 0x8000;
 					if (!BIT(p, 15)) // bit 15 set = transparent
@@ -1530,15 +1542,18 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		const u32 off = start - VRAM_ORIGIN;
 		const u32 y0 = (off / 16384) * 8 + ((off % 16384) % 512) / 64;
 		const u32 xb0 = ((off % 16384) / 512) * 64 + (off % 64);
+		int xa, xb;
 		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 		{
+			if (!window_span(gregs, 0x130, y, xa, xb))
+				continue;
 			u32 *dst = &bitmap.pix(y);
-			for (int x = cliprect.left(); x <= cliprect.right(); x++)
+			const u32 row = tiled_addr(VRAM_ORIGIN, 0, y0 + y);
+			for (int x = xa; x <= xb; x++)
 			{
-				if (!in_window(gregs, 0x130, x, y))
-					continue;
-				const u32 addr = tiled_addr(VRAM_ORIGIN, (xb0 + x * 2) & 2047, y0 + y);
-				const u16 p = in_sdram(addr) ? ram_r16(addr) : 0;
+				const u32 xbyte = (xb0 + x * 2) & 2047;
+				const u32 addr = row + ((xbyte >> 6) & 31) * 512 + (xbyte & 63);
+				const u16 p = in_sdram(addr) ? u16(m_sdram[(addr - SDRAM_BASE) >> 2] >> (BIT(addr, 1) * 16)) : 0;
 				if (BIT(p, 15))
 					continue; // transparent: confirmed on hardware with CPU-drawn pixels
 				dst[x] = bgr555(p);
@@ -1568,13 +1583,14 @@ u32 vsmilpro_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 		const bool bpp4 = ((mode >> 2) & 3) == 2;
 		const u32 *const pal = &regs[(BIT(mode, 4) ? 0xa00 : 0x800) / 4];
 		const int sx = scroll & 0xfff, sy = (scroll >> 16) & 0xfff;
+		int xa, xb;
 		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 		{
+			if (!window_span(regs, window_regs[layer], y, xa, xb))
+				continue;
 			u32 *dst = &bitmap.pix(y);
-			for (int x = cliprect.left(); x <= cliprect.right(); x++)
+			for (int x = xa; x <= xb; x++)
 			{
-				if (!in_window(regs, window_regs[layer], x, y))
-					continue;
 				const int lx = (x + sx) & (mapw * 8 - 1), ly = (y + sy) & (mapw * 8 - 1);
 				const u16 entry = ram_r16(map + ((ly >> 3) * mapw + (lx >> 3)) * 2);
 				u8 index;
@@ -2756,6 +2772,9 @@ void vsmilpro_state::vsmilpro(machine_config &config)
 	static const std::vector<u32> fa_idle = { 0xe3a03000, 0xe2833001, 0xe35300fe, 0x9afffffc, 0xeafffffa };
 	m_maincpu->add_idle_pattern(0, fa_idle);
 	m_maincpu->add_idle_pattern(4, fa_idle);
+	// FA's Gpu_waitIdle in Bratz (0x10A16CD8) spins until the GPU interrupt has retired every queued list
+	// (gpu_ring.count = 0); the game spends most of its time there while the GPU draws
+	m_maincpu->add_idle_branch(16, { 0xe1a00000, 0xe59f300c, 0xe5933000, 0xe3530000, 0x1afffffb, 0xe1a0f00e });
 	// Wacky Races (Jumpin' Bean Island): the main loop's frame pacing spins until the timer at
 	// 0x900C000C has moved 0x30 counts on from the last frame; each pass only reads the time
 	m_maincpu->add_idle_loop(0x10b520c4, 0x10b520c4, {

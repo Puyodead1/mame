@@ -219,6 +219,22 @@ void arm7_cpu_device::drc_block_transfer_impl()
 	m_drc_ok = 1;
 }
 
+// UML flags (C V Z S = bits 0-3) to ARM N Z C V, after an addition and after a subtraction
+static const struct nzcv_tables
+{
+	uint32_t add[16], sub[16];
+	nzcv_tables()
+	{
+		for (int f = 0; f < 16; f++)
+		{
+			const uint32_t nzv = (BIT(f, 3) ? N_MASK : 0) | (BIT(f, 2) ? Z_MASK : 0) | (BIT(f, 1) ? V_MASK : 0);
+			add[f] = nzv | (BIT(f, 0) ? C_MASK : 0);
+			sub[f] = nzv | (BIT(f, 0) ? 0 : C_MASK);
+		}
+	}
+} s_nzcv;
+static const uint32_t *const s_nzcv_add = s_nzcv.add, *const s_nzcv_sub = s_nzcv.sub;
+
 static uint64_t s_drc_compiles, s_drc_invalidates, s_drc_dirty_flushes, s_drc_compile_insns;
 static struct drc_stats_dump { ~drc_stats_dump() { if (getenv("ARM_DRC_STATS")) printf("DRC compiles %llu (%llu insns) invalidated pages %llu flushes %llu\n", (unsigned long long)s_drc_compiles, (unsigned long long)s_drc_compile_insns, (unsigned long long)s_drc_invalidates, (unsigned long long)s_drc_dirty_flushes); } } s_drc_stats_dump;
 
@@ -380,11 +396,9 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 		// Execution continues after the tail.
 		auto tail = [&] (int cost, offs_t nextpc)
 		{
+			// one read-modify-write of the counter; its flags give icount <= 0
 			const code_label ooc = nextlabel++;
-			load(I0, &m_icount);
-			UML_SUB(block, I0, I0, cost);
-			store(&m_icount, I0);
-			UML_CMP(block, I0, 0);
+			UML_SUB(block, mem(&m_icount), mem(&m_icount), cost);
 			UML_JMPc(block, uml::COND_LE, ooc);
 
 			stubs.emplace_back([&, ooc, nextpc] ()
@@ -501,6 +515,21 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 
 		UML_HASH(block, mode, startpc);
 		s_drc_compiles++;
+
+		// code at virtual address a matches sig
+		auto code_matches = [&] (offs_t a, const std::vector<uint32_t> &sig)
+		{
+			for (size_t i = 0; i < sig.size(); i++, a += 4)
+			{
+				offs_t pa = a;
+				if ((m_control & COPRO_CTRL_MMU_EN) && !translate_fast(pa, ARM7_TLB_ABORT_P | ARM7_TLB_READ))
+					return false;
+				const uint8_t *const p = fastram_ptr(pa);
+				if (!p || *reinterpret_cast<const uint32_t *>(p) != sig[i])
+					return false;
+			}
+			return true;
+		};
 
 		for (const auto &il : m_idle_loops)
 		{
@@ -650,6 +679,10 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 
 				// I2 = result; arithmetic flags take (a, b) = (I0, I1) or (I1, I0)
 				bool add = false, sub = false, swap = false;
+				// ADD SUB RSB CMP CMN with S: N Z C V from the host's flags right after the operation
+				// (a subtraction's host carry is a borrow, ARM's C is its inverse)
+				const bool hostflags = s && (opcode == OPCODE_ADD || opcode == OPCODE_CMN || opcode == OPCODE_SUB
+						|| opcode == OPCODE_CMP || opcode == OPCODE_RSB);
 				switch (opcode)
 				{
 				case OPCODE_AND: case OPCODE_TST: UML_AND(block, I2, I0, I1); break;
@@ -687,7 +720,16 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				default: /* MVN */ UML_XOR(block, I2, I1, ~uint32_t(0)); break;
 				}
 
-				if (s)
+				if (hostflags)
+				{
+					UML_GETFLGS(block, I3, FLAG_C | FLAG_V | FLAG_Z | FLAG_S);
+					UML_LOAD(block, I3, add ? s_nzcv_add : s_nzcv_sub, I3, SIZE_DWORD, SCALE_x4);
+					load(I7, &m_r[eCPSR]);
+					UML_AND(block, I7, I7, ~(N_MASK | Z_MASK | C_MASK | V_MASK));
+					UML_OR(block, I7, I7, I3);
+					store(&m_r[eCPSR], I7);
+				}
+				else if (s)
 				{
 					// N and Z from the result (as HandleALUNZFlags)
 					UML_AND(block, I5, I2, 0x80000000);
@@ -1318,6 +1360,18 @@ void arm7_cpu_device::drc_compile(uint32_t mode, offs_t startpc)
 				{
 					UML_MOV(block, I0, pc + 4);
 					store(reg(14), I0);
+				}
+				bool idle = false;
+				if (cond != 14 && !(insn & INSN_BL) && target <= pc)
+					for (const auto &il : m_idle_branches)
+						idle = idle || code_matches(pc - il.sig_start, il.sig);
+				if (idle)
+				{
+					// add_idle_branch: the rest of the timeslice passes in the loop
+					load(I0, &m_icount);
+					UML_CMP(block, I0, 3);
+					UML_MOVc(block, uml::COND_G, I0, 3);
+					store(&m_icount, I0);
 				}
 				tail(3, target);
 				UML_MOV(block, I0, target);

@@ -66,6 +66,10 @@ public:
 	// the same at any address: a block starting `entry` bytes into code matching sig
 	void add_idle_pattern(offs_t entry, std::vector<uint32_t> sig) { m_idle_loops.push_back({ ANY_PC, entry, std::move(sig) }); }
 	static constexpr offs_t ANY_PC = ~offs_t(0);
+	// a polling loop at any address: when the conditional backward branch `branch` bytes into code matching sig is
+	// taken, the loop goes round again with nothing to change its condition but an interrupt, so the rest of the
+	// timeslice passes idle (checked when taken, unlike add_idle_loop, so a wait that is already over costs nothing)
+	void add_idle_branch(offs_t branch, std::vector<uint32_t> sig) { m_idle_branches.push_back({ ANY_PC, branch, std::move(sig) }); }
 
 	// fast RAM: physical ranges of plain little-endian RAM accessed through a
 	// host pointer instead of the address space (no taps or watchpoints there)
@@ -312,6 +316,7 @@ protected:
 	bool m_drc_requested = false;
 	struct idle_loop { offs_t pc, sig_start; std::vector<uint32_t> sig; };
 	std::vector<idle_loop> m_idle_loops;
+	std::vector<idle_loop> m_idle_branches; // sig_start = offset of the branch in sig
 	bool m_drc = false;
 	bool m_drc_dirty = true;
 	std::unique_ptr<drc_cache> m_drc_cache;
